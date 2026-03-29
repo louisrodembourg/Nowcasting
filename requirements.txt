@@ -1,0 +1,20 @@
+# Data processing
+duckdb
+polars
+
+# Machine learning
+hdbscan
+scikit-learn
+torch
+xgboost
+
+# Explainability
+shap
+
+# Data sources
+yfinance
+
+# Visualization
+folium
+matplotlib
+ipykernel
