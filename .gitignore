@@ -1,0 +1,43 @@
+# macOS
+.DS_Store
+
+# Python virtual environments
+venv/
+.venv/
+env/
+
+# Python cache / build
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Jupyter
+*.ipynb_checkpoints
+
+# Project outputs
+outputs/
+data/
+
+# Data files
+*.parquet
+*.csv
+*.xlsx
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+
+# Generated files in notebooks
+notebooks/*.html
+notebooks/*.png
+notebooks/*.jpg
+notebooks/*.jpeg
+
+# Local environment files
+.env
+.env.*
+!.env.example
