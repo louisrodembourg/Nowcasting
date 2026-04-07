@@ -5,6 +5,7 @@
 venv/
 .venv/
 env/
+.env
 
 # Python cache / build
 __pycache__/
@@ -41,3 +42,5 @@ notebooks/*.jpeg
 .env
 .env.*
 !.env.example
+CLAUDE.md
+PROGRESS.md

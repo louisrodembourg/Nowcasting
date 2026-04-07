@@ -56,23 +56,60 @@ MacBook Pro M3 Pro, 18 GB RAM unifiée, ~150 GB stockage libre. Toutes les déci
 
 | Source | Couverture | Usage |
 |--------|-----------|-------|
-| Marine Cadastre / NOAA | Eaux US, colonnes riches (tirant d'eau, dimensions, cargo) | Houston — Phase 1-2 |
-| Global Fishing Watch | Historique long terme, global | Suez — Phase 2 (manifold) |
+| Marine Cadastre / NOAA | Eaux US, schéma riche (tirant d'eau, dimensions, cargo, cap) | Houston — Phase 1-2 (source unique) |
+| Global Fishing Watch | Historique long terme, global | Suez — Phase 2 (manifold baseline) |
 | MarineTraffic / UNGP | Haute fréquence | Suez — Phase 3 (PINNs) |
-| AISStream.io | WebSocket temps réel | Optionnel, temps réel |
-| AISHub | API REST | Optionnel |
 
-### Workflow type (Marine Cadastre)
+> **Note Houston :** Marine Cadastre remplace à la fois GFW (baseline manifold) et MarineTraffic (haute fréquence crise). C'est la source unique pour Houston — gratuitement disponible, historique 2009–présent, résolution ~2–15 min/navire.
 
-1. Télécharger les CSV mensuels depuis Marine Cadastre
-2. Charger via DuckDB, filtrer par bounding box géographique
-3. Convertir en Parquet, supprimer les CSV bruts (discipline stockage)
-4. Dédupliquer : agréger à **une position par navire** avant clustering (résolution de la redondance temporelle — critique pour éviter l'inflation de clusters)
-5. Appliquer HDBSCAN pour détecter les clusters de navires stationnaires
+---
+
+## Phase 1 — Pipeline Houston (Marine Cadastre)
+
+Focus actuel du projet. Événement de référence : **Hurricane Harvey (août 2017)**.
+
+### Étape 1 — Collecte ciblée
+
+**Bounding box Houston Ship Channel :** LAT [29.5, 29.9], LON [-95.4, -94.7]
+
+- Télécharger les CSV mensuels depuis marinecadastre.gov pour la période **2015–2017** (baseline pré-Harvey + crise Harvey)
+- Charger via DuckDB, filtrer par bbox stricte
+- Convertir en Parquet, supprimer les CSV bruts immédiatement (discipline stockage)
+- Colonnes clés Marine Cadastre : `MMSI, BaseDateTime, LAT, LON, SOG, COG, Heading, VesselName, IMO, VesselType, Status, Length, Width, Draft, Cargo`
+
+> Contrairement au pipeline Suez (deux flux GFW + MarineTraffic), Marine Cadastre est la source unique pour Houston : même résolution sur le baseline et sur la période de crise Harvey.
+
+### Étape 2 — Filtrage cinématique
+
+- **MMSI invalides :** exclure si hors plage [200 000 000 – 999 999 999]
+- **Coordonnées hors bbox :** filtrage strict sur LAT/LON
+- **VesselType :** exclure les classes hors pertinence cargo (ex. type 0 = inconnu si masse de données trop bruyante)
+- **SOG aberrant :** recalculer la vitesse réelle via la formule haversine entre deux positions consécutives du même MMSI et comparer à la valeur déclarée
+
+### Étape 3 — Restructuration et interpolation des trajectoires
+
+- **Gap threshold :** 30 minutes (Marine Cadastre est moins dense qu'un flux AIS temps réel ; un trou > 30 min scinde la trajectoire en deux segments distincts)
+- **Houston Ship Channel = canal quasi-linéaire** (comme Suez) → interpolation linéaire pour la majorité des navires
+- **Zone turning basin** (lat ≈ 29.75) → si changement de cap > 30° entre deux points, utiliser une interpolation **Cubic Hermite**
+- **Compression :** appliquer Douglas-Peucker (ε ≈ 0.0001°, soit ~11 m) pour réduire la redondance des trajectoires haute fréquence
+
+### Étape 4 — Identification spatiale (HDBSCAN)
+
+- **Filtre préalable :** conserver uniquement les navires avec SOG < 1 nœud (stationnaires sûrs)
+- **Features de clustering :** `[LAT, LON, Heading]` — le cap (Heading) permet de distinguer les navires à quai des navires au mouillage
+- **Paramètres :** `min_cluster_size=5`, `min_samples=3`
+- **Distinction quai / mouillage :**
+  - À quai : caps alignés sur le terminal (faible écart-type du Heading au sein du cluster)
+  - Au mouillage / en attente : caps dispersés (vent + courant imposent des orientations variées)
+- **Enrichissement optionnel :** pondérer par `Draft` pour mesurer la capacité bloquée
+
+**Résultat Phase 1 :** trajectoires continues physiquement fiables + clusters étiquetés (docked / waiting) → input direct pour Phase 2 (Manifold + Score de gravité).
+
+---
 
 ### 13 features quotidiennes (input manifold)
 
-vessel_count, SOG_mean, SOG_std, SOG_median, utilization_rate_rho, hdbscan_cluster_count, hdbscan_noise_ratio, membership_score_mean, membership_score_std, draft_mean, draft_std, blocked_capacity, tanker_ratio
+`vessel_count, SOG_mean, SOG_std, SOG_median, utilization_rate_rho, hdbscan_cluster_count, hdbscan_noise_ratio, membership_score_mean, membership_score_std, draft_mean, draft_std, blocked_capacity, tanker_ratio`
 
 ---
 
@@ -88,11 +125,18 @@ vessel_count, SOG_mean, SOG_std, SOG_median, utilization_rate_rho, hdbscan_clust
 
 ### En cours / À faire 🔜
 
-- Appliquer le pipeline de features sur plusieurs jours → construire la matrice d'entrée du manifold
-- Pipeline d'accès données Suez/Rotterdam (GFW + MarineTraffic)
-- UMAP + construction du gravity score (Phase 2)
-- PINNs / LWR pour Time to Clear (Phase 3)
-- Modèle de prime de risque (Phase 4), validation sur crise Mer Rouge
+**Phase 1 — Houston (priorité immédiate)**
+- Étapes 2–4 sur données août 2017 (filtrage cinématique, interpolation, HDBSCAN journalier)
+- Étendre le pipeline sur 2015–2017 (baseline pré-Harvey + crise) → construire la matrice de features quotidiennes (13 features)
+- Vérifier/supprimer le CSV brut `data/raw/AIS_2017_08_01.csv` (1 GB — parquet existant dans `data/parquet/houston/`)
+
+**Phase 2 — Manifold / Score de gravité**
+- UMAP sur la matrice de features Houston → extraction du gravity score
+- Ensuite : pipeline équivalent Suez/Rotterdam (GFW + MarineTraffic)
+
+**Phases 3–4**
+- PINNs / LWR pour Time to Clear
+- Modèle de prime de risque (XGBoost/Elastic Net), validation sur crise Mer Rouge 2023–2024
 
 ---
 
@@ -118,28 +162,33 @@ vessel_count, SOG_mean, SOG_std, SOG_median, utilization_rate_rho, hdbscan_clust
 
 ---
 
-## Structure de fichiers attendue
+## Structure de fichiers
 
 ```
-project/
-├── CLAUDE.md                  # Ce fichier
+Nowcasting/
+├── CLAUDE.md                       # Ce fichier
 ├── data/
-│   ├── raw/                   # CSV temporaires (supprimer après conversion)
-│   ├── parquet/               # Données nettoyées
-│   └── features/              # Matrices de features quotidiennes
+│   ├── raw/                        # CSV temporaires (supprimer après conversion Parquet)
+│   ├── parquet/
+│   │   ├── houston/                # Données Marine Cadastre nettoyées
+│   │   └── suez/
+│   │       ├── ais/                # Données AIS Suez (GFW)
+│   │       └── presence/           # Données présence/détection
+│   ├── features/                   # Matrices de features quotidiennes
+│   └── financial/                  # Indices BDI, FBX, WCI
 ├── src/
-│   ├── ingestion/             # Scripts collecte + nettoyage AIS
-│   ├── clustering/            # HDBSCAN, déduplication
-│   ├── manifold/              # UMAP, gravity score
-│   ├── pinns/                 # PINNs + LWR
-│   ├── correlation/           # Modèle prime de risque
-│   └── utils/                 # Helpers communs
-├── notebooks/                 # Exploration seulement (pas de production)
+│   ├── ingestion/                  # Scripts collecte + nettoyage AIS
+│   ├── clustering/                 # HDBSCAN, déduplication
+│   ├── manifold/                   # UMAP, gravity score
+│   ├── pinns/                      # PINNs + LWR
+│   ├── correlation/                # Modèle prime de risque
+│   └── utils/                      # Helpers communs
+├── notebooks/                      # Exploration seulement (pas de production)
 ├── outputs/
-│   ├── figures/               # Cartes Folium, plots
-│   └── models/                # Checkpoints PyTorch
-├── report/                    # Sources LaTeX du rapport
-└── references/                # PDFs articles, BibTeX
+│   ├── figures/                    # Cartes Folium, plots, PNG
+│   └── models/                     # Checkpoints PyTorch
+├── report/                         # Sources LaTeX du rapport
+└── references/                     # PDFs articles, BibTeX
 ```
 
 ---
