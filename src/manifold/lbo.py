@@ -186,9 +186,10 @@ def find_characteristic_points(
 def run_lbo(
     k: int = DEFAULT_K,
     n_eigenvectors: int = DEFAULT_N_EIGENVECTORS,
+    features_path: Path | None = None,
 ) -> pl.DataFrame:
     """
-    Full LBO pipeline on houston_daily_features.parquet.
+    Full LBO pipeline on a features parquet (default: houston_daily_features.parquet).
     Saves results to houston_manifold.parquet and returns the DataFrame.
 
     Output columns (appended to original features):
@@ -196,7 +197,8 @@ def run_lbo(
         eigenvalue_1…N : corresponding eigenvalues
         is_characteristic: True if local extremum in any of the first 3 eigenvectors
     """
-    df = pl.read_parquet(FEATURES_PATH).sort("date")
+    path = Path(features_path) if features_path is not None else FEATURES_PATH
+    df = pl.read_parquet(path).sort("date")
     log.info("Loaded %d days × %d features", *df.select(FEATURE_COLS).shape)
 
     # Step 1 — normalise

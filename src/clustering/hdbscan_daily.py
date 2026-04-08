@@ -37,6 +37,16 @@ HDBSCAN_MIN_CLUSTER_SIZE = 3
 HDBSCAN_MIN_SAMPLES      = 2
 
 
+def cluster_day_from_df(
+    prepared: pl.DataFrame,
+) -> tuple[Optional[pl.DataFrame], Optional[pl.DataFrame]]:
+    """
+    Run HDBSCAN on an already-prepared DataFrame (output of prepare_kinematics).
+    Returns (cluster_df, prepared_df) — same contract as cluster_day.
+    """
+    return _run_hdbscan(prepared, label="<DataFrame>")
+
+
 def cluster_day(
     parquet_path: Path,
 ) -> tuple[Optional[pl.DataFrame], Optional[pl.DataFrame]]:
@@ -58,36 +68,54 @@ def cluster_day(
     raw_df     = pl.read_parquet(parquet_path)
     prepared   = prepare_kinematics(raw_df)
 
+    return _run_hdbscan(prepared, label=parquet_path.name)
+
+
+def _run_hdbscan(
+    prepared: pl.DataFrame,
+    label: str = "",
+) -> tuple[Optional[pl.DataFrame], Optional[pl.DataFrame]]:
+    """Core HDBSCAN logic on a prepared DataFrame."""
     # --- Filter stationary vessels (using corrected SOG) --------------------
     static = prepared.filter(pl.col("SOG_corr") < SOG_STATIC_THRESHOLD)
 
     if len(static) < HDBSCAN_MIN_CLUSTER_SIZE:
         log.warning(
             "%s: only %d static messages — skipping clustering",
-            parquet_path.name, len(static),
+            label, len(static),
         )
         return None, prepared
 
     # --- Deduplicate: one position per (MMSI, traj_id) ----------------------
     # Each continuous static episode is treated as a distinct data point.
     # Heading 511 = AIS "not available" — excluded before stats.
-    agg = static.group_by(["MMSI", "traj_id"]).agg([
+
+    # Build agg expression — only include columns that exist
+    agg_exprs = [
         pl.col("LAT").median().alias("LAT"),
         pl.col("LON").median().alias("LON"),
-        pl.col("Heading").filter(pl.col("Heading") < 360).mean().alias("Heading_mean"),
-        pl.col("Heading").filter(pl.col("Heading") < 360).std().alias("Heading_std"),
-        pl.col("Draft").max().alias("Draft"),
-        pl.col("Length").max().alias("Length"),
-        pl.col("Width").max().alias("Width"),
-        pl.col("VesselType").max().alias("VesselType"),
+        pl.col("Heading").filter(pl.col("Heading") < 360).mean().alias("Heading_mean")
+            if "Heading" in prepared.columns else pl.lit(None).cast(pl.Float64).alias("Heading_mean"),
+        pl.col("Heading").filter(pl.col("Heading") < 360).std().alias("Heading_std")
+            if "Heading" in prepared.columns else pl.lit(None).cast(pl.Float64).alias("Heading_std"),
+        pl.col("Draft").max().alias("Draft")
+            if "Draft" in prepared.columns else pl.lit(None).cast(pl.Float64).alias("Draft"),
+        pl.col("Length").max().alias("Length")
+            if "Length" in prepared.columns else pl.lit(None).cast(pl.Float64).alias("Length"),
+        pl.col("Width").max().alias("Width")
+            if "Width" in prepared.columns else pl.lit(None).cast(pl.Float64).alias("Width"),
+        pl.col("VesselType").max().alias("VesselType")
+            if "VesselType" in prepared.columns else pl.lit(0).cast(pl.Int64).alias("VesselType"),
         pl.len().alias("nb_messages"),
-    ])
+    ]
+
+    agg = static.group_by(["MMSI", "traj_id"]).agg(agg_exprs)
 
     # Guard: HDBSCAN BallTree requires at least min_cluster_size points
     if len(agg) < HDBSCAN_MIN_CLUSTER_SIZE:
         log.warning(
             "%s: only %d static episodes after dedup — skipping HDBSCAN",
-            parquet_path.name, len(agg),
+            label, len(agg),
         )
         return None, prepared
 
@@ -119,7 +147,7 @@ def cluster_day(
     n_noise    = int((labels == -1).sum())
     log.info(
         "%s: %d static episodes (%d vessels) → %d clusters, %d noise (%.1f%%)",
-        parquet_path.name, n_episodes, n_vessels,
+        label, n_episodes, n_vessels,
         n_clusters, n_noise, 100 * n_noise / n_episodes,
     )
 
