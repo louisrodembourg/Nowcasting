@@ -1,17 +1,17 @@
 """
-Download Marine Cadastre AIS daily files for Houston Ship Channel.
+Download Marine Cadastre AIS daily files for Houston Ship Channel or LA/Long Beach.
 
 For each day in [--start, --end]:
   1. Download ZIP from NOAA coast server
   2. Extract CSV from ZIP (in memory)
-  3. Filter by Houston bbox + valid MMSI + realistic SOG via DuckDB
+  3. Filter by location bbox + valid MMSI + realistic SOG via DuckDB
   4. Save as Parquet (ZSTD compressed) — ~30–100x smaller than raw CSV
   5. Delete temp CSV
 
 Usage (run from Nowcasting/ root):
-    python src/ingestion/download.py --start 2017-07-25 --end 2017-09-15
-    python src/ingestion/download.py --start 2015-01-01 --end 2016-12-31  # baseline
-    python src/ingestion/download.py --start 2017-08-01 --end 2017-08-01 --force
+    python src/ingestion/download.py --location houston --start 2017-07-25 --end 2017-09-15
+    python src/ingestion/download.py --location la      --start 2019-01-01 --end 2019-12-31
+    python src/ingestion/download.py --location houston --start 2017-08-01 --end 2017-08-01 --force
 """
 import argparse
 import io
@@ -26,9 +26,27 @@ import requests
 
 log = logging.getLogger(__name__)
 
-# Houston Ship Channel bounding box (Galveston Bay to turning basin)
-LAT_MIN, LAT_MAX = 29.3, 29.85
-LON_MIN, LON_MAX = -95.4, -94.7
+# ── Location configs ─────────────────────────────────────────────────────────
+LOCATIONS = {
+    "houston": {
+        # Houston Ship Channel — Galveston Bay entrance to turning basin
+        "lat_min":  29.3,
+        "lat_max":  29.85,
+        "lon_min": -95.4,
+        "lon_max": -94.7,
+        "out_dir":  Path("data/parquet/houston"),
+        "prefix":   "houston",
+    },
+    "la": {
+        # Port of Los Angeles + Port of Long Beach — San Pedro Bay + approaches
+        "lat_min":  33.55,
+        "lat_max":  33.85,
+        "lon_min": -118.35,
+        "lon_max": -118.05,
+        "out_dir":  Path("data/parquet/la"),
+        "prefix":   "la",
+    },
+}
 
 # SOG sanity cap — anything above 50 kt is a sensor error for commercial vessels
 SOG_MAX = 50.0
@@ -39,16 +57,28 @@ NOAA_URL = (
     "/{year}/AIS_{year}_{month:02d}_{day:02d}.zip"
 )
 
-DEFAULT_OUT_DIR = Path("data/parquet/houston")
+# Keep old defaults for backwards compatibility
+LAT_MIN, LAT_MAX = LOCATIONS["houston"]["lat_min"], LOCATIONS["houston"]["lat_max"]
+LON_MIN, LON_MAX = LOCATIONS["houston"]["lon_min"], LOCATIONS["houston"]["lon_max"]
+DEFAULT_OUT_DIR   = LOCATIONS["houston"]["out_dir"]
 
 
-def download_day(d: date, out_dir: Path, force: bool = False) -> Path | None:
+def download_day(
+    d: date,
+    out_dir: Path,
+    force: bool = False,
+    lat_min: float = LAT_MIN,
+    lat_max: float = LAT_MAX,
+    lon_min: float = LON_MIN,
+    lon_max: float = LON_MAX,
+    prefix: str = "houston",
+) -> Path | None:
     """
     Download, filter, and convert one day to Parquet.
     Returns the output path on success, None on failure.
     Skips silently if the file already exists (unless force=True).
     """
-    out_path = out_dir / f"houston_{d.strftime('%Y_%m_%d')}.parquet"
+    out_path = out_dir / f"{prefix}_{d.strftime('%Y_%m_%d')}.parquet"
 
     if out_path.exists() and not force:
         log.info("%s: already exists — skipping", d)
@@ -100,8 +130,8 @@ def download_day(d: date, out_dir: Path, force: bool = False) -> Path | None:
             COPY (
                 SELECT *
                 FROM read_csv_auto('{tmp_csv}')
-                WHERE LAT  BETWEEN {LAT_MIN} AND {LAT_MAX}
-                  AND LON  BETWEEN {LON_MIN} AND {LON_MAX}
+                WHERE LAT  BETWEEN {lat_min} AND {lat_max}
+                  AND LON  BETWEEN {lon_min} AND {lon_max}
                   AND MMSI BETWEEN 200000000 AND 999999999
                   AND SOG  BETWEEN 0 AND {SOG_MAX}
             ) TO '{out_path}' (FORMAT PARQUET, COMPRESSION ZSTD)
@@ -124,33 +154,48 @@ def download_day(d: date, out_dir: Path, force: bool = False) -> Path | None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Download Marine Cadastre AIS daily files → filtered Houston Parquet"
+        description="Download Marine Cadastre AIS daily files → filtered Parquet"
     )
+    parser.add_argument("--location", default="houston",
+                        choices=list(LOCATIONS.keys()),
+                        help="Target port (default: houston)")
     parser.add_argument("--start", required=True, metavar="YYYY-MM-DD",
                         help="First day to download (inclusive)")
     parser.add_argument("--end",   required=True, metavar="YYYY-MM-DD",
                         help="Last day to download (inclusive)")
-    parser.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR),
-                        help=f"Output directory (default: {DEFAULT_OUT_DIR})")
+    parser.add_argument("--out-dir", default=None,
+                        help="Output directory (default: data/parquet/<location>)")
     parser.add_argument("--force", action="store_true",
                         help="Re-download and overwrite existing Parquet files")
+    parser.add_argument("--delay", type=float, default=3.0,
+                        help="Seconds to wait between downloads (default: 3)")
     args = parser.parse_args()
 
+    loc     = LOCATIONS[args.location]
     start   = date.fromisoformat(args.start)
     end     = date.fromisoformat(args.end)
-    out_dir = Path(args.out_dir)
+    out_dir = Path(args.out_dir) if args.out_dir else loc["out_dir"]
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    log.info("Location : %s  bbox LAT[%.2f,%.2f] LON[%.2f,%.2f]",
+             args.location, loc["lat_min"], loc["lat_max"], loc["lon_min"], loc["lon_max"])
     log.info("Downloading %s → %s into %s", start, end, out_dir)
 
     ok = failed = 0
     d = start
     while d <= end:
-        result = download_day(d, out_dir, force=args.force)
+        result = download_day(
+            d, out_dir, force=args.force,
+            lat_min=loc["lat_min"], lat_max=loc["lat_max"],
+            lon_min=loc["lon_min"], lon_max=loc["lon_max"],
+            prefix=loc["prefix"],
+        )
         if result is not None:
             ok += 1
         else:
             failed += 1
+        if d < end:
+            time.sleep(args.delay)
         d += timedelta(days=1)
 
     log.info("Done — %d downloaded/existing, %d failed/skipped", ok, failed)
