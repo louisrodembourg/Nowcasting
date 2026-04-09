@@ -33,7 +33,7 @@ FEATURE_COLS = [
     "vessel_count", "SOG_mean", "SOG_std", "SOG_median",
     "utilization_rate_rho", "hdbscan_cluster_count", "hdbscan_noise_ratio",
     "membership_score_mean", "membership_score_std",
-    "draft_mean", "draft_std", "blocked_capacity", "tanker_ratio",
+    "draft_mean", "draft_std", "blocked_capacity", "cargo_ratio",
 ]
 
 # Default hyperparameters
@@ -209,7 +209,7 @@ def run_lbo(
     """
     path = Path(features_path) if features_path is not None else FEATURES_PATH
     df = pl.read_parquet(path).sort("date")
-    log.info("Loaded %d days × %d features", *df.select(FEATURE_COLS).shape)
+    log.info("Loaded %d days × 12 features", df.shape[0])
 
     # Step 1 — normalise
     X_norm = normalize_features(df)

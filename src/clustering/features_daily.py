@@ -1,5 +1,5 @@
 """
-Extract the 13 daily feature vector for the Houston manifold input.
+Extract the 13 daily feature vector for the manifold input.
 
 Features (one row per day):
   1.  vessel_count           — distinct MMSI in bbox that day
@@ -14,7 +14,7 @@ Features (one row per day):
   10. draft_mean             — mean max-draft among static episodes (m)
   11. draft_std              — std of draft
   12. blocked_capacity       — Σ(Length × Width) for static episodes (m² proxy)
-  13. tanker_ratio           — tanker MMSI fraction among static MMSI (VesselType 80–89)
+  13. cargo_ratio            — cargo/container MMSI fraction among static MMSI (VesselType 70–79)
 
 Usage (standalone, one day):
     python src/clustering/features_daily.py --date 2017-07-01
@@ -100,7 +100,7 @@ def compute_daily_features(
             "draft_mean":            0.0,
             "draft_std":             0.0,
             "blocked_capacity":      0.0,
-            "tanker_ratio":          0.0,
+            "cargo_ratio":           0.0,
         }
 
     labels     = cluster_df["cluster_label"].to_numpy()
@@ -126,10 +126,10 @@ def compute_daily_features(
     )
     blocked_capacity = _f(cap_series.sum())
 
-    # Tanker ratio: count unique MMSI (not episodes) with VesselType 80–89
-    n_static_mmsi  = cluster_df["MMSI"].n_unique()
-    tanker_mmsi    = cluster_df.filter(pl.col("VesselType").is_between(80, 89))["MMSI"].n_unique()
-    tanker_ratio   = tanker_mmsi / n_static_mmsi if n_static_mmsi > 0 else 0.0
+    # Cargo ratio: count unique MMSI with VesselType 70–79 (cargo / container ships)
+    n_static_mmsi = cluster_df["MMSI"].n_unique()
+    cargo_mmsi    = cluster_df.filter(pl.col("VesselType").is_between(70, 79))["MMSI"].n_unique()
+    cargo_ratio   = cargo_mmsi / n_static_mmsi if n_static_mmsi > 0 else 0.0
 
     return {
         "date":                  d.isoformat(),
@@ -145,7 +145,7 @@ def compute_daily_features(
         "draft_mean":            round(draft_mean, 2),
         "draft_std":             round(draft_std,  2),
         "blocked_capacity":      round(blocked_capacity, 1),
-        "tanker_ratio":          round(tanker_ratio, 4),
+        "cargo_ratio":           round(cargo_ratio, 4),
     }
 
 
