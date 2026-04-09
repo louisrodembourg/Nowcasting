@@ -37,7 +37,7 @@ FEATURE_COLS = [
 ]
 
 # Default hyperparameters
-DEFAULT_K              = 7   # K-nearest neighbours
+DEFAULT_K              = 15  # K-nearest neighbours
 DEFAULT_N_EIGENVECTORS = 8   # number of eigenvectors to compute (excl. trivial ϕ0)
 
 
@@ -54,6 +54,15 @@ def normalize_features(df: pl.DataFrame) -> np.ndarray:
     Returns a (N, 13) float64 numpy array.
     """
     X = df.select(FEATURE_COLS).cast(pl.Float64).to_numpy()
+    # Step 1: min-max per feature so each column spans [0,1]
+    # This prevents quasi-constant features (e.g. utilization_rate_rho ≈ 1.0)
+    # from dominating the distance metric and collapsing the manifold geometry.
+    col_min = X.min(axis=0)
+    col_max = X.max(axis=0)
+    col_range = col_max - col_min
+    col_range[col_range == 0] = 1.0   # guard for constant features
+    X = (X - col_min) / col_range
+    # Step 2: L2 per row (captures relative congestion patterns, not absolute magnitudes)
     norms = np.linalg.norm(X, axis=1, keepdims=True)
     norms[norms == 0] = 1.0   # avoid div-by-zero for Harvey days
     return X / norms
