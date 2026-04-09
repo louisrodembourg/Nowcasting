@@ -129,7 +129,10 @@ def download_day(
         con.execute(f"""
             COPY (
                 SELECT *
-                FROM read_csv_auto('{tmp_csv}')
+                FROM read_csv('{tmp_csv}',
+                    delim=',', quote='"', escape='"', header=true,
+                    ignore_errors=true, null_padding=true
+                )
                 WHERE LAT  BETWEEN {lat_min} AND {lat_max}
                   AND LON  BETWEEN {lon_min} AND {lon_max}
                   AND MMSI BETWEEN 200000000 AND 999999999

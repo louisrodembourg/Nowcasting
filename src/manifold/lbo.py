@@ -187,6 +187,7 @@ def run_lbo(
     k: int = DEFAULT_K,
     n_eigenvectors: int = DEFAULT_N_EIGENVECTORS,
     features_path: Path | None = None,
+    output_path: Path | None = None,
 ) -> pl.DataFrame:
     """
     Full LBO pipeline on a features parquet (default: houston_daily_features.parquet).
@@ -226,9 +227,10 @@ def run_lbo(
         if isinstance(extra_cols[name], list)
     ])
 
-    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    df_out.write_parquet(OUTPUT_PATH)
-    log.info("Saved manifold output → %s", OUTPUT_PATH)
+    out = Path(output_path) if output_path is not None else OUTPUT_PATH
+    out.parent.mkdir(parents=True, exist_ok=True)
+    df_out.write_parquet(out)
+    log.info("Saved manifold output → %s", out)
     return df_out
 
 
