@@ -41,11 +41,12 @@ RHO_THRESHOLD = 0.85                # fraction du ρ baseline → "retour à la 
 N_CONSECUTIVE = 3                   # jours consécutifs sous le seuil pour valider
 
 
-def load_model(device: torch.device) -> tuple[LWRPINN, dict]:
-    if not MODEL_PATH.exists():
-        raise FileNotFoundError(f"Modèle non trouvé : {MODEL_PATH} — lancez train.py d'abord")
+def load_model(device: torch.device, model_path: Path = MODEL_PATH) -> tuple[LWRPINN, dict]:
+    mp = Path(model_path)
+    if not mp.exists():
+        raise FileNotFoundError(f"Modèle non trouvé : {mp} — lancez train.py d'abord")
 
-    checkpoint = torch.load(MODEL_PATH, map_location=device)
+    checkpoint = torch.load(mp, map_location=device)
     model = LWRPINN(hidden_layers=4, hidden_size=64).to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
@@ -57,29 +58,37 @@ def load_model(device: torch.device) -> tuple[LWRPINN, dict]:
 
 
 def compute_time_to_clear(
-    rho_threshold:  float = RHO_THRESHOLD,
-    n_consecutive:  int   = N_CONSECUTIVE,
-    n_eval_days:    int   = 60,
+    rho_threshold:  float       = RHO_THRESHOLD,
+    n_consecutive:  int         = N_CONSECUTIVE,
+    n_eval_days:    int         = 60,
+    features_path:  Path        = FEATURES_PATH,
+    model_path:     Path        = MODEL_PATH,
+    output_path:    Path        = OUTPUT_PATH,
+    harvey_peak:    date | str  = HARVEY_PEAK,
 ) -> pl.DataFrame:
     """
-    Évalue ρ(x=0.5, t) sur n_eval_days jours après le pic Harvey.
+    Évalue ρ(x=0.5, t) sur n_eval_days jours après le pic.
     Calcule le TTC et produit un DataFrame journalier avec :
         date, rho_pred, v_pred, is_cleared, time_to_clear_days
     """
+    if isinstance(harvey_peak, str):
+        harvey_peak = date.fromisoformat(harvey_peak)
+
     device = get_device()
-    model, checkpoint = load_model(device)
+    model, checkpoint = load_model(device, model_path=Path(model_path))
 
     train_start = date.fromisoformat(checkpoint["train_start"])
     train_end   = date.fromisoformat(checkpoint["train_end"])
     n_train_days = (train_end - train_start).days + 1
 
-    # Baseline ρ : moyenne sur les jours normaux (avant Harvey)
-    df_feat = pl.read_parquet(FEATURES_PATH).sort("date")
-    harvey_start = date(2017, 8, 25)
-    harvey_end   = date(2017, 8, 31)
+    # Baseline ρ : moyenne sur les jours normaux (hors fenêtre de crise)
+    df_feat = pl.read_parquet(Path(features_path)).sort("date")
+    # Use ±2 weeks around peak as "crisis" exclusion window
+    crisis_start = harvey_peak - timedelta(days=14)
+    crisis_end   = harvey_peak + timedelta(days=14)
     baseline_rho = float(
         df_feat
-        .filter(~pl.col("date").is_between(harvey_start, harvey_end))
+        .filter(~pl.col("date").is_between(crisis_start, crisis_end))
         .filter(pl.col("utilization_rate_rho") > 0)
         ["utilization_rate_rho"]
         .mean()
@@ -87,8 +96,8 @@ def compute_time_to_clear(
     rho_threshold_abs = baseline_rho * rho_threshold
     log.info("Baseline ρ = %.4f | seuil TTC = %.4f", baseline_rho, rho_threshold_abs)
 
-    # Grille temporelle d'évaluation : depuis HARVEY_PEAK
-    eval_dates = [HARVEY_PEAK + timedelta(days=i) for i in range(n_eval_days)]
+    # Grille temporelle d'évaluation : depuis le pic
+    eval_dates = [harvey_peak + timedelta(days=i) for i in range(n_eval_days)]
 
     # Harvey fait chuter ρ → 0 (port fermé).
     # TTC = temps pour que ρ remonte AU-DESSUS du seuil (retour à la normale).
@@ -135,13 +144,14 @@ def compute_time_to_clear(
     df_out = pl.DataFrame(rows).with_columns(pl.col("date").str.to_date())
 
     if ttc_found:
-        log.info("Time to Clear = %d jours (depuis le pic Harvey %s)", ttc_days, HARVEY_PEAK)
+        log.info("Time to Clear = %d jours (depuis le pic %s)", ttc_days, harvey_peak)
     else:
         log.warning("TTC non atteint dans la fenêtre de %d jours — augmenter n_eval_days", n_eval_days)
 
-    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    df_out.write_parquet(OUTPUT_PATH)
-    log.info("Sauvegardé → %s", OUTPUT_PATH)
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    df_out.write_parquet(out)
+    log.info("Sauvegardé → %s", out)
     return df_out
 
 

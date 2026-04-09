@@ -1,23 +1,23 @@
 """
-Phase 1 orchestrator — Houston Ship Channel AIS → Daily feature matrix.
+Phase 1 orchestrator — AIS → Daily feature matrix.
 
 Steps for each day in [--start, --end]:
   1. Download daily ZIP from Marine Cadastre → filtered Parquet (skip if exists)
   2. HDBSCAN clustering on stationary vessels (SOG < 1 kt)
   3. Extract 13 daily features from traffic + cluster data
 
-Writes the feature matrix to data/features/houston_daily_features.parquet
+Writes the feature matrix to data/features/<location>_daily_features.parquet
 (appends or merges with existing data if the file already exists).
 
 Usage (run from Nowcasting/ root):
-    # Full pipeline: download + process
+    # Houston (default) — download + process
     python run_phase1.py --start 2017-07-25 --end 2017-09-15
 
-    # Process only (Parquets already downloaded)
-    python run_phase1.py --start 2017-07-25 --end 2017-09-15 --no-download
+    # LA/Long Beach — process only (already downloaded)
+    python run_phase1.py --location la --start 2019-01-01 --end 2019-12-31 --no-download
 
-    # Force re-download (e.g. after bbox change)
-    python run_phase1.py --start 2017-08-01 --end 2017-08-31 --force
+    # Force re-download
+    python run_phase1.py --location houston --start 2017-08-01 --end 2017-08-31 --force
 """
 import argparse
 import logging
@@ -27,19 +27,19 @@ from pathlib import Path
 
 import polars as pl
 
-from src.ingestion.download import download_day
+from src.ingestion.download import download_day, LOCATIONS
 from src.clustering.hdbscan_daily import cluster_day
 from src.clustering.features_daily import compute_daily_features
 
 log = logging.getLogger(__name__)
 
-PARQUET_DIR   = Path("data/parquet/houston")
-FEATURES_PATH = Path("data/features/houston_daily_features.parquet")
-
 
 def run_pipeline(
     start: date,
     end: date,
+    parquet_dir: Path,
+    prefix: str,
+    loc_cfg: dict,
     skip_download: bool = False,
     force: bool = False,
     delay: float = 3.0,
@@ -48,18 +48,23 @@ def run_pipeline(
     Run the full Phase 1 pipeline for [start, end].
     Returns a DataFrame with 14 columns (date + 13 features), one row per day.
     """
-    PARQUET_DIR.mkdir(parents=True, exist_ok=True)
+    parquet_dir.mkdir(parents=True, exist_ok=True)
 
     rows = []
     d = start
     while d <= end:
-        parquet_path = PARQUET_DIR / f"houston_{d.strftime('%Y_%m_%d')}.parquet"
+        parquet_path = parquet_dir / f"{prefix}_{d.strftime('%Y_%m_%d')}.parquet"
 
         # Step 1 — download
         if not skip_download:
             try:
                 already_existed = parquet_path.exists() and not force
-                result = download_day(d, PARQUET_DIR, force=force)
+                result = download_day(
+                    d, parquet_dir, force=force,
+                    lat_min=loc_cfg["lat_min"], lat_max=loc_cfg["lat_max"],
+                    lon_min=loc_cfg["lon_min"], lon_max=loc_cfg["lon_max"],
+                    prefix=prefix,
+                )
             except ConnectionAbortedError as exc:
                 log.critical("Network abort: %s", exc)
                 log.critical("Fix your connection then re-run from --start %s", d)
@@ -107,11 +112,9 @@ def save_features(df_new: pl.DataFrame, path: Path) -> None:
 
     if path.exists():
         df_existing = pl.read_parquet(path)
-        # Drop dates that are being re-computed, then append new rows
-        existing_dates = set(df_existing["date"].to_list())
-        new_dates      = set(df_new["date"].to_list())
-        df_kept = df_existing.filter(~pl.col("date").is_in(list(new_dates)))
-        df_merged = pl.concat([df_kept, df_new]).sort("date")
+        new_dates  = set(df_new["date"].to_list())
+        df_kept    = df_existing.filter(~pl.col("date").is_in(list(new_dates)))
+        df_merged  = pl.concat([df_kept, df_new]).sort("date")
         log.info(
             "Merged: %d existing + %d new = %d total days",
             len(df_existing), len(df_new), len(df_merged),
@@ -124,8 +127,10 @@ def save_features(df_new: pl.DataFrame, path: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Phase 1 — Houston AIS → 13 daily features matrix"
+        description="Phase 1 — AIS → 13 daily features matrix"
     )
+    parser.add_argument("--location",    default="houston", choices=list(LOCATIONS.keys()),
+                        help="Target port (default: houston)")
     parser.add_argument("--start",       required=True, metavar="YYYY-MM-DD",
                         help="First day (inclusive)")
     parser.add_argument("--end",         required=True, metavar="YYYY-MM-DD",
@@ -138,27 +143,39 @@ def main() -> None:
                         help="Pause between downloads in seconds (default: 3)")
     args = parser.parse_args()
 
+    loc_cfg     = LOCATIONS[args.location]
+    parquet_dir = loc_cfg["out_dir"]
+    prefix      = loc_cfg["prefix"]
+    features_path = Path(f"data/features/{args.location}_daily_features.parquet")
+
     start = date.fromisoformat(args.start)
     end   = date.fromisoformat(args.end)
 
-    log.info("=== Phase 1 — Houston Ship Channel ===")
-    log.info("Period : %s → %s (%d days)", start, end, (end - start).days + 1)
-    log.info("Download: %s (delay=%.0fs)", "skip" if args.no_download else "yes", args.delay)
+    log.info("=== Phase 1 — %s ===", args.location.upper())
+    log.info("Period   : %s → %s (%d days)", start, end, (end - start).days + 1)
+    log.info("Parquets : %s", parquet_dir)
+    log.info("Features : %s", features_path)
+    log.info("Download : %s (delay=%.0fs)", "skip" if args.no_download else "yes", args.delay)
 
     df_features = run_pipeline(
-        start, end, skip_download=args.no_download, force=args.force, delay=args.delay
+        start, end,
+        parquet_dir=parquet_dir,
+        prefix=prefix,
+        loc_cfg=loc_cfg,
+        skip_download=args.no_download,
+        force=args.force,
+        delay=args.delay,
     )
 
     if len(df_features) == 0:
         log.error("Pipeline produced no output.")
         return
 
-    save_features(df_features, FEATURES_PATH)
+    save_features(df_features, features_path)
 
-    # Summary
     log.info("\n--- Feature matrix summary ---")
-    log.info("Shape   : %d days × %d features", *df_features.shape)
-    log.info("Date range: %s → %s", df_features["date"].min(), df_features["date"].max())
+    log.info("Shape      : %d days × %d features", *df_features.shape)
+    log.info("Date range : %s → %s", df_features["date"].min(), df_features["date"].max())
     log.info("vessel_count  avg=%.0f  max=%d",
              df_features["vessel_count"].mean(), df_features["vessel_count"].max())
     log.info("clusters      avg=%.1f  max=%d",

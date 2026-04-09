@@ -55,6 +55,7 @@ def prepare_training_data(
     train_start: date,
     train_end:   date,
     device: torch.device,
+    features_path: Path = FEATURES_PATH,
 ) -> dict[str, torch.Tensor]:
     """
     Extrait et normalise les données AIS pour l'entraînement.
@@ -67,7 +68,7 @@ def prepare_training_data(
     Retourne un dict de tenseurs sur `device`.
     """
     df = (
-        pl.read_parquet(FEATURES_PATH)
+        pl.read_parquet(features_path)
         .sort("date")
         .filter(pl.col("date").is_between(train_start, train_end))
     )
@@ -136,17 +137,24 @@ def prepare_training_data(
 # ---------------------------------------------------------------------------
 
 def train(
-    epochs:      int   = DEFAULT_EPOCHS,
-    lr:          float = DEFAULT_LR,
-    lambda_pde:  float = DEFAULT_LAMBDA_PDE,
-    lambda_bc:   float = DEFAULT_LAMBDA_BC,
-    train_start: date  = TRAIN_START,
-    train_end:   date  = TRAIN_END,
+    epochs:        int   = DEFAULT_EPOCHS,
+    lr:            float = DEFAULT_LR,
+    lambda_pde:    float = DEFAULT_LAMBDA_PDE,
+    lambda_bc:     float = DEFAULT_LAMBDA_BC,
+    train_start:   date  = TRAIN_START,
+    train_end:     date  = TRAIN_END,
+    features_path: Path  = FEATURES_PATH,
+    model_path:    Path  = MODEL_PATH,
 ) -> LWRPINN:
+    if isinstance(train_start, str):
+        train_start = date.fromisoformat(train_start)
+    if isinstance(train_end, str):
+        train_end = date.fromisoformat(train_end)
+
     device = get_device()
     log.info("Device: %s", device)
 
-    data  = prepare_training_data(train_start, train_end, device)
+    data  = prepare_training_data(train_start, train_end, device, features_path=Path(features_path))
     model = LWRPINN(hidden_layers=4, hidden_size=64).to(device)
     opt   = optim.Adam(model.parameters(), lr=lr)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(opt, patience=200, factor=0.5)
@@ -196,7 +204,8 @@ def train(
     if best_state:
         model.load_state_dict(best_state)
 
-    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    mp = Path(model_path)
+    mp.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
         "model_state": model.state_dict(),
         "train_start": train_start.isoformat(),
@@ -206,8 +215,8 @@ def train(
         "epochs":      epochs,
         "lambda_pde":  lambda_pde,
         "lambda_bc":   lambda_bc,
-    }, MODEL_PATH)
-    log.info("Modèle sauvegardé → %s  (best_loss=%.6f)", MODEL_PATH, best_loss)
+    }, mp)
+    log.info("Modèle sauvegardé → %s  (best_loss=%.6f)", mp, best_loss)
     return model
 
 

@@ -111,15 +111,26 @@ def compute_gravity_score(
 
 
 def run_gravity_score(
-    harvey_start: date = HARVEY_START,
-    harvey_end:   date = HARVEY_END,
+    harvey_start: date | str = HARVEY_START,
+    harvey_end:   date | str = HARVEY_END,
+    manifold_path: Path | None = None,
+    output_path:   Path | None = None,
 ) -> pl.DataFrame:
-    df     = pl.read_parquet(MANIFOLD_PATH).sort("date")
+    from datetime import date as date_type
+    if isinstance(harvey_start, str):
+        harvey_start = date_type.fromisoformat(harvey_start)
+    if isinstance(harvey_end, str):
+        harvey_end = date_type.fromisoformat(harvey_end)
+
+    src = Path(manifold_path) if manifold_path is not None else MANIFOLD_PATH
+    out = Path(output_path)   if output_path   is not None else OUTPUT_PATH
+
+    df     = pl.read_parquet(src).sort("date")
     df_out = compute_gravity_score(df, harvey_start, harvey_end)
 
-    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    df_out.write_parquet(OUTPUT_PATH)
-    log.info("Saved → %s", OUTPUT_PATH)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    df_out.write_parquet(out)
+    log.info("Saved → %s", out)
     return df_out
 
 
