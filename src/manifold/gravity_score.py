@@ -1,8 +1,8 @@
 """
-Phase 2 — Manifold : Gravity Score (Étape 5).
+Phase 2 — Manifold : Score de Gravité (Étape 5).
 
-Prend en entrée le manifold (houston_manifold.parquet) et calcule le
-Score de Gravité journalier :
+Prend le manifold en entrée (houston_manifold.parquet) et calcule
+le Score de Gravité quotidien :
 
     gravity_score_i = Σ_c  |ϕ_c(i) - μ_c|  ×  blocked_capacity_i
                       ─────────────────────────────────────────────
@@ -10,15 +10,15 @@ Score de Gravité journalier :
 
 Où :
   - ϕ_c(i)          : coordonnée du jour i sur le c-ième vecteur propre
-  - μ_c, σ_c        : moyenne et std de ϕ_c sur la période baseline (jours non-Harvey)
-  - blocked_capacity: capacité bloquée (Σ Length×Width) du jour i
+  - μ_c, σ_c        : moyenne et écart-type de ϕ_c sur la période baseline (jours non-Harvey)
+  - blocked_capacity: capacité bloquée (Σ Longueur×Largeur) du jour i
   - baseline_capacity: médiane de blocked_capacity sur la baseline
 
-Le score est normalisé [0, 1] sur la période entière.
-Les jours Harvey (port fermé) ont un blocked_capacity=0 → score=0 par conception,
+Le score est normalisé à [0, 1] sur toute la période.
+Les jours Harvey (port fermé) ont blocked_capacity=0 → score=0 par conception,
 puis remplacés par la valeur max post-Harvey (réouverture = pic de gravité réelle).
 
-Usage:
+Usage :
     python src/manifold/gravity_score.py
     python src/manifold/gravity_score.py --harvey-start 2017-08-25 --harvey-end 2017-08-31
 """
@@ -48,45 +48,45 @@ def compute_gravity_score(
     harvey_end:   date = HARVEY_END,
 ) -> pl.DataFrame:
     """
-    Compute the gravity score for each day in the manifold DataFrame.
+    Calcule le score de gravité pour chaque jour du DataFrame manifold.
 
-    Returns df with two additional columns:
-        deviation_score : raw manifold deviation (unscaled)
-        gravity_score   : final score ∈ [0, 1], weighted by blocked_capacity
+    Retourne df avec deux colonnes supplémentaires :
+        deviation_score : déviation brute du manifold (non normalisée)
+        gravity_score   : score final ∈ [0, 1], pondéré par blocked_capacity
     """
     phi_cols = sorted([c for c in df.columns if c.startswith("phi_")])
     if not phi_cols:
-        raise ValueError("No phi_ columns found — run lbo.py first")
+        raise ValueError("Aucune colonne phi_ trouvée — exécutez d'abord lbo.py")
 
     dates = df["date"].to_list()
 
-    # Baseline mask: days outside Harvey window (normal operations)
+    # Masque baseline : jours en dehors de la fenêtre Harvey (opérations normales)
     baseline_mask = np.array([
         not (harvey_start <= d <= harvey_end) for d in dates
     ])
 
     phi_matrix = df.select(phi_cols).to_numpy()   # (N, n_components)
 
-    # μ and σ on baseline only
+    # Moyenne et écart-type sur la baseline uniquement
     phi_baseline = phi_matrix[baseline_mask]
     mu    = phi_baseline.mean(axis=0)
     sigma = phi_baseline.std(axis=0)
-    sigma[sigma == 0] = 1.0   # guard
+    sigma[sigma == 0] = 1.0   # protection
 
-    # Normalised deviation from baseline for each day
+    # Déviation normalisée par rapport à la baseline pour chaque jour
     deviation = np.abs((phi_matrix - mu) / sigma).mean(axis=1)  # (N,)
 
-    # Capacity weight: blocked_capacity / baseline median
+    # Poids de capacité : blocked_capacity / médiane baseline
     capacity        = df["blocked_capacity"].to_numpy().astype(float)
     baseline_cap    = np.median(capacity[baseline_mask & (capacity > 0)])
     if baseline_cap == 0:
         baseline_cap = 1.0
     cap_weight = capacity / baseline_cap
 
-    # Raw gravity score
+    # Score de gravité brut
     raw_score = deviation * cap_weight
 
-    # Normalise to [0, 1]
+    # Normalisation à [0, 1]
     score_max = raw_score.max()
     score_min = raw_score.min()
     if score_max > score_min:
@@ -94,14 +94,14 @@ def compute_gravity_score(
     else:
         gravity_score = np.zeros_like(raw_score)
 
-    log.info("Gravity score: min=%.4f  max=%.4f  mean=%.4f",
+    log.info("Score de gravité : min=%.4f  max=%.4f  moyenne=%.4f",
              gravity_score.min(), gravity_score.max(), gravity_score.mean())
 
-    # Log top 10 days by score
+    # Enregistre les 10 meilleurs jours par score
     top_idx = np.argsort(gravity_score)[::-1][:10]
-    log.info("Top 10 gravity days:")
+    log.info("Top 10 jours de gravité :")
     for i in top_idx:
-        log.info("  %s  score=%.4f  capacity=%.0f  deviation=%.4f",
+        log.info("  %s  score=%.4f  capacité=%.0f  déviation=%.4f",
                  dates[i], gravity_score[i], capacity[i], deviation[i])
 
     return df.with_columns([
@@ -116,6 +116,7 @@ def run_gravity_score(
     manifold_path: Path | None = None,
     output_path:   Path | None = None,
 ) -> pl.DataFrame:
+    """Fonction wrapper pour convertir les dates en string et exécuter le pipeline complet."""
     from datetime import date as date_type
     if isinstance(harvey_start, str):
         harvey_start = date_type.fromisoformat(harvey_start)
@@ -125,17 +126,20 @@ def run_gravity_score(
     src = Path(manifold_path) if manifold_path is not None else MANIFOLD_PATH
     out = Path(output_path)   if output_path   is not None else OUTPUT_PATH
 
+    # Charge le manifold et calcule les scores de gravité
     df     = pl.read_parquet(src).sort("date")
     df_out = compute_gravity_score(df, harvey_start, harvey_end)
 
+    # Sauvegarde la sortie
     out.parent.mkdir(parents=True, exist_ok=True)
     df_out.write_parquet(out)
-    log.info("Saved → %s", out)
+    log.info("Sauvegardé → %s", out)
     return df_out
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Phase 2 — Gravity Score")
+    """Point d'entrée principal pour exécution autonome — calcul Phase 2 du score de gravité."""
+    parser = argparse.ArgumentParser(description="Phase 2 — Score de Gravité")
     parser.add_argument("--harvey-start", default="2017-08-25", metavar="YYYY-MM-DD")
     parser.add_argument("--harvey-end",   default="2017-08-31", metavar="YYYY-MM-DD")
     args = parser.parse_args()
@@ -144,10 +148,12 @@ def main() -> None:
         harvey_start=date.fromisoformat(args.harvey_start),
         harvey_end=date.fromisoformat(args.harvey_end),
     )
+    # Affiche les résultats triés par score de gravité (le plus élevé en premier)
     print(df.select(["date", "deviation_score", "gravity_score",
                      "blocked_capacity", "is_characteristic"]).sort("gravity_score", descending=True))
 
 
 if __name__ == "__main__":
+    # Configure le logging pour afficher les messages d'info avec timestamps
     logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
     main()

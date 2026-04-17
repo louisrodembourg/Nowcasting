@@ -1,22 +1,22 @@
 """
-Extract the 13 daily feature vector for the Houston manifold input.
+Extraire le vecteur des 13 features quotidiennes pour l'entrée de la variété de Houston.
 
-Features (one row per day):
-  1.  vessel_count           — distinct MMSI in bbox that day
-  2.  SOG_mean               — mean corrected SOG across all messages
-  3.  SOG_std                — std of corrected SOG
-  4.  SOG_median             — median corrected SOG
-  5.  utilization_rate_rho   — fraction of distinct MMSI with ≥1 static episode
-  6.  hdbscan_cluster_count  — number of non-noise HDBSCAN clusters
-  7.  hdbscan_noise_ratio    — noise episodes / total static episodes
-  8.  membership_score_mean  — mean HDBSCAN membership probability (non-noise)
-  9.  membership_score_std   — std of membership probabilities
-  10. draft_mean             — mean max-draft among static episodes (m)
-  11. draft_std              — std of draft
-  12. blocked_capacity       — Σ(Length × Width) for static episodes (m² proxy)
-  13. tanker_ratio           — tanker MMSI fraction among static MMSI (VesselType 80–89)
+Features (une ligne par jour) :
+  1.  vessel_count           — nombre distinct de MMSI dans la bbox ce jour-là
+  2.  SOG_mean               — SOG moyen corrigé sur tous les messages
+  3.  SOG_std                — écart-type de la SOG corrigée
+  4.  SOG_median             — médiane de la SOG corrigée
+  5.  utilization_rate_rho   — fraction de MMSI distincts avec ≥1 épisode statique
+  6.  hdbscan_cluster_count  — nombre de clusters HDBSCAN (hors bruit)
+  7.  hdbscan_noise_ratio    — épisodes bruits / total épisodes statiques
+  8.  membership_score_mean  — probabilité moyenne d'appartenance HDBSCAN (hors bruit)
+  9.  membership_score_std   — écart-type des probabilités d'appartenance
+  10. draft_mean             — tirant d'eau moyen parmi les épisodes statiques (m)
+  11. draft_std              — écart-type du tirant d'eau
+  12. blocked_capacity       — Σ(Longueur × Largeur) pour épisodes statiques (proxy m²)
+  13. tanker_ratio           — fraction MMSI pétroliers parmi MMSI statiques (VesselType 80–89)
 
-Usage (standalone, one day):
+Usage (autonome, un jour):
     python src/clustering/features_daily.py --date 2017-07-01
 """
 import argparse
@@ -39,7 +39,7 @@ PARQUET_DIR = Path("data/parquet/houston")
 
 
 def _f(val, default: float = 0.0) -> float:
-    """Safely cast a nullable Polars scalar to float."""
+    """Convertit de manière sûre un scalaire Polars nullable en float."""
     return float(val) if val is not None else default
 
 
@@ -49,43 +49,48 @@ def compute_daily_features(
     d: date,
 ) -> Optional[dict]:
     """
-    Compute 13 daily features for the manifold.
+    Calcule les 13 features quotidiennes pour la variété.
 
     Args:
-        day_data:    Path to raw Parquet OR a prepared DataFrame (with SOG_corr column).
-                     When a DataFrame is passed (already prepared by prepare_kinematics),
-                     corrected SOG is used for traffic stats. Otherwise raw SOG is used.
-        cluster_df:  Output of cluster_day() — one row per static episode + cluster metadata.
-                     Pass None if HDBSCAN produced no result (HDBSCAN features default to 0).
-        d:           The date, used as the 'date' key in the output dict.
+        day_data:    Chemin vers le Parquet brut OU un DataFrame préparé (avec colonne SOG_corr).
+                     Quand un DataFrame est passé (déjà préparé par prepare_kinematics),
+                     la SOG corrigée est utilisée pour les stats de trafic. Sinon la SOG brute est utilisée.
+        cluster_df:  Sortie de cluster_day() — une ligne par épisode statique + métadonnées du cluster.
+                     Passer None si HDBSCAN n'a produit aucun résultat (features HDBSCAN défaut 0).
+        d:           La date, utilisée comme clé 'date' dans le dict de sortie.
 
-    Returns a dict with 14 keys (date + 13 features), or None if data is missing.
+    Retourne un dict avec 14 clés (date + 13 features), ou None si les données manquent.
     """
+    # Vérifie si day_data est un chemin ou un DataFrame déjà préparé
     if isinstance(day_data, Path):
         if not day_data.exists():
-            log.warning("%s: Parquet not found — %s", d, day_data)
+            log.warning("%s : Parquet non trouvé — %s", d, day_data)
             return None
+        # Charge le fichier brut et utilise la SOG brute
         all_df = pl.read_parquet(day_data)
         sog_col = "SOG"
     else:
+        # Utilise le DataFrame préparé, préférant la SOG corrigée si disponible
         all_df  = day_data
         sog_col = "SOG_corr" if "SOG_corr" in all_df.columns else "SOG"
 
-    # --- Overall traffic (all messages, all vessels) -------------------------
-    vessel_count = all_df["MMSI"].n_unique()
-    sog_mean     = _f(all_df[sog_col].mean())
-    sog_std      = _f(all_df[sog_col].std())
-    sog_median   = _f(all_df[sog_col].median())
+    # --- Trafic global (tous les messages, tous les navires) ----------------
+    vessel_count = all_df["MMSI"].n_unique()  # Nombre distinct de navires
+    sog_mean     = _f(all_df[sog_col].mean())  # Vitesse moyenne
+    sog_std      = _f(all_df[sog_col].std())   # Variabilité de vitesse
+    sog_median   = _f(all_df[sog_col].median())  # Vitesse médiane
 
-    # --- Static fraction: distinct MMSI with ≥1 static episode --------------
+    # --- Fraction statique : MMSI distinct avec ≥1 épisode statique ---------
     static_mmsi_count = (
         all_df.filter(pl.col(sog_col) < SOG_STATIC_THRESHOLD)["MMSI"].n_unique()
     )
+    # Ratio d'utilisation = navires statiques / navires totaux
     utilization_rate_rho = static_mmsi_count / vessel_count if vessel_count > 0 else 0.0
 
-    # --- HDBSCAN-derived features --------------------------------------------
+    # --- Features dérivées de HDBSCAN ------------------------------------------
+    # Si pas de résultats de clustering, retourne les features par défaut (0)
     if cluster_df is None or len(cluster_df) == 0:
-        log.warning("%s: no cluster data — HDBSCAN features set to 0", d)
+        log.warning("%s : aucune donnée de cluster — features HDBSCAN mises à 0", d)
         return {
             "date":                  d.isoformat(),
             "vessel_count":          vessel_count,
@@ -103,30 +108,38 @@ def compute_daily_features(
             "tanker_ratio":          0.0,
         }
 
+    # Extrait les labels de cluster et calcule les statistiques de clustering
     labels     = cluster_df["cluster_label"].to_numpy()
-    n_episodes = len(cluster_df)                              # static episodes
-    n_noise    = int((labels == -1).sum())
-    n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
-    non_noise  = cluster_df.filter(pl.col("cluster_label") >= 0)
+    n_episodes = len(cluster_df)                              # épisodes statiques
+    n_noise    = int((labels == -1).sum())                     # points bruits
+    n_clusters = len(set(labels)) - (1 if -1 in labels else 0)  # clusters significatifs
+    non_noise  = cluster_df.filter(pl.col("cluster_label") >= 0)  # exclu le bruit
 
+    # Ratio de bruit et scores d'appartenance
     hdbscan_noise_ratio   = n_noise / n_episodes if n_episodes > 0 else 1.0
     membership_score_mean = _f(non_noise["membership_score"].mean())
     membership_score_std  = _f(non_noise["membership_score"].std())
 
-    # Draft: ignore zero / unknown values
+    # Tirant d'eau : ignorer les valeurs zéro / inconnues
     draft_series   = cluster_df.filter(pl.col("Draft") > 0)["Draft"]
     draft_mean     = _f(draft_series.mean())
     draft_std      = _f(draft_series.std())
 
-    # Blocked capacity: Σ(Length × Width) — ignore vessels with unknown dimensions
+    # Capacité bloquée : Σ(Longueur × Largeur) — ignorer les navires avec dimensions inconnues
     cap_series = (
         cluster_df
         .filter((pl.col("Length") > 0) & (pl.col("Width") > 0))
         .select((pl.col("Length") * pl.col("Width")).alias("cap"))["cap"]
     )
+
+    # Enregistre le nombre d'épisodes avec dimensions valides
+    n_before = len(cluster_df)
+    n_after = len(cap_series)
+    log.info("%s : %d épisodes, %d avec dimensions valides pour blocked_capacity", d, n_before, n_after)
+
     blocked_capacity = _f(cap_series.sum())
 
-    # Tanker ratio: count unique MMSI (not episodes) with VesselType 80–89
+    # Ratio pétroliérs : compte les MMSI uniques (pas les épisodes) avec VesselType 80–89
     n_static_mmsi  = cluster_df["MMSI"].n_unique()
     tanker_mmsi    = cluster_df.filter(pl.col("VesselType").is_between(80, 89))["MMSI"].n_unique()
     tanker_ratio   = tanker_mmsi / n_static_mmsi if n_static_mmsi > 0 else 0.0
@@ -150,16 +163,19 @@ def compute_daily_features(
 
 
 def main() -> None:
+    """Point d'entrée pour l'exécution autonome — calcul des features pour un jour donné."""
     parser = argparse.ArgumentParser(
-        description="Compute 13 daily features for one day — Houston"
+        description="Calcule les 13 features quotidiennes pour un jour — Houston"
     )
     parser.add_argument("--date", required=True, metavar="YYYY-MM-DD")
     parser.add_argument("--parquet-dir", default=str(PARQUET_DIR))
     args = parser.parse_args()
 
+    # Charge la date et construit le chemin du fichier Parquet
     d            = date.fromisoformat(args.date)
     parquet_path = Path(args.parquet_dir) / f"houston_{d.strftime('%Y_%m_%d')}.parquet"
 
+    # Exécute le pipeline complet : clustering puis extraction des features
     cluster_df, prepared_df = cluster_day(parquet_path)
     features = compute_daily_features(
         prepared_df if prepared_df is not None else parquet_path,
@@ -167,13 +183,15 @@ def main() -> None:
         d,
     )
 
+    # Affiche les résultats ou un message d'erreur
     if features:
         for k, v in features.items():
             print(f"  {k:<26} {v}")
     else:
-        print("No features computed.")
+        print("Aucune feature calculée.")
 
 
 if __name__ == "__main__":
+    # Configure le logging pour afficher les messages d'info avec timestamps
     logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
     main()
