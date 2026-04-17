@@ -18,3 +18,4 @@ yfinance
 folium
 matplotlib
 ipykernel
+plotly

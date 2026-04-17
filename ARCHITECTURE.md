@@ -14,7 +14,7 @@ Modélisation de l'impact des disruptions maritimes sur les indices de fret (BDI
 ╚══════════════════════════════════════════════════════════════════════════════════╝
                                         │
                                download.py
-                          (DuckDB bbox filter → Parquet ZSTD)
+                           (DuckDB bbox filter → Parquet ZSTD)
                                         │
                                         ▼
 ╔══════════════════════════════════════════════════════════════════════════════════╗
@@ -24,9 +24,9 @@ Modélisation de l'impact des disruptions maritimes sur les indices de fret (BDI
 ║  kinematic_filter.py          hdbscan_daily.py          features_daily.py        ║
 ║  ─────────────────            ───────────────           ───────────────          ║
 ║  • SOG haversine corr         • Filtre SOG < 1 kt       • 13 features/jour       ║
-║  • traj_id (gap > 30min)      • HDBSCAN haversine       • vessel_count           ║
-║  • speed_computed_kt          • docked / waiting        • SOG_mean/std/median    ║
-║                               • membership_score        • utilization_rate_rho   ║
+║    si >50kts correction       • HDBSCAN haversine       • vessel_count           ║
+║  • traj_id (gap > 30min)      • docked / waiting        • SOG_mean/std/median    ║
+║  • speed_computed_kt          • membership_score        • utilization_rate_rho   ║
 ║                                                         • cluster_count/noise    ║
 ║                                                         • draft_mean/std         ║
 ║                                                         • blocked_capacity       ║
@@ -35,45 +35,42 @@ Modélisation de l'impact des disruptions maritimes sur les indices de fret (BDI
                                         │
                             <location>_daily_features.parquet
                                         │
-                         ┌──────────────┴──────────────┐
-                         ▼                             ▼
-╔═══════════════════════════════╗      ╔═══════════════════════════════════════════╗
-║  PHASE 2 — MANIFOLD           ║      ║  PHASE 3 — PINNs / TIME TO CLEAR          ║
-║  (run_phase2.py)              ║      ║  (run_phase3.py)                           ║
-╠═══════════════════════════════╣      ╠═══════════════════════════════════════════╣
-║                               ║      ║                                           ║
-║  lbo.py                       ║      ║  lwr_pinn.py                              ║
-║  ────────                     ║      ║  ──────────                               ║
-║  • L2 normalize (13D→13D)     ║      ║  • MLP (x,t) → (ρ, v)                    ║
-║  • KNN k=7 + Gaussian W       ║      ║  • tanh activations                       ║
-║  • LBO = A⁻¹W                 ║      ║  • Loss = L_data + L_PDE + L_BC           ║
-║  • Eigenvectors ϕ₁…ϕ₈        ║      ║  • PDE : ∂ρ/∂t + ∂(ρv)/∂x = 0           ║
-║  • Characteristic points      ║      ║                                           ║
-║                               ║      ║  train.py                                 ║
-║  gravity_score.py             ║      ║  ─────────                                ║
-║  ────────────────             ║      ║  • ρ = utilization_rate_rho               ║
-║  • Baseline vs event window   ║      ║  • v = SOG_mean normalisé                 ║
-║  • deviation = |ϕ - μ| / σ   ║      ║  • x = 0.5 (proxy chenal)                ║
-║  • gravity = dev × capacity   ║      ║  • Adam + ReduceLROnPlateau               ║
-║  • Normalisé [0, 1]           ║      ║  • Gradient clipping max_norm=1.0         ║
-║                               ║      ║                                           ║
-╚═══════════════════════════════╝      ║  predict.py                               ║
-                │                      ║  ──────────                               ║
-                │                      ║  • ρ(x=0.5, t) post-peak                 ║
-                │                      ║  • TTC = ρ ≥ 85% baseline × 3 jours      ║
-                │                      ╚═══════════════════════════════════════════╝
-                │                                       │
-                ▼                                       ▼
-   <location>_gravity_score.parquet      <location>_time_to_clear.parquet
-   <location>_manifold.parquet           outputs/models/<location>_lwr_pinn.pt
-                │
-                ▼
+                 ┌──────────────────────────┴──────────────────────────┐
+                 ▼                                               ▼
+╔═══════════════════════════════╗         ╔═══════════════════════════════════════════╗
+║  PHASE 2 — MANIFOLD          ║         ║  PHASE 3 — PINNs / TIME TO CLEAR          ║
+║  (corrigé géospatial)        ║         ║  (run_phase3.py)                           ║
+╠═══════════════════════════════╣         ╠═══════════════════════════════════════════╣
+║                               ║         ║                                           ║
+║  manifold_pipeline.py         ║         ║  lwr_pinn.py                              ║
+║  ─────────────────           ║         ║  ──────────                               ║
+║  • Matrice zones × jours      ║         ║  • MLP (x,t) → (ρ, v)                    ║
+║  • L2 normalize par zone    ║         ║  • tanh activations                       ║
+║  • KNN + Gaussian W         ║         ║  • Loss = L_data + L_PDE + L_BC           ║
+║  • LBO spectral             ║         ║  • PDE : ∂ρ/∂t + ∂(ρv)/∂x = 0           ║
+║  • Constituent zones ⭐     ║         ║                                           ║
+║                               ║         ║  train.py                                 ║
+║  Scoring quotidien          ║         ║  ─────────                                ║
+║  ─────────────────           ║         ║  • ρ = utilization_rate_rho               ║
+║  • Compter navires           ║         ║  • v = SOG_mean normalisé                 ║
+║    dans zones constituantes║         ║  • x = 0.5 (proxy chenal)                ║
+║  • Sum(capacité × is_const)  ║         ║  • Adam + ReduceLROnPlateau               ║
+║                               ║         ║  • Gradient clipping max_norm=1.0         ║
+╚═══════════════════════════════╝         ║  predict.py                               ║
+                 │                            ║  ──────────                               ║
+                 │                            ║  • ρ(x=0.5, t) post-peak                 ║
+                 │                            ║  • TTC = ρ ≥ 85% baseline × 3 jours      ║
+                 │                            ║  ────────────────────────────────           ║
+                 ▼                            ║
+    <location>_constituent_zones.parquet       ║  <location>_time_to_clear.parquet
+    <location>_gravity_daily.parquet           ║  outputs/models/<location>_lwr_pinn.pt
+                 │
+                 ▼
 ╔══════════════════════════════════════════════════════════════════════════════════╗
-║                    VISUALISATION  (src/utils/visualize.py)                       ║
+║                         VISUALISATION                                           ║
 ╠══════════════════════════════════════════════════════════════════════════════════╣
-║  --date        → Folium cluster map (1 jour)                                     ║
-║  --start/--end → Folium HeatMapWithTime (période animée)                         ║
-║  --gravity     → Matplotlib time series + scatter manifold 2D                    ║
+║  visualize_clusters.py → Polygones sémantiques (MBR/hull) sur carte satellite      ║
+║  manifold_pipeline.py --plot → Courbe gravity score temporelle                  ║
 ╚══════════════════════════════════════════════════════════════════════════════════╝
 ```
 
@@ -99,7 +96,7 @@ Modélisation de l'impact des disruptions maritimes sur les indices de fret (BDI
 | Location | Bbox LAT | Bbox LON | Événement de référence |
 |----------|---------|---------|----------------------|
 | `houston` | [29.3, 29.85] | [-95.4, -94.7] | Hurricane Harvey (août 2017) |
-| `la` | [33.65, 33.85] | [-118.40, -118.05] | Tensions US-Chine (2019) |
+| `la` | [33.65, 33.85] | [-118.40, [-118.05]] | Tensions US-Chine (2019) |
 
 **Colonnes brutes conservées (17) :**
 `MMSI, BaseDateTime, LAT, LON, SOG, COG, Heading, VesselName, IMO, CallSign, VesselType, Status, Length, Width, Draft, Cargo, TransceiverClass`
@@ -123,7 +120,7 @@ Pour chaque navire (MMSI) :
   ├── SOG_corr = speed_computed_kt si SOG déclaré > 50 kt (erreur capteur)
   │             sinon SOG déclaré
   └── traj_id = nouveau segment si Δt > 30 min (gap = trajet distinct)
-              = np.cumsum(gap_mask) par MMSI
+                = np.cumsum(gap_mask) par MMSI
 ```
 
 **Pourquoi haversine et non distance euclidienne ?**
@@ -151,10 +148,6 @@ Pour chaque navire (MMSI) :
    - Heading_std < 25° → "docked"  (caps alignés sur le quai)
    - Heading_std ≥ 25° → "waiting" (caps dispersés par vent/courant)
 ```
-
-**Deux fonctions d'entrée :**
-- `cluster_day(parquet_path)` — lit depuis fichier (pipeline production)
-- `cluster_day_from_df(prepared_df)` — reçoit un DataFrame (notebooks, tests)
 
 ---
 
@@ -186,68 +179,76 @@ Pour chaque navire (MMSI) :
 
 ---
 
-## Phase 2 — Manifold Learning
+## Phase 2 — Manifold Learning (corrigé)
 
-### `src/manifold/lbo.py`
+### `src/manifold/manifold_pipeline.py`
 
-**Rôle :** Projeter la matrice de features dans un espace de faible dimension capturant la géométrie des régimes de trafic.
+**Rôle :** Identifier les zones géographiques "constituantes" (les plus structurantes) 
+puis calculer le gravity score quotidien sur ces zones.
 
-**Entrée :** `<location>_daily_features.parquet` (N jours × 13 features)
+**Entrée :** `<location>_daily_features.parquet` + données Parquet journalières
 
-**Sortie :** `<location>_manifold.parquet` (+ colonnes `phi_1…phi_8`, `eigenvalue_1…8`, `is_characteristic`)
+**Sortie :** 
+- `<location>_constituent_zones.parquet` (zones + is_constituent + phi)
+- `<location>_gravity_daily.parquet` (date, gravity_score, etc.)
+- `outputs/figures/<location>_gravity_score.png`
 
-**Fonctionnement — 4 étapes :**
+**Fonctionnement — 2 phases :**
 
-```
-1. NORMALISATION L2
-   Xi ← Xi / ||Xi||₂   (chaque jour = vecteur unitaire dans R¹³)
-   → Supprime les effets d'échelle entre features
-
-2. MATRICE DE POIDS KNN
-   Pour chaque point i, trouver les k=7 voisins les plus proches
-   W_ij = exp(-||Xi - Xj||² / σ²)   si j ∈ KNN(i)
-   W_ij = 0                          sinon
-   W = symmetrize(W)   →  matrice sparse
-
-3. OPÉRATEUR DE LAPLACE-BELTRAMI
-   A = diag(sommes de lignes de W)   (matrice degrés)
-   LBO = A⁻¹ · W
-   → Diffusion sur la variété des régimes de trafic
-
-4. DÉCOMPOSITION PROPRE
-   W · ϕ = λ · A · ϕ
-   → ϕ₀ trivial (vecteur constant), on garde ϕ₁…ϕ₈
-   → Points caractéristiques = extrema locaux dans le graphe KNN
-```
-
-**Hyperparamètres :** `k=7` voisins, `n_eigenvectors=8`
-
----
-
-### `src/manifold/gravity_score.py`
-
-**Rôle :** Quantifier l'anomalie de chaque jour par rapport au régime normal.
-
-**Entrée :** `<location>_manifold.parquet` + fenêtre d'événement (harvey_start / harvey_end)
-
-**Sortie :** `<location>_gravity_score.parquet` (+ `gravity_score`, `deviation_score`)
-
-**Fonctionnement :**
+#### Phase 2A : Identification des zones constituantes
 
 ```
-baseline = jours HORS fenêtre événement
-μ_c = mean(ϕ_c sur baseline)    pour chaque composante c
-σ_c = std(ϕ_c sur baseline)
+1. CONSTRUIRE LA MATRICE ZONES × JOURS
+   Pour chaque jour :
+     - Extraire les clusters HDBSCAN
+     - Créer une clé de zone (lat_rondé_3, lon_rondé_3)
+     - Compter les navire par zone
+   
+   Matrice X : (n_zones, n_jours)
+   - Ligne = zone géographique unique
+   - Colonne = jour
+   - Valeur = occupation normalisée [0,1]
 
-deviation_i = mean_c(|ϕ_c(i) - μ_c| / σ_c)   (déviation normalisée z-score)
+2. NORMALISATION L2 PAR LIGNE
+   Xi ← Xi / ||Xi||₂   (chaque zone = vecteur unitaire dans R^jours)
 
-cap_weight_i = blocked_capacity_i / max(blocked_capacity)
+3. MATRICE DE POIDS KNN
+   KNN(k=5) + noyau gaussien → W symétrique sparse
 
-raw_score_i = deviation_i × cap_weight_i
-gravity_score_i = (raw_score_i - min) / (max - min)   →  [0, 1]
+4. OPÉRATEUR DE LAPLACE-BELTRAMI
+   LBO = A⁻¹ · W   (A = matrice degrés)
+
+5. DÉCOMPOSITION PROPRE
+   W·φ = λ·A·φ
+   → φ₁…φ₅ vecteurs propres
+
+6. ZONES CONSTITUANTES ⭐
+   = extrema locaux dans le graphe KNN sur φ₁…φ₃
+   → Ce sont les zones géographiques qui capturent la structure du trafic
 ```
 
-**Interprétation :** Un score élevé = jour très anormal (loin du baseline) avec beaucoup de tonnage immobilisé.
+#### Phase 2B : Scoring quotidien
+
+```
+Pour chaque nouveau jour :
+  1. Charger les clusters HDBSCAN du jour
+  2. Identifier quais sont dans les zones constituantes
+  3. gravity_score = Σ(capacité × is_constituent)
+  4. Sauvegarder dans _gravity_daily.parquet
+```
+
+**Commandes :**
+
+```bash
+# Identifier les zones constituantes (une seule fois)
+python src/manifold/manifold_pipeline.py --identify --start 2020-01-01 --end 2020-01-31 --location la
+
+# Scoring quotidien
+python src/manifold/manifold_pipeline.py --score --date 2020-02-01 --location la
+
+# Scoring sur période + graphique
+python src/manifold/manifold_pipeline.py --score --start 2020-02-01 --end 2020-02-07 --location la
+```
 
 ---
 
@@ -279,17 +280,15 @@ Modèle de Greenshields : v = v_max · (1 - ρ/ρ_max)
 
 **Rôle :** Entraîner le PINN sur la fenêtre temporelle de la disruption.
 
-**Données d'entrée (depuis `_daily_features.parquet`) :**
-- `ρ_obs` = `utilization_rate_rho` ∈ [0,1]
-- `v_obs` = `SOG_mean` normalisé par max observé
-- `x` = 0.5 (proxy — centroid du chenal)
+**Données d'entrée (depuis `_gravity_daily.parquet`) :**
+- `ρ_obs` = `gravity_score` ∈ [0,1]
 - `t` = index jour normalisé ∈ [0,1]
 
 **Loss composite :**
 ```
 L_total = L_data + 0.1 · L_PDE + 0.1 · L_BC
 
-L_data = MSE(ρ_pred, ρ_obs) + MSE(v_pred, v_obs)
+L_data = MSE(ρ_pred, ρ_obs)
 L_PDE  = résidu ∂ρ/∂t + ∂(ρv)/∂x sur points de collocation aléatoires
 L_BC   = condition limite : ρ(x=0, t) = ρ(x=1, t) (chenal fermé aux bords)
 ```
@@ -330,15 +329,27 @@ Les phases 1–3 travaillent sur des features agrégées par jour — la géomé
 
 ## Visualisation
 
-### `src/utils/visualize.py`
+### `src/clustering/visualize_clusters.py`
 
-**Trois modes :**
+| Commande | Output |
+|----------|--------|
+| `--date YYYY-MM-DD` | Carte interactive avec polygones sémantiques |
+| `--start … --end …` | Carte avec clusters par jour |
 
-| Commande | Output | Technologie |
-|----------|--------|-------------|
-| `--date YYYY-MM-DD` | Carte interactive clusters HDBSCAN | Folium + CircleMarker |
-| `--start … --end …` | Heatmap animée navires stationnaires | Folium HeatMapWithTime |
-| `--gravity` | Time series gravity score + scatter manifold 2D | Matplotlib |
+**Fonctionnalités :**
+- Rectangles orientés (MBR) pour clusters "docked" (bleu)
+- Convex Hulls pour clusters "waiting" (orange)
+- Couche satellite ESRI en overlay
+- Popups avec vignette satellite
+
+### `src/manifold/manifold_pipeline.py --plot`
+
+**Sortie :** `outputs/figures/<location>_gravity_score.png`
+
+Courbe temporelle du gravity score avec :
+- Axe X : dates
+- Axe Y : gravity score (capacité bloquée dans zones constituantes)
+- Marqueur sur le maximum
 
 ---
 
@@ -347,20 +358,21 @@ Les phases 1–3 travaillent sur des features agrégées par jour — la géomé
 ```bash
 # Phase 1 — features (données déjà téléchargées)
 python run_phase1.py --location la --start 2019-01-01 --end 2019-12-31 --no-download
-python run_phase1.py --location houston --start 2017-07-01 --end 2017-09-30 --no-download
 
-# Phase 2 — manifold + gravity score
-python run_phase2.py --location la
-python run_phase2.py --location houston
+# Phase 2 — Identificaton zones constituantes (une seule fois)
+python src/manifold/manifold_pipeline.py --identify --start 2019-01-01 --end 2019-12-31 --location la
+
+# Phase 2 — Scoring quotidien
+python src/manifold/manifold_pipeline.py --score --date 2019-06-05 --location la
+
+# Phase 2 — Scoring période + graphique
+python src/manifold/manifold_pipeline.py --score --start 2019-06-01 --end 2019-06-30 --location la
 
 # Phase 3 — PINN + Time to Clear
 python run_phase3.py --location la
-python run_phase3.py --location houston
 
-# Visualisation
-python src/utils/visualize.py --gravity --location la
-python src/utils/visualize.py --location la --date 2019-06-05
-python src/utils/visualize.py --location la --start 2019-05-01 --end 2019-09-30
+# Visualisation clusters géometriques
+python src/clustering/visualize_clusters.py --date 2019-06-05 --location la
 ```
 
 ---
@@ -369,41 +381,37 @@ python src/utils/visualize.py --location la --start 2019-05-01 --end 2019-09-30
 
 ```
 Marine Cadastre NOAA
-        │  ZIP (~1 GB/jour)
-        ▼
+         │  ZIP (~1 GB/jour)
+         ▼
 download.py  ──────────────────────────────────────────────────────
-        │  Parquet ZSTD (~8 MB/jour, ×125 compression)
-        ▼
+         │  Parquet ZSTD (~8 MB/jour, ×125 compression)
+         ▼
 kinematic_filter.py  ──────────────────────────────────────────────
-        │  + SOG_corr, traj_id
-        ▼
+         │  + SOG_corr, traj_id
+         ▼
 hdbscan_daily.py  ─────────────────────────────────────────────────
-        │  cluster_df (episodes stationnaires + labels)
-        │  prepared_df (DataFrame complet enrichi)
-        ▼
+         │  cluster_df (episodes stationnaires + labels)
+         │  prepared_df (DataFrame complet enrichi)
+         ▼
 features_daily.py  ────────────────────────────────────────────────
-        │  13 scalaires par jour
-        ▼
+         │  13 scalaires par jour
+         ▼
 <location>_daily_features.parquet  (N jours × 13 features)
-        │
-   ┌────┴────┐
-   ▼         ▼
-lbo.py    train.py
-   │         │
-   ▼         ▼
-manifold  lwr_pinn.pt
-   │         │
-   ▼         ▼
-gravity   predict.py
-_score        │
-   │          ▼
-   │    time_to_clear.parquet
-   │
-   ▼
-visualize.py
-   │
-   ▼
-outputs/figures/*.png  /  *.html
+         │
+    ┌────┴────┐
+    ▼         ▼
+manifold_pipeline.py    train.py
+    │         │
+    ▼         ▼
+constituent_zones  lwr_pinn.pt
+    │         │
+    ▼         ▼
+gravity_daily   predict.py
+    │          │
+    │    time_to_clear.parquet
+    │
+    ▼
+outputs/figures/*.png
 ```
 
 ---
@@ -411,10 +419,20 @@ outputs/figures/*.png  /  *.html
 ## Données produites
 
 | Fichier | Contenu | Taille typique |
-|---------|---------|---------------|
+|---------|--------|---------------|
 | `data/parquet/<loc>/<loc>_YYYY_MM_DD.parquet` | Positions AIS filtrées | ~1–5 MB/jour |
 | `data/features/<loc>_daily_features.parquet` | 13 features × N jours | < 100 KB |
-| `data/features/<loc>_manifold.parquet` | Features + ϕ₁…ϕ₈ + is_characteristic | < 200 KB |
-| `data/features/<loc>_gravity_score.parquet` | + gravity_score, deviation_score | < 200 KB |
+| `data/features/<loc>_constituent_zones.parquet` | Zones + is_constituent + phi | < 200 KB |
+| `data/features/<loc>_gravity_daily.parquet` | date + gravity_score | < 100 KB |
 | `data/features/<loc>_time_to_clear.parquet` | ρ_pred, v_pred, TTC par jour | < 50 KB |
 | `outputs/models/<loc>_lwr_pinn.pt` | Poids PyTorch du PINN | ~1 MB |
+| `outputs/figures/<loc>_gravity_score.png` | Courbe temporelle | ~50 KB |
+
+---
+
+## Différenciation Houston / LA
+
+| Port | Source AIS | Période disponible | Événement de référence |
+|------|----------|-----------------|-------------------|
+| Houston | Marine Cadastre (NOAA) | 2017–2017 | Hurricane Harvey |
+| LA | AISStream | 2020–2020 | COVID-19 / trade tensions |
