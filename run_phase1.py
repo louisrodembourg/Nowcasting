@@ -2,9 +2,9 @@
 Phase 1 orchestrator — AIS → Daily feature matrix.
 
 Steps for each day in [--start, --end]:
-  1. Download daily ZIP from Marine Cadastre → filtered Parquet (skip if exists)
-  2. HDBSCAN clustering on stationary vessels (SOG < 1 kt)
-  3. Extract 13 daily features from traffic + cluster data
+  1. Download daily ZIP from Marine Cadastre → filtered Parquet (skip if exists) --> dowload_index.py
+  2. HDBSCAN clustering on stationary vessels (SOG < 1 kt) --> hdbscan_daily.py
+  3. Extract 13 daily features from traffic + cluster data --> features_daily.py
 
 Writes the feature matrix to data/features/<location>_daily_features.parquet
 (appends or merges with existing data if the file already exists).

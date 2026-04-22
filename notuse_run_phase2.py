@@ -1,5 +1,6 @@
 """
 Phase 2 orchestrator — Manifold Learning + Gravity Score.
+--> LBO + eigenvectors → gravity score → characteristic day detection. --> gravity_score.py, lbo.py, characteristic_days.py
 
 Usage (run from Nowcasting/ root):
     python run_phase2.py                              # houston (default)
@@ -11,8 +12,8 @@ import logging
 from pathlib import Path
 
 from src.ingestion.download import LOCATIONS
-from src.manifold.lbo import run_lbo, DEFAULT_K, DEFAULT_N_EIGENVECTORS
-from src.manifold.gravity_score import run_gravity_score
+from src.manifold.notuse_lbo import run_lbo, DEFAULT_K, DEFAULT_N_EIGENVECTORS
+from src.manifold.notuse_gravity_score import run_gravity_score
 
 log = logging.getLogger(__name__)
 

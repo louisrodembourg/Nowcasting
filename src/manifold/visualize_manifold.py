@@ -21,7 +21,7 @@ import folium
 import numpy as np
 import polars as pl
 
-from src.manifold.lbo import run_lbo
+from src.manifold.notuse_lbo import run_lbo
 from src.ingestion.download import LOCATIONS
 
 log = logging.getLogger(__name__)
