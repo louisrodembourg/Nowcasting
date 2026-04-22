@@ -13,6 +13,7 @@ shap
 
 # Data sources
 yfinance
+pyarrow
 
 # Visualization
 folium
