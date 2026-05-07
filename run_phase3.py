@@ -2,10 +2,10 @@
 Phase 3 orchestrator — PINNs / Time to Clear.
 
 Usage (run from Nowcasting/ root):
-    python run_phase3.py                              # houston (default)
-    python run_phase3.py --location la
-    python run_phase3.py --location la --skip-train   # inférence seule
-    python run_phase3.py --location la --epochs 5000 --lr 1e-3
+    python run_phase3.py                                      # houston (default)
+    python run_phase3.py --location la --year 2019
+    python run_phase3.py --location la --year 2019 --skip-train   # inférence seule
+    python run_phase3.py --location houston --year 2017 --epochs 5000 --lr 1e-3
 """
 import argparse
 import logging
@@ -36,6 +36,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Phase 3 — PINNs + Time to Clear")
     parser.add_argument("--location",      default="houston", choices=list(LOCATIONS.keys()),
                         help="Target port (default: houston)")
+    parser.add_argument("--year",          type=int, default=None,
+                        help="Année des données (ex: 2019). Dérive tous les chemins.")
+    parser.add_argument("--period",        default=None,
+                        help="Période multi-années (ex: 2023_2024). Priorité sur --year.")
     parser.add_argument("--skip-train",    action="store_true",
                         help="Skip training (use existing model)")
     parser.add_argument("--epochs",        type=int,   default=DEFAULT_EPOCHS)
@@ -49,12 +53,21 @@ def main() -> None:
     parser.add_argument("--peak-date",     default=None, metavar="YYYY-MM-DD")
     args = parser.parse_args()
 
-    loc = args.location
+    loc    = args.location
+    period = args.period or (str(args.year) if args.year else None)
+
+    if period is None:
+        log.error(
+            "Précise --year YYYY ou --period YYYY_YYYY.\n"
+            "  Exemples : --year 2019  |  --period 2023_2024"
+        )
+        return
+
     cfg = TRAIN_CONFIG.get(loc, TRAIN_CONFIG["houston"])
 
-    features_path = Path(f"data/features/{loc}_daily_features.parquet")
-    model_path    = Path(f"outputs/models/{loc}_lwr_pinn.pt")
-    output_path   = Path(f"data/features/{loc}_time_to_clear.parquet")
+    features_path = Path(f"data/features/{loc}_{period}_daily_features.parquet")
+    model_path    = Path(f"outputs/models/{loc}_{period}_lwr_pinn.pt")
+    output_path   = Path(f"data/features/{loc}_{period}_time_to_clear.parquet")
 
     train_start = args.train_start or cfg["train_start"]
     train_end   = args.train_end   or cfg["train_end"]

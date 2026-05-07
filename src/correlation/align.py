@@ -20,7 +20,7 @@ import polars as pl
 
 log = logging.getLogger(__name__)
 
-GRAVITY_PATH = Path("data/features/la_gravity_score.parquet")
+GRAVITY_PATH = Path("data/features/la_2019_gravity_score.parquet")
 SCFI_PATH    = Path("data/financial/scfi_2019.parquet")
 
 

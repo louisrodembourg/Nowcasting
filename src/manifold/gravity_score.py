@@ -1,22 +1,18 @@
 """
 Phase 2 — Manifold : Score de Gravité (Étape 5).
 
-Prend le manifold en entrée (houston_manifold.parquet) et calcule
-le Score de Gravité quotidien :
+Formule v0_baseline (L1, poids égaux, baseline globale) — meilleur SNR empirique LA 2019 :
 
-    gravity_score_i = Σ_c  |ϕ_c(i) - μ_c|  ×  blocked_capacity_i
-                      ─────────────────────────────────────────────
-                             Σ_c  σ_c  ×  baseline_capacity
+    deviation_i = mean_c( |ϕ_c(i) - μ_c| / σ_c )
+    gravity_score_i = normalise( deviation_i × blocked_capacity_i / baseline_capacity )
 
 Où :
-  - ϕ_c(i)          : coordonnée du jour i sur le c-ième vecteur propre
-  - μ_c, σ_c        : moyenne et écart-type de ϕ_c sur la période baseline (jours non-Harvey)
-  - blocked_capacity: capacité bloquée (Σ Longueur×Largeur) du jour i
+  - ϕ_c(i)           : coordonnée du jour i sur le c-ième vecteur propre
+  - μ_c, σ_c         : moyenne et écart-type de ϕ_c sur tous les jours hors événement
+  - blocked_capacity : capacité bloquée (Σ Longueur×Largeur) du jour i
   - baseline_capacity: médiane de blocked_capacity sur la baseline
 
 Le score est normalisé à [0, 1] sur toute la période.
-Les jours Harvey (port fermé) ont blocked_capacity=0 → score=0 par conception,
-puis remplacés par la valeur max post-Harvey (réouverture = pic de gravité réelle).
 
 Usage :
     python src/manifold/gravity_score.py
@@ -60,21 +56,24 @@ def compute_gravity_score(
 
     dates = df["date"].to_list()
 
-    # Masque baseline : jours en dehors de la fenêtre Harvey (opérations normales)
-    baseline_mask = np.array([
-        not (harvey_start <= d <= harvey_end) for d in dates
-    ])
+    # Baseline globale : tous les jours hors fenêtre événement
+    # Si aucun événement défini, tous les jours servent de baseline
+    if harvey_start is None or harvey_end is None:
+        baseline_mask = np.ones(len(dates), dtype=bool)
+    else:
+        baseline_mask = np.array([
+            not (harvey_start <= d <= harvey_end) for d in dates
+        ])
 
     phi_matrix = df.select(phi_cols).to_numpy()   # (N, n_components)
 
-    # Moyenne et écart-type sur la baseline uniquement
-    phi_baseline = phi_matrix[baseline_mask]
-    mu    = phi_baseline.mean(axis=0)
-    sigma = phi_baseline.std(axis=0)
-    sigma[sigma == 0] = 1.0   # protection
+    mu    = phi_matrix[baseline_mask].mean(axis=0)
+    sigma = phi_matrix[baseline_mask].std(axis=0)
+    sigma[sigma == 0] = 1.0
 
-    # Déviation normalisée par rapport à la baseline pour chaque jour
-    deviation = np.abs((phi_matrix - mu) / sigma).mean(axis=1)  # (N,)
+    # Déviation L1 à poids égaux (v0_baseline — meilleur SNR empirique sur LA 2019)
+    z = np.abs((phi_matrix - mu) / sigma)          # (N, n_components)
+    deviation = z.mean(axis=1)                     # (N,)
 
     # Poids de capacité : blocked_capacity / médiane baseline
     capacity        = df["blocked_capacity"].to_numpy().astype(float)

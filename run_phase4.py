@@ -2,10 +2,10 @@
 Phase 4 orchestrator — Correlation gravity_score ↔ SCFI.
 
 Usage (run from Nowcasting/ root):
-    python run_phase4.py                     # LA (default)
-    python run_phase4.py --skip-fetch        # reuse existing scfi_2019.parquet
-    python run_phase4.py --max-lag 14        # shorter lag window
-    python run_phase4.py --figures-only      # regenerate figures from saved results
+    python run_phase4.py --location la --year 2019
+    python run_phase4.py --location la --year 2019 --skip-fetch
+    python run_phase4.py --location la --year 2019 --max-lag 14
+    python run_phase4.py --location la --year 2019 --figures-only
 """
 import argparse
 import logging
@@ -31,6 +31,10 @@ log = logging.getLogger(__name__)
 def main() -> None:
     parser = argparse.ArgumentParser(description="Phase 4 — Correlation gravity ↔ SCFI")
     parser.add_argument("--location",         default="la", choices=list(LOCATIONS.keys()))
+    parser.add_argument("--year",             type=int, default=None,
+                        help="Année des données (ex: 2019). Dérive tous les chemins.")
+    parser.add_argument("--period",           default=None,
+                        help="Période multi-années (ex: 2023_2024). Priorité sur --year.")
     parser.add_argument("--max-lag",          type=int, default=21,
                         help="Maximum lag in days for cross-correlation (default: 21)")
     parser.add_argument("--granger-max-lag",  type=int, default=8,
@@ -43,11 +47,20 @@ def main() -> None:
                         help="Regenerate figures from existing intermediate parquets")
     args = parser.parse_args()
 
-    loc          = args.location
-    gravity_path = Path(f"data/features/{loc}_gravity_score.parquet")
-    scfi_path    = Path("data/financial/scfi_2019.parquet")
-    corr_path    = Path(f"data/features/{loc}_scfi_correlation.parquet")
-    granger_path = Path(f"data/features/{loc}_scfi_granger.parquet")
+    loc    = args.location
+    period = args.period or (str(args.year) if args.year else None)
+
+    if period is None:
+        log.error(
+            "Précise --year YYYY ou --period YYYY_YYYY.\n"
+            "  Exemples : --year 2019  |  --period 2023_2024"
+        )
+        return
+
+    gravity_path = Path(f"data/features/{loc}_{period}_gravity_score.parquet")
+    scfi_path    = Path(f"data/financial/scfi_{period}.parquet")
+    corr_path    = Path(f"data/features/{loc}_{period}_scfi_correlation.parquet")
+    granger_path = Path(f"data/features/{loc}_{period}_scfi_granger.parquet")
     out_dir      = Path("outputs/figures")
 
     if not gravity_path.exists():
@@ -61,8 +74,9 @@ def main() -> None:
         if args.skip_fetch and scfi_path.exists():
             log.info("--- Step 1 : SCFI (skipped — using %s) ---", scfi_path)
         else:
-            log.info("--- Step 1 : Fetch SCFI 2019 ---")
-            fetch_scfi(year=2019, output_path=scfi_path)
+            log.info("--- Step 1 : Fetch SCFI [%s] ---", period)
+            scfi_year = int(period.split("_")[0])
+            fetch_scfi(year=scfi_year, output_path=scfi_path)
 
         # ── Step 2 — Align ───────────────────────────────────────────────────
         log.info("--- Step 2 : Temporal alignment (%s) ---", args.align_method)

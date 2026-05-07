@@ -146,10 +146,27 @@ def main() -> None:
     loc_cfg     = LOCATIONS[args.location]
     parquet_dir = loc_cfg["out_dir"]
     prefix      = loc_cfg["prefix"]
-    features_path = Path(f"data/features/{args.location}_daily_features.parquet")
 
     start = date.fromisoformat(args.start)
     end   = date.fromisoformat(args.end)
+
+    # Auto-derive output path from year range — prevents accidental cross-year merges
+    start_year, end_year = start.year, end.year
+    period = str(start_year) if start_year == end_year else f"{start_year}_{end_year}"
+    features_path = Path(f"data/features/{args.location}_{period}_daily_features.parquet")
+
+    # Guard: refuse to append if existing file covers different years
+    if features_path.exists():
+        existing = pl.read_parquet(features_path)
+        existing_years = set(existing["date"].dt.year().unique().to_list())
+        requested_years = set(range(start_year, end_year + 1))
+        if not existing_years.issubset(requested_years):
+            log.error(
+                "CONFLIT D'ANNÉES — %s contient %s mais tu demandes %s.\n"
+                "  → Utilise un chemin différent ou supprime le fichier existant.",
+                features_path, sorted(existing_years), sorted(requested_years),
+            )
+            return
 
     log.info("=== Phase 1 — %s ===", args.location.upper())
     log.info("Period   : %s → %s (%d days)", start, end, (end - start).days + 1)

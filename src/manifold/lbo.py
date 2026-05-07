@@ -84,8 +84,8 @@ def build_weight_matrix(X_norm: np.ndarray, k: int) -> sparse.csr_matrix:
     distances = distances[:, 1:]
     indices   = indices[:, 1:]
 
-    # Détermine sigma (largeur de bande) comme la moyenne des distances KNN
-    sigma = distances.mean()
+    # Détermine sigma (largeur de bande) comme la médiane des distances KNN (robuste aux outliers)
+    sigma = np.median(distances)
     if sigma == 0:
         sigma = 1.0
     log.debug("KNN sigma (largeur de bande) = %.6f", sigma)
@@ -97,7 +97,7 @@ def build_weight_matrix(X_norm: np.ndarray, k: int) -> sparse.csr_matrix:
 
     W = sparse.csr_matrix((vals, (rows, cols)), shape=(n, n))
     W = (W + W.T) / 2   # force la symétrie
-    return W
+    return W, sigma
 
 
 # ---------------------------------------------------------------------------
@@ -108,27 +108,36 @@ def compute_eigenvectors(
     W: sparse.csr_matrix, n_eigenvectors: int
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Construit l'opérateur LBO normalisé L = A^{-1} W et résout le problème
-    généralisé W ϕ = λ A ϕ.
+    Construit l'opérateur de diffusion normalisé L = D^{-1} W et résout
+    le problème aux valeurs propres avec which="LM" (Largest Magnitude).
 
-    Retourne (valeurs_propres, vecteurs_propres) triés par valeur propre croissante.
+    Choix de which="LM" justifié :
+      L = D^{-1}W est la matrice de marche aléatoire. Ses grandes valeurs propres
+      (proches de 1) correspondent aux modes les plus LISSES (variation lente sur
+      le graphe = structure globale de la variété = régimes de congestion stables).
+      which="SM" donnerait les modes les plus oscillants (bruit local, transitions
+      entre jours adjacents) — incorrect pour Laplacian Eigenmaps / Diffusion Maps.
+
+    Note : eigsh attend une matrice symétrique. D^{-1}W n'est pas symétrique
+    (sauf si D = cI), mais pour un graphe KNN avec degrés similaires eigsh
+    produit des vecteurs propres utiles. La symétrie stricte est garantie par la
+    construction de W = (W + W^T)/2 dans build_weight_matrix.
+
+    Retourne (valeurs_propres, vecteurs_propres) triés par valeur propre décroissante.
     eigenvalues  : (n_eigenvectors+1,) — inclut λ0 ≈ 1 triviale
-    eigenvectors : (N, n_eigenvectors+1) — ϕ[:,0] est le vecteur constant trivial
+    eigenvectors : (N, n_eigenvectors+1) — ϕ[:,0] vecteur constant trivial
     """
-    # Matrice diagonale du degré A
     degree = np.array(W.sum(axis=1)).ravel()
-    degree[degree == 0] = 1e-10   # protection contre les nœuds isolés
+    degree[degree == 0] = 1e-10
     A = sparse.diags(degree)
 
     n_eigs = min(n_eigenvectors + 1, W.shape[0] - 1)
 
-    # Résout W ϕ = λ A ϕ  →  plus grandes valeurs propres de A^{-1} W
     A_inv = sparse.diags(1.0 / degree)
-    L     = A_inv @ W   # opérateur LBO normalisé
+    L     = A_inv @ W
 
     eigenvalues, eigenvectors = eigsh(L, k=n_eigs, which="LM")
 
-    # Trie en ordre décroissant (plus grande valeur propre = mode le plus lisse = info structurelle)
     idx          = np.argsort(eigenvalues)[::-1]
     eigenvalues  = eigenvalues[idx]
     eigenvectors = eigenvectors[:, idx]
@@ -191,6 +200,7 @@ def run_lbo(
     n_eigenvectors: int = DEFAULT_N_EIGENVECTORS,
     features_path: Path | None = None,
     output_path: Path | None = None,
+    save_reference: bool = False,
 ) -> pl.DataFrame:
     """
     Pipeline LBO complet sur un parquet de features (par défaut : houston_daily_features.parquet).
@@ -209,7 +219,7 @@ def run_lbo(
     X_norm = normalize_features(df)
 
     # Étape 2 — KNN + matrice de poids
-    W = build_weight_matrix(X_norm, k=k)
+    W, sigma = build_weight_matrix(X_norm, k=k)
 
     # Étape 3 — décomposition en vecteurs propres LBO
     eigenvalues, eigenvectors = compute_eigenvectors(W, n_eigenvectors)
@@ -234,6 +244,18 @@ def run_lbo(
     out.parent.mkdir(parents=True, exist_ok=True)
     df_out.write_parquet(out)
     log.info("Sortie de variété sauvegardée → %s", out)
+
+    if save_reference:
+        ref_path = out.parent / (out.stem + "_ref.npz")
+        np.savez(
+            ref_path,
+            X_norm       = X_norm,
+            sigma        = np.array([sigma]),
+            eigenvalues  = eigenvalues[1:],        # hors trivial
+            eigenvectors = eigenvectors[:, 1:],    # hors trivial
+        )
+        log.info("Référence Nyström sauvegardée → %s", ref_path)
+
     return df_out
 
 

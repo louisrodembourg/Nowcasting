@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import hdbscan
 import numpy as np
 import polars as pl
+from scipy.stats import circmean, circstd
 
 from src.ingestion.kinematic_filter import prepare_kinematics
 
@@ -99,13 +100,11 @@ def _run_hdbscan(
     # Position médiane (latitude/longitude) + statistiques sur le cap (moyenne/écart-type)
     # + dimensions du navire (tirant d'eau, longueur, largeur) + type de navire + compte de messages
     agg_exprs = [
-        pl.col("LAT").median().alias("LAT"),  # Latitude médiane de l'épisode
-        pl.col("LON").median().alias("LON"),  # Longitude médiane de l'épisode
-        # Cap moyen et écart-type (excluant les valeurs invalides 511)
-        pl.col("Heading").filter(pl.col("Heading") < 360).mean().alias("Heading_mean")
-            if "Heading" in prepared.columns else pl.lit(None).cast(pl.Float64).alias("Heading_mean"),
-        pl.col("Heading").filter(pl.col("Heading") < 360).std().alias("Heading_std")
-            if "Heading" in prepared.columns else pl.lit(None).cast(pl.Float64).alias("Heading_std"),
+        pl.col("LAT").median().alias("LAT"),
+        pl.col("LON").median().alias("LON"),
+        # Collect valid headings as list for circular stats (computed after group_by)
+        (pl.col("Heading").filter(pl.col("Heading") < 360).implode().alias("_headings")
+            if "Heading" in prepared.columns else pl.lit(None).alias("_headings")),
         # Caractéristiques du navire (tirant d'eau max, dimensions)
         pl.col("Draft").max().alias("Draft")
             if "Draft" in prepared.columns else pl.lit(None).cast(pl.Float64).alias("Draft"),
@@ -120,6 +119,19 @@ def _run_hdbscan(
 
     # Agrège par (MMSI, traj_id) pour obtenir un point par épisode statique
     agg = static.group_by(["MMSI", "traj_id"]).agg(agg_exprs)
+
+    # Circular mean and std on heading — extract to Python, compute, rejoin
+    headings_list = agg["_headings"].to_list()
+    h_means, h_stds = [], []
+    for raw in headings_list:
+        h = [x for x in (raw or []) if x is not None]
+        h_means.append(float(circmean(h, high=360, low=0)) if len(h) >= 1 else None)
+        h_stds.append(float(circstd(h,  high=360, low=0)) if len(h) >= 2 else 180.0)
+
+    agg = agg.with_columns([
+        pl.Series("Heading_mean", h_means, dtype=pl.Float64),
+        pl.Series("Heading_std",  h_stds,  dtype=pl.Float64),
+    ]).drop("_headings")
 
     # Garde la main : HDBSCAN BallTree nécessite au moins min_cluster_size points
     if len(agg) < HDBSCAN_MIN_CLUSTER_SIZE:

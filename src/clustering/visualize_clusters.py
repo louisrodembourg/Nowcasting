@@ -391,7 +391,7 @@ def visualize_day(d: date, location: str = "houston") -> Path:
             coords = feat["geometry"]["coordinates"]
             folium.Polygon(
                 locations=[[p[1], p[0]] for p in coords[0]],
-                popup=folium.Popup(props["popup_html"], max_width=250),
+                popup=folium.Popup(props["popup"], max_width=250),
                 tooltip=f"Cluster {props['cluster_label']} — {props['cluster_type']} ({props['n_vessels']} navires)",
                 **props["style"],
             ).add_to(polygon_group)
@@ -400,7 +400,7 @@ def visualize_day(d: date, location: str = "houston") -> Path:
             coords = feat["geometry"]["coordinates"]
             folium.PolyLine(
                 locations=[[p[1], p[0]] for p in coords],
-                popup=folium.Popup(props["popup_html"], max_width=250),
+                popup=folium.Popup(props["popup"], max_width=250),
                 tooltip=f"Cluster {props['cluster_label']} — {props['cluster_type']} (ligne)",
                 **props["style"],
             ).add_to(polygon_group)
@@ -421,11 +421,13 @@ def visualize_day(d: date, location: str = "houston") -> Path:
             color=props["style"]["color"],
             fill=True,
             fill_opacity=props["style"]["fillOpacity"],
-            popup=folium.Popup(props["popup_html"], max_width=200),
+            popup=folium.Popup(props["popup"], max_width=200),
         ).add_to(noise_group)
     noise_group.add_to(m)
 
     # --- Navires en mouvement (échantillon) ---
+    loc_cfg_v = LOCATIONS[location]
+    prefix = loc_cfg_v["prefix"]
     parquet_dir = Path(__file__).resolve().parents[2] / "data" / "parquet" / location
     parquet_path = parquet_dir / f"{prefix}_{d.strftime('%Y_%m_%d')}.parquet"
     vessel_df = pl.read_parquet(parquet_path)

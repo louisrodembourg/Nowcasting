@@ -125,12 +125,14 @@ def compute_daily_features(
     draft_mean     = _f(draft_series.mean())
     draft_std      = _f(draft_series.std())
 
-    # Capacité bloquée : Σ(Longueur × Largeur) — ignorer les navires avec dimensions inconnues
-    cap_series = (
-        cluster_df
-        .filter((pl.col("Length") > 0) & (pl.col("Width") > 0))
-        .select((pl.col("Length") * pl.col("Width")).alias("cap"))["cap"]
+    # Capacité bloquée : Σ(Longueur × Largeur) — proxy surface occupée (m²)
+    # Draft est déjà capté par draft_mean/draft_std dans les 13 features.
+    valid_cap = cluster_df.filter(
+        (pl.col("Length") > 0) & (pl.col("Width") > 0)
     )
+    cap_series = valid_cap.select(
+        (pl.col("Length") * pl.col("Width")).alias("cap")
+    )["cap"]
 
     # Enregistre le nombre d'épisodes avec dimensions valides
     n_before = len(cluster_df)
