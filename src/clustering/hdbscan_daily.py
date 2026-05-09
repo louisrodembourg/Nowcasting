@@ -18,6 +18,7 @@ Usage (autonome) :
 import argparse
 import logging
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -32,25 +33,43 @@ from src.ingestion.kinematic_filter import prepare_kinematics
 
 log = logging.getLogger(__name__)
 
-# Paramètres de clustering et seuils cinématiques
+# Paramètres de clustering et seuils cinématiques (valeurs par défaut)
 SOG_STATIC_THRESHOLD     = 1.0   # nœuds — en dessous = navire stationnaire
 HEADING_DOCKED_MAX_STD   = 25.0  # degrés — écart-type en dessous = à quai
 HDBSCAN_MIN_CLUSTER_SIZE = 3     # taille minimale du cluster HDBSCAN
 HDBSCAN_MIN_SAMPLES      = 2     # nombre minimal d'échantillons pour HDBSCAN
 
 
+@dataclass
+class ClusteringConfig:
+    """
+    Paramètres de clustering HDBSCAN.
+    Instancier sans arguments pour obtenir le comportement par défaut (baseline).
+    """
+    sog_static_threshold: float = SOG_STATIC_THRESHOLD
+    heading_docked_max_std: float = HEADING_DOCKED_MAX_STD
+    hdbscan_min_cluster_size: int = HDBSCAN_MIN_CLUSTER_SIZE
+    hdbscan_min_samples: int = HDBSCAN_MIN_SAMPLES
+    # Rayon max (en nm) pour qu'un cluster soit classé "docked".
+    # None = pas de contrainte spatiale (comportement baseline).
+    # 0.3 nm ≈ 550 m — taille typique d'un terminal de quai.
+    max_docked_radius_nm: Optional[float] = None
+
+
 def cluster_day_from_df(
     prepared: pl.DataFrame,
+    config: Optional[ClusteringConfig] = None,
 ) -> tuple[Optional[pl.DataFrame], Optional[pl.DataFrame]]:
     """
     Exécute HDBSCAN sur un DataFrame déjà préparé (sortie de prepare_kinematics).
     Retourne (cluster_df, prepared_df) — même contrat que cluster_day.
     """
-    return _run_hdbscan(prepared, label="<DataFrame>")
+    return _run_hdbscan(prepared, label="<DataFrame>", config=config or ClusteringConfig())
 
 
 def cluster_day(
     parquet_path: Path,
+    config: Optional[ClusteringConfig] = None,
 ) -> tuple[Optional[pl.DataFrame], Optional[pl.DataFrame]]:
     """
     Exécute le prétraitement cinématique + HDBSCAN sur un fichier Parquet quotidien.
@@ -63,29 +82,28 @@ def cluster_day(
         Draft, Length, Width, VesselType, nb_messages,
         cluster_label, membership_score, cluster_type
     """
-    # Vérifie que le fichier existe
     if not parquet_path.exists():
         log.warning("Fichier non trouvé : %s", parquet_path)
         return None, None
 
-    # Charge le fichier brut et applique le prétraitement cinématique
     raw_df     = pl.read_parquet(parquet_path)
     prepared   = prepare_kinematics(raw_df)
 
-    # Exécute le pipeline HDBSCAN
-    return _run_hdbscan(prepared, label=parquet_path.name)
+    return _run_hdbscan(prepared, label=parquet_path.name, config=config or ClusteringConfig())
 
 
 def _run_hdbscan(
     prepared: pl.DataFrame,
     label: str = "",
+    config: Optional[ClusteringConfig] = None,
 ) -> tuple[Optional[pl.DataFrame], Optional[pl.DataFrame]]:
     """Logique centrale du clustering HDBSCAN sur un DataFrame préparé."""
-    # --- Filtre les navires stationnaires (en utilisant la SOG corrigée) -------
-    static = prepared.filter(pl.col("SOG_corr") < SOG_STATIC_THRESHOLD)
+    cfg = config or ClusteringConfig()
 
-    # Garde la main si pas assez de messages statiques
-    if len(static) < HDBSCAN_MIN_CLUSTER_SIZE:
+    # --- Filtre les navires stationnaires (en utilisant la SOG corrigée) -------
+    static = prepared.filter(pl.col("SOG_corr") < cfg.sog_static_threshold)
+
+    if len(static) < cfg.hdbscan_min_cluster_size:
         log.warning(
             "%s : seulement %d messages statiques — skip clustering",
             label, len(static),
@@ -93,19 +111,11 @@ def _run_hdbscan(
         return None, prepared
 
     # --- Déduplique : une position par (MMSI, traj_id) ----------------------
-    # Chaque épisode statique continu est traité comme un point de données distinct.
-    # Heading 511 = AIS « non disponible » — exclu avant calcul des statistiques.
-
-    # Construit l'expression d'agrégation — inclut uniquement les colonnes existantes
-    # Position médiane (latitude/longitude) + statistiques sur le cap (moyenne/écart-type)
-    # + dimensions du navire (tirant d'eau, longueur, largeur) + type de navire + compte de messages
     agg_exprs = [
         pl.col("LAT").median().alias("LAT"),
         pl.col("LON").median().alias("LON"),
-        # Collect valid headings as list for circular stats (computed after group_by)
         (pl.col("Heading").filter(pl.col("Heading") < 360).implode().alias("_headings")
             if "Heading" in prepared.columns else pl.lit(None).alias("_headings")),
-        # Caractéristiques du navire (tirant d'eau max, dimensions)
         pl.col("Draft").max().alias("Draft")
             if "Draft" in prepared.columns else pl.lit(None).cast(pl.Float64).alias("Draft"),
         pl.col("Length").max().alias("Length")
@@ -114,13 +124,11 @@ def _run_hdbscan(
             if "Width" in prepared.columns else pl.lit(None).cast(pl.Float64).alias("Width"),
         pl.col("VesselType").max().alias("VesselType")
             if "VesselType" in prepared.columns else pl.lit(0).cast(pl.Int64).alias("VesselType"),
-        pl.len().alias("nb_messages"),  # Nombre de messages pour cet épisode
+        pl.len().alias("nb_messages"),
     ]
 
-    # Agrège par (MMSI, traj_id) pour obtenir un point par épisode statique
     agg = static.group_by(["MMSI", "traj_id"]).agg(agg_exprs)
 
-    # Circular mean and std on heading — extract to Python, compute, rejoin
     headings_list = agg["_headings"].to_list()
     h_means, h_stds = [], []
     for raw in headings_list:
@@ -133,8 +141,7 @@ def _run_hdbscan(
         pl.Series("Heading_std",  h_stds,  dtype=pl.Float64),
     ]).drop("_headings")
 
-    # Garde la main : HDBSCAN BallTree nécessite au moins min_cluster_size points
-    if len(agg) < HDBSCAN_MIN_CLUSTER_SIZE:
+    if len(agg) < cfg.hdbscan_min_cluster_size:
         log.warning(
             "%s : seulement %d épisodes après dédupication — skip HDBSCAN",
             label, len(agg),
@@ -142,36 +149,30 @@ def _run_hdbscan(
         return None, prepared
 
     # --- HDBSCAN sur (LAT, LON) avec distance haversine ----------------------
-    # Extrait les coordonnées en degrés, puis les convertit en radians
     coords_deg = agg.select(["LAT", "LON"]).to_numpy()
     coords_rad = np.radians(coords_deg)
 
-    # Configure et exécute HDBSCAN avec la métrique géographique haversine
     clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=HDBSCAN_MIN_CLUSTER_SIZE,
-        min_samples=HDBSCAN_MIN_SAMPLES,
-        metric="haversine",  # Distance géographique appropriée pour coordonnées lat/lon
-        cluster_selection_method="eom",  # Excess of mass selection
+        min_cluster_size=cfg.hdbscan_min_cluster_size,
+        min_samples=cfg.hdbscan_min_samples,
+        metric="haversine",
+        cluster_selection_method="eom",
     )
     labels = clusterer.fit_predict(coords_rad)
     scores = clusterer.probabilities_
 
-    # Ajoute les labels de cluster et scores d'appartenance au DataFrame
     agg = agg.with_columns([
         pl.Series("cluster_label",    labels, dtype=pl.Int32),
         pl.Series("membership_score", scores, dtype=pl.Float32),
     ])
 
     # --- Classifie les clusters : à quai vs en attente ----------------------
-    # Utilise l'écart-type des cap pour distinguer les navires amarrés (caps alignés)
-    # des navires en attente (caps dispersés par vent/courant)
-    cluster_types = _classify_clusters(agg)
+    cluster_types = _classify_clusters(agg, cfg)
     agg = agg.join(cluster_types, on="cluster_label", how="left")
 
-    # Calcule et enregistre les statistiques de clustering
     n_episodes = len(agg)
     n_vessels  = agg["MMSI"].n_unique()
-    n_clusters = len(set(labels)) - (1 if -1 in labels else 0)  # Exclut le label de bruit (-1)
+    n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
     n_noise    = int((labels == -1).sum())
     log.info(
         "%s : %d épisodes (%d navires) → %d clusters, %d bruits (%.1f%%)",
@@ -179,40 +180,64 @@ def _run_hdbscan(
         n_clusters, n_noise, 100 * n_noise / n_episodes,
     )
 
-    # Retourne le DataFrame des clusters et le DataFrame préparé complet
     return agg, prepared
 
 
-def _classify_clusters(df: pl.DataFrame) -> pl.DataFrame:
+def _compute_cluster_radius_nm(lats: np.ndarray, lons: np.ndarray) -> float:
     """
-    Étiquette chaque cluster comme 'à quai' ou 'en attente' selon l'écart-type des cap.
-    Écart-type faible → navires alignés avec le quai → 'à quai'.
-    Écart-type élevé → dispersion par vent/courant → 'en attente'.
-    Écart-type nul (épisode un message) traité comme dispersion max → 'en attente'.
+    Rayon du cluster = distance haversine max du centroïde au point le plus éloigné (en nm).
+    Retourne 0 si le cluster a un seul point.
     """
-    # Filtre les clusters valides (exclut le bruit avec label -1)
-    # Puis agrège par label de cluster et calcule l'écart-type moyen des cap
-    # (remplace les NaN par 180° pour traiter les épisodes d'un seul message comme maximalement dispersés)
-    # Finalement, classifie : écart-type < HEADING_DOCKED_MAX_STD = "à quai", sinon = "en attente"
-    return (
-        df.filter(pl.col("cluster_label") >= 0)
-        .group_by("cluster_label")
-        .agg(
-            pl.col("Heading_std")
-            .fill_null(180.0)  # Traite l'absence de cap comme maximale dispersion
-            .mean()
-            .alias("_mean_heading_std")
+    if len(lats) <= 1:
+        return 0.0
+    lat_c = np.radians(np.mean(lats))
+    lon_c = np.radians(np.mean(lons))
+    lat2  = np.radians(lats)
+    lon2  = np.radians(lons)
+    dlat  = lat2 - lat_c
+    dlon  = lon2 - lon_c
+    a = np.sin(dlat / 2) ** 2 + np.cos(lat_c) * np.cos(lat2) * np.sin(dlon / 2) ** 2
+    return float(3440.065 * 2 * np.arcsin(np.sqrt(np.clip(a, 0, 1))).max())
+
+
+def _classify_clusters(df: pl.DataFrame, config: ClusteringConfig) -> pl.DataFrame:
+    """
+    Étiquette chaque cluster comme 'à quai' ou 'en attente'.
+
+    Règles de classification (appliquées dans l'ordre) :
+      1. heading_std moyen < config.heading_docked_max_std → candidat "docked"
+      2. Si config.max_docked_radius_nm est défini :
+           rayon du cluster > seuil → reclassé "waiting" (trop dispersé pour un terminal)
+      3. Sinon → "waiting"
+    """
+    valid = df.filter(pl.col("cluster_label") >= 0)
+
+    rows: list[dict] = []
+    for label in valid["cluster_label"].unique().to_list():
+        cluster    = valid.filter(pl.col("cluster_label") == label)
+        mean_hstd  = float(cluster["Heading_std"].fill_null(180.0).mean())
+
+        is_docked = mean_hstd < config.heading_docked_max_std
+
+        # Contrainte spatiale : un terminal est compact (<0.3 nm de rayon typiquement)
+        if is_docked and config.max_docked_radius_nm is not None:
+            lats   = cluster["LAT"].to_numpy()
+            lons   = cluster["LON"].to_numpy()
+            radius = _compute_cluster_radius_nm(lats, lons)
+            if radius > config.max_docked_radius_nm:
+                is_docked = False
+
+        rows.append({
+            "cluster_label": label,
+            "cluster_type":  "docked" if is_docked else "waiting",
+        })
+
+    if not rows:
+        return pl.DataFrame(
+            schema={"cluster_label": pl.Int32, "cluster_type": pl.Utf8}
         )
-        .with_columns(
-            # Classification : seuil HEADING_DOCKED_MAX_STD (25°) pour distinguer quai/attente
-            pl.when(pl.col("_mean_heading_std") < HEADING_DOCKED_MAX_STD)
-            .then(pl.lit("docked"))  # Navires alignés = à quai
-            .otherwise(pl.lit("waiting"))  # Navires dispersés = en attente
-            .alias("cluster_type")
-        )
-        .drop("_mean_heading_std")  # Supprime la colonne temporaire après classification
-    )
-    
+
+    return pl.DataFrame(rows).with_columns(pl.col("cluster_label").cast(pl.Int32))
 
 
 def main() -> None:
@@ -223,12 +248,10 @@ def main() -> None:
     parser.add_argument("parquet", help="Chemin vers le fichier Parquet quotidien")
     args = parser.parse_args()
 
-    # Exécute le clustering sur le fichier spécifié
     cluster_df, _ = cluster_day(Path(args.parquet))
     if cluster_df is not None:
         print(cluster_df)
-        
-        # Affiche les statistiques par type de cluster
+
         docked  = cluster_df.filter(pl.col("cluster_type") == "docked").height
         waiting = cluster_df.filter(pl.col("cluster_type") == "waiting").height
         noise   = cluster_df.filter(pl.col("cluster_label") == -1).height
