@@ -1,18 +1,15 @@
 """
-Phase 3 — Entraînement du PINN LWR sur Harvey.
+Phase 3 — Entraînement du PINN LWR.
 
-Fenêtre d'entraînement : 10 jours avant Harvey + fenêtre de crise + 10 jours après.
-Default : 2017-08-15 → 2017-09-10
-
-Les données AIS (ρ, v) sont extraites de la matrice de features Phase 1 et
-normalisées dans [0,1]. Les points de collocation PDE sont échantillonnés
-uniformément dans le domaine (x, t).
-
-Le modèle entraîné est sauvegardé dans outputs/models/lwr_pinn.pt.
+Nouveautés vs version Houston :
+  - Spatialisation réelle : les points de collocation PDE sont échantillonnés
+    depuis les positions LON des zones constituantes Phase 2 (au lieu de x=0.5).
+  - Pondération gravity_score : les jours de crise contribuent plus à la data loss.
+  - Loss cinématique (Alam et al. 2025) : pénalise |∂v/∂t| > a_max.
 
 Usage:
-    python src/pinns/train.py
-    python src/pinns/train.py --epochs 3000 --lr 1e-3
+    python src/pinns/train.py --location la
+    python src/pinns/train.py --location la --epochs 3000 --lr 1e-3
 """
 import argparse
 import logging
@@ -31,105 +28,180 @@ from src.pinns.lwr_pinn import LWRPINN, total_loss, get_device
 
 log = logging.getLogger(__name__)
 
-FEATURES_PATH = Path("data/features/houston_daily_features.parquet")
-MODEL_PATH    = Path("outputs/models/lwr_pinn.pt")
-
-# Fenêtre Harvey
-TRAIN_START   = date(2017, 8, 15)
-TRAIN_END     = date(2017, 9, 10)
-
 # Hyperparamètres par défaut
-DEFAULT_EPOCHS      = 2000
-DEFAULT_LR          = 5e-4
-DEFAULT_N_COL       = 2000   # points de collocation PDE
-DEFAULT_LAMBDA_PDE  = 0.1
-DEFAULT_LAMBDA_BC   = 0.1
-LOG_EVERY           = 200
+DEFAULT_EPOCHS     = 2000
+DEFAULT_LR         = 5e-4
+DEFAULT_N_COL      = 2000
+DEFAULT_N_KIN      = 500
+DEFAULT_LAMBDA_PDE = 0.3
+DEFAULT_LAMBDA_BC  = 0.1
+DEFAULT_LAMBDA_KIN = 0.1
+LOG_EVERY          = 200
+
+# LA bbox longitude (pour normalisation x si pas de fichier zones)
+LA_LON_MIN = -118.35
+LA_LON_MAX = -118.05
 
 
 # ---------------------------------------------------------------------------
-# Préparation des données
+# Préparation des données d'entraînement avec spatialisation
 # ---------------------------------------------------------------------------
 
 def prepare_training_data(
-    train_start: date,
-    train_end:   date,
-    device: torch.device,
-    features_path: Path = FEATURES_PATH,
-) -> dict[str, torch.Tensor]:
+    train_start:   date,
+    train_end:     date,
+    device:        torch.device,
+    features_path: Path,
+    zones_path:    Path | None = None,
+    gravity_path:  Path | None = None,
+    n_col:         int  = DEFAULT_N_COL,
+    n_kin:         int  = DEFAULT_N_KIN,
+    n_bc:          int  = 50,
+) -> dict[str, torch.Tensor | tuple]:
     """
-    Extrait et normalise les données AIS pour l'entraînement.
+    Prépare les tenseurs d'entraînement pour le PINN LWR.
 
-    x = LON normalisé ∈ [0,1] (position le long du chenal)
-    t = jour normalisé ∈ [0,1] (depuis train_start)
-    ρ = utilization_rate_rho ∈ [0,1]  (déjà une fraction)
-    v = SOG_median normalisé ∈ [0,1]  (/ SOG_max observé)
+    Spatialisation :
+      Si zones_path est fourni et existe, les points de collocation PDE sont
+      tirés depuis les positions LON réelles des zones constituantes Phase 2.
+      Sinon, grille uniforme [0,1] (fallback).
 
-    Retourne un dict de tenseurs sur `device`.
+    Pondération gravity :
+      Si gravity_path est fourni, les jours à fort gravity_score contribuent
+      davantage à la data loss (weight = 1 + gravity_score, normalisé à μ=1).
+
+    Retourne un dict de tenseurs sur `device` + métadonnées (lon_range, sog_max).
     """
     df = (
         pl.read_parquet(features_path)
         .sort("date")
         .filter(pl.col("date").is_between(train_start, train_end))
     )
-
     if len(df) == 0:
         raise ValueError(f"Aucune donnée entre {train_start} et {train_end}")
 
-    n_days  = (train_end - train_start).days + 1
-    dates   = df["date"].to_list()
+    n_days = (train_end - train_start).days + 1
+    dates  = df["date"].to_list()
+    t_vals = np.array([(d - train_start).days / max(n_days - 1, 1) for d in dates])
 
-    # t normalisé
-    t_vals  = np.array([(d - train_start).days / max(n_days - 1, 1) for d in dates])
+    # ρ : blocked_capacity normalisée pour LA (pic de crise = haute capacité bloquée)
+    #     utilization_rate_rho pour Houston (port fermé = chute de ρ)
+    if "blocked_capacity" in df.columns and df["blocked_capacity"].max() > 0:
+        cap_arr  = df["blocked_capacity"].to_numpy().astype(float)
+        cap_95   = float(np.percentile(cap_arr[cap_arr > 0], 95)) if cap_arr.max() > 0 else 1.0
+        rho_vals = np.clip(cap_arr / cap_95, 0.0, 1.0)
+        log.info("ρ = blocked_capacity normalisée (95p=%.0f)", cap_95)
+    else:
+        rho_vals = df["utilization_rate_rho"].to_numpy().astype(float)
+        log.info("ρ = utilization_rate_rho")
 
-    # x : on utilise une position x=0.5 (centroid du chenal) —
-    # on n'a pas de coordonnée x par jour dans les features agrégées.
-    # Les trajectoires détaillées (trajectory.py) donneraient un x continu,
-    # mais pour le training sur features journalières, x=0.5 est un proxy valide.
-    x_vals  = np.full(len(df), 0.5)
+    sog      = df["SOG_mean"].to_numpy().astype(float)
+    sog_max  = sog.max() if sog.max() > 0 else 1.0
+    v_vals   = sog / sog_max
 
-    # ρ = utilization_rate_rho (déjà ∈ [0,1])
-    rho_vals = df["utilization_rate_rho"].to_numpy().astype(float)
+    # Observation : centroïde du port à x=0.5
+    x_vals = np.full(len(df), 0.5)
 
-    # v = SOG_mean normalisé (SOG_median=0 pour la plupart des jours car navires stationnaires)
-    sog = df["SOG_mean"].to_numpy().astype(float)
-    sog_max = sog.max()
-    v_vals = sog / sog_max if sog_max > 0 else sog
+    # --- Pondération par gravity score ---
+    weights_np = np.ones(len(df))
+    if gravity_path is not None and Path(gravity_path).exists():
+        try:
+            gdf = pl.read_parquet(gravity_path).sort("date")
+            date_to_gs = dict(zip(gdf["date"].to_list(), gdf["gravity_score"].to_list()))
+            for i, d in enumerate(dates):
+                weights_np[i] = 1.0 + float(date_to_gs.get(d, 0.0))
+            w_mean = weights_np.mean()
+            if w_mean > 0:
+                weights_np /= w_mean
+            log.info("Gravity weights: min=%.3f  max=%.3f  mean=%.3f",
+                     weights_np.min(), weights_np.max(), weights_np.mean())
+        except Exception as exc:
+            log.warning("Impossible de charger gravity_path (%s) — poids uniformes", exc)
 
-    def t_(arr: np.ndarray, grad: bool = False) -> torch.Tensor:
+    # --- Positions spatiales depuis les zones constituantes ---
+    lon_min, lon_max = LA_LON_MIN, LA_LON_MAX
+    if zones_path is not None and Path(zones_path).exists():
+        try:
+            zones    = pl.read_parquet(zones_path).filter(pl.col("is_constituent"))
+            lon_arr  = zones["lon"].to_numpy().astype(float)
+            lon_min  = float(lon_arr.min())
+            lon_max  = float(lon_arr.max())
+            x_zones  = (lon_arr - lon_min) / max(lon_max - lon_min, 1e-8)
+            log.info("Zones constituantes : %d zones  lon=[%.4f, %.4f]",
+                     len(zones), lon_min, lon_max)
+        except Exception as exc:
+            log.warning("Impossible de charger zones_path (%s) — grille uniforme", exc)
+            x_zones = np.linspace(0, 1, 100)
+    else:
+        x_zones = np.linspace(0, 1, 100)
+        log.info("Pas de fichier zones — grille uniforme de 100 points")
+
+    def mk(arr: np.ndarray, grad: bool = False) -> torch.Tensor:
         return torch.tensor(arr, dtype=torch.float32, device=device,
                             requires_grad=grad).reshape(-1, 1)
 
-    x_data   = t_(x_vals)
-    t_data   = t_(t_vals)
-    rho_obs  = t_(rho_vals)
-    v_obs    = t_(v_vals)
+    x_data   = mk(x_vals)
+    t_data   = mk(t_vals)
+    rho_obs  = mk(rho_vals)
+    v_obs    = mk(v_vals)
+    weights  = mk(weights_np)
 
-    # Points de collocation PDE : grille uniforme (x, t) ∈ [0,1]²
-    n_col   = DEFAULT_N_COL
-    x_col_np = np.random.uniform(0, 1, n_col)
-    t_col_np = np.random.uniform(0, 1, n_col)
-    x_col    = t_(x_col_np, grad=True)
-    t_col    = t_(t_col_np, grad=True)
+    # Collocation PDE : positions zones × temps aléatoire
+    idx_col = np.random.choice(len(x_zones), n_col, replace=True)
+    x_col   = mk(x_zones[idx_col], grad=True)
+    t_col   = mk(np.random.uniform(0, 1, n_col), grad=True)
 
-    # Conditions aux limites : ρ = baseline aux bords temporels (t=0 et t=1)
-    n_bc   = 50
-    x_bc_np = np.random.uniform(0, 1, n_bc)
-    t_bc_np = np.concatenate([np.zeros(n_bc // 2), np.ones(n_bc // 2)])
-    rho_bc_np = np.full(n_bc, float(rho_vals[rho_vals > 0].mean()))
-    x_bc     = t_(x_bc_np)
-    t_bc     = t_(t_bc_np)
-    rho_bc   = t_(rho_bc_np)
+    # Points cinématiques
+    idx_kin = np.random.choice(len(x_zones), n_kin, replace=True)
+    x_kin   = mk(x_zones[idx_kin])
+    t_kin   = mk(np.random.uniform(0, 1, n_kin), grad=True)
 
-    log.info("Training data: %d days | rho=[%.3f, %.3f] | v=[%.3f, %.3f]",
+    # Conditions aux limites : densité baseline aux extrémités temporelles
+    rho_bc_val  = float(rho_vals[rho_vals > 0].mean()) if rho_vals.max() > 0 else 0.5
+    x_bc_np     = np.random.uniform(0, 1, n_bc)
+    t_bc_np     = np.concatenate([np.zeros(n_bc // 2), np.ones(n_bc // 2)])
+    rho_bc_np   = np.full(n_bc, rho_bc_val)
+    x_bc        = mk(x_bc_np)
+    t_bc        = mk(t_bc_np)
+    rho_bc      = mk(rho_bc_np)
+
+    log.info("Training data: %d jours | rho=[%.3f, %.3f] | v=[%.3f, %.3f]",
              len(df), rho_vals.min(), rho_vals.max(), v_vals.min(), v_vals.max())
 
     return {
         "x_data": x_data, "t_data": t_data,
         "rho_obs": rho_obs, "v_obs": v_obs,
+        "weights": weights,
         "x_col": x_col, "t_col": t_col,
         "x_bc": x_bc, "t_bc": t_bc, "rho_bc": rho_bc,
+        "x_kin": x_kin, "t_kin": t_kin,
+        "lon_range": (lon_min, lon_max),
+        "sog_max": sog_max,
+        "x_zones": x_zones,
     }
+
+
+# ---------------------------------------------------------------------------
+# Refresh des points stochastiques (évite l'overfitting à la grille)
+# ---------------------------------------------------------------------------
+
+def _refresh_stochastic_points(data: dict, device: torch.device) -> None:
+    """Retire et remplace les points de collocation et cinématiques."""
+    x_zones = data["x_zones"]
+    n_col   = len(data["x_col"])
+    n_kin   = len(data["x_kin"])
+
+    def mk(arr: np.ndarray, grad: bool = False) -> torch.Tensor:
+        return torch.tensor(arr, dtype=torch.float32, device=device,
+                            requires_grad=grad).reshape(-1, 1)
+
+    idx_col = np.random.choice(len(x_zones), n_col, replace=True)
+    data["x_col"] = mk(x_zones[idx_col], grad=True)
+    data["t_col"] = mk(np.random.uniform(0, 1, n_col), grad=True)
+
+    idx_kin = np.random.choice(len(x_zones), n_kin, replace=True)
+    data["x_kin"] = mk(x_zones[idx_kin])
+    data["t_kin"] = mk(np.random.uniform(0, 1, n_kin), grad=True)
 
 
 # ---------------------------------------------------------------------------
@@ -141,10 +213,13 @@ def train(
     lr:            float = DEFAULT_LR,
     lambda_pde:    float = DEFAULT_LAMBDA_PDE,
     lambda_bc:     float = DEFAULT_LAMBDA_BC,
-    train_start:   date  = TRAIN_START,
-    train_end:     date  = TRAIN_END,
-    features_path: Path  = FEATURES_PATH,
-    model_path:    Path  = MODEL_PATH,
+    lambda_kin:    float = DEFAULT_LAMBDA_KIN,
+    train_start:   date | str = date(2020, 1, 1),
+    train_end:     date | str = date(2020, 12, 31),
+    features_path: Path | str = Path("data/features/la_daily_features.parquet"),
+    zones_path:    Path | str | None = Path("data/features/la_constituent_zones.parquet"),
+    gravity_path:  Path | str | None = Path("data/features/la_gravity_daily.parquet"),
+    model_path:    Path | str = Path("outputs/models/la_lwr_pinn.pt"),
 ) -> LWRPINN:
     if isinstance(train_start, str):
         train_start = date.fromisoformat(train_start)
@@ -154,31 +229,37 @@ def train(
     device = get_device()
     log.info("Device: %s", device)
 
-    data  = prepare_training_data(train_start, train_end, device, features_path=Path(features_path))
+    data = prepare_training_data(
+        train_start, train_end, device,
+        features_path=Path(features_path),
+        zones_path=Path(zones_path) if zones_path else None,
+        gravity_path=Path(gravity_path) if gravity_path else None,
+    )
+
     model = LWRPINN(hidden_layers=4, hidden_size=64).to(device)
     opt   = optim.Adam(model.parameters(), lr=lr)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(opt, patience=200, factor=0.5)
 
-    best_loss = float("inf")
+    best_loss  = float("inf")
     best_state = None
-    history = []
+    history: list[dict] = []
 
     for epoch in range(1, epochs + 1):
         opt.zero_grad()
 
-        # Refresh collocation points every 500 epochs (avoid overfitting to grid)
-        if epoch % 500 == 1:
-            n_col = DEFAULT_N_COL
-            data["x_col"] = torch.rand(n_col, 1, device=device, requires_grad=True)
-            data["t_col"] = torch.rand(n_col, 1, device=device, requires_grad=True)
+        if epoch % 500 == 1 and epoch > 1:
+            _refresh_stochastic_points(data, device)
 
         loss, components = total_loss(
             model,
             data["x_data"], data["t_data"], data["rho_obs"], data["v_obs"],
             data["x_col"], data["t_col"],
             data["x_bc"],  data["t_bc"],  data["rho_bc"],
+            x_kin=data["x_kin"], t_kin=data["t_kin"],
+            weights=data["weights"],
             lambda_pde=lambda_pde,
             lambda_bc=lambda_bc,
+            lambda_kin=lambda_kin,
         )
 
         loss.backward()
@@ -186,7 +267,7 @@ def train(
         opt.step()
         scheduler.step(loss)
 
-        history.append(components["total"])
+        history.append(components)
 
         if loss.item() < best_loss:
             best_loss  = loss.item()
@@ -194,13 +275,12 @@ def train(
 
         if epoch % LOG_EVERY == 0 or epoch == 1:
             log.info(
-                "Epoch %4d/%d  total=%.6f  data=%.6f  pde=%.6f  bc=%.6f",
+                "Epoch %4d/%d  total=%.6f  data=%.6f  pde=%.6f  kin=%.6f  bc=%.6f",
                 epoch, epochs,
                 components["total"], components["data"],
-                components["pde"],   components["bc"],
+                components["pde"],   components["kin"], components["bc"],
             )
 
-    # Restore best weights
     if best_state:
         model.load_state_dict(best_state)
 
@@ -215,6 +295,9 @@ def train(
         "epochs":      epochs,
         "lambda_pde":  lambda_pde,
         "lambda_bc":   lambda_bc,
+        "lambda_kin":  lambda_kin,
+        "lon_range":   data["lon_range"],
+        "sog_max":     data["sog_max"],
     }, mp)
     log.info("Modèle sauvegardé → %s  (best_loss=%.6f)", mp, best_loss)
     return model
@@ -222,19 +305,43 @@ def train(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Phase 3 — PINN LWR Training")
-    parser.add_argument("--epochs",     type=int,   default=DEFAULT_EPOCHS)
-    parser.add_argument("--lr",         type=float, default=DEFAULT_LR)
-    parser.add_argument("--lambda-pde", type=float, default=DEFAULT_LAMBDA_PDE)
-    parser.add_argument("--lambda-bc",  type=float, default=DEFAULT_LAMBDA_BC)
-    parser.add_argument("--train-start", default=TRAIN_START.isoformat(), metavar="YYYY-MM-DD")
-    parser.add_argument("--train-end",   default=TRAIN_END.isoformat(),   metavar="YYYY-MM-DD")
+    parser.add_argument("--location",    default="la", choices=["houston", "la"])
+    parser.add_argument("--epochs",      type=int,   default=DEFAULT_EPOCHS)
+    parser.add_argument("--lr",          type=float, default=DEFAULT_LR)
+    parser.add_argument("--lambda-pde",  type=float, default=DEFAULT_LAMBDA_PDE)
+    parser.add_argument("--lambda-bc",   type=float, default=DEFAULT_LAMBDA_BC)
+    parser.add_argument("--lambda-kin",  type=float, default=DEFAULT_LAMBDA_KIN)
+    parser.add_argument("--train-start", default="2020-01-01")
+    parser.add_argument("--train-end",   default="2020-12-31")
+    parser.add_argument("--features-path", default=None)
+    parser.add_argument("--zones-path",    default=None)
+    parser.add_argument("--gravity-path",  default=None)
+    parser.add_argument("--model-path",    default=None)
     args = parser.parse_args()
+
+    loc = args.location
+    features_path = Path(args.features_path) if args.features_path else Path(
+        f"data/features/{loc}_daily_features.parquet"
+    )
+    zones_path = Path(args.zones_path) if args.zones_path else Path(
+        f"data/features/{loc}_constituent_zones.parquet"
+    )
+    gravity_path = Path(args.gravity_path) if args.gravity_path else Path(
+        f"data/features/{loc}_gravity_daily.parquet"
+    )
+    model_path = Path(args.model_path) if args.model_path else Path(
+        f"outputs/models/{loc}_lwr_pinn.pt"
+    )
 
     train(
         epochs=args.epochs, lr=args.lr,
-        lambda_pde=args.lambda_pde, lambda_bc=args.lambda_bc,
+        lambda_pde=args.lambda_pde, lambda_bc=args.lambda_bc, lambda_kin=args.lambda_kin,
         train_start=date.fromisoformat(args.train_start),
         train_end=date.fromisoformat(args.train_end),
+        features_path=features_path,
+        zones_path=zones_path,
+        gravity_path=gravity_path,
+        model_path=model_path,
     )
 
 
