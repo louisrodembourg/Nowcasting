@@ -33,7 +33,11 @@ import shapely.ops as so
 from shapely import Point, MultiPoint
 from scipy.spatial import ConvexHull
 
-from src.clustering.hdbscan_daily import cluster_day
+from src.clustering.hdbscan_daily import (
+    cluster_day,
+    ClusteringConfig,
+    load_waiting_zones,
+)
 from src.ingestion.download import LOCATIONS
 
 log = logging.getLogger(__name__)
@@ -298,7 +302,11 @@ def _build_geojson_features(
 # ----------------------------------------------------------------------------
 
 
-def build_features_and_stats(d: date, location: str = "houston") -> tuple[list, str, int]:
+def build_features_and_stats(
+    d: date,
+    location: str = "houston",
+    config: Optional[ClusteringConfig] = None,
+) -> tuple[list, str, int]:
     """
     Construit les features GeoJSON et les statistiques pour un jour.
     Retourne (features, stats_html, total_vessels)
@@ -312,7 +320,7 @@ def build_features_and_stats(d: date, location: str = "houston") -> tuple[list, 
         raise FileNotFoundError(f"Parquet introuvable : {parquet_path}")
 
     vessel_df = pl.read_parquet(parquet_path)
-    cluster_df, _ = cluster_day(parquet_path)
+    cluster_df, _ = cluster_day(parquet_path, config=config)
 
     if cluster_df is None:
         log.warning("Pas de clusters pour %s", d)
@@ -361,7 +369,11 @@ def build_features_and_stats(d: date, location: str = "houston") -> tuple[list, 
     return features, stats_html, total_vessels
 
 
-def visualize_day(d: date, location: str = "houston") -> Path:
+def visualize_day(
+    d: date,
+    location: str = "houston",
+    config: Optional[ClusteringConfig] = None,
+) -> Path:
     """
     Génère la carte Folium pour un jour.
     """
@@ -370,7 +382,9 @@ def visualize_day(d: date, location: str = "houston") -> Path:
         "la": {"center": [33.745, -118.22], "zoom": 11},
     }.get(location, {"center": [29.60, -95.05], "zoom": 12})
 
-    features, stats_html, total_vessels = build_features_and_stats(d, location)
+    features, stats_html, total_vessels = build_features_and_stats(
+        d, location, config=config
+    )
 
     # Map
     m = folium.Map(
@@ -391,7 +405,7 @@ def visualize_day(d: date, location: str = "houston") -> Path:
             coords = feat["geometry"]["coordinates"]
             folium.Polygon(
                 locations=[[p[1], p[0]] for p in coords[0]],
-                popup=folium.Popup(props["popup_html"], max_width=250),
+                popup=folium.Popup(props["popup"], max_width=250),
                 tooltip=f"Cluster {props['cluster_label']} — {props['cluster_type']} ({props['n_vessels']} navires)",
                 **props["style"],
             ).add_to(polygon_group)
@@ -400,7 +414,7 @@ def visualize_day(d: date, location: str = "houston") -> Path:
             coords = feat["geometry"]["coordinates"]
             folium.PolyLine(
                 locations=[[p[1], p[0]] for p in coords],
-                popup=folium.Popup(props["popup_html"], max_width=250),
+                popup=folium.Popup(props["popup"], max_width=250),
                 tooltip=f"Cluster {props['cluster_label']} — {props['cluster_type']} (ligne)",
                 **props["style"],
             ).add_to(polygon_group)
@@ -421,11 +435,13 @@ def visualize_day(d: date, location: str = "houston") -> Path:
             color=props["style"]["color"],
             fill=True,
             fill_opacity=props["style"]["fillOpacity"],
-            popup=folium.Popup(props["popup_html"], max_width=200),
+            popup=folium.Popup(props["popup"], max_width=200),
         ).add_to(noise_group)
     noise_group.add_to(m)
 
     # --- Navires en mouvement (échantillon) ---
+    loc_cfg_v = LOCATIONS[location]
+    prefix = loc_cfg_v["prefix"]
     parquet_dir = Path(__file__).resolve().parents[2] / "data" / "parquet" / location
     parquet_path = parquet_dir / f"{prefix}_{d.strftime('%Y_%m_%d')}.parquet"
     vessel_df = pl.read_parquet(parquet_path)
@@ -456,7 +472,15 @@ def visualize_day(d: date, location: str = "houston") -> Path:
     return out_path
 
 
-def visualize_period(start: date, end: date, location: str = "houston", no_docked: bool = False, no_waiting: bool = False, no_noise: bool = False) -> Path:
+def visualize_period(
+    start: date,
+    end: date,
+    location: str = "houston",
+    no_docked: bool = False,
+    no_waiting: bool = False,
+    no_noise: bool = False,
+    config: Optional[ClusteringConfig] = None,
+) -> Path:
     """
     Génère une carte Folium avec time slider pour la période.
     """
@@ -474,8 +498,12 @@ def visualize_period(start: date, end: date, location: str = "houston", no_docke
     for i, d in enumerate(range((end - start).days + 1)):
         d_date = start + timedelta(days=i)
         try:
-            features, _, total_vessels = build_features_and_stats(d_date, location)
-            waiting_count = sum(1 for f in features if f["properties"]["cluster_type"] == "waiting")
+            features, _, total_vessels = build_features_and_stats(
+                d_date, location, config=config
+            )
+            waiting_count = sum(
+                1 for f in features if f["properties"]["cluster_type"] == "waiting"
+            )
             waiting_vessels = sum(
                 f["properties"].get("n_vessels", 0)
                 for f in features
@@ -495,7 +523,7 @@ def visualize_period(start: date, end: date, location: str = "houston", no_docke
                     waiting_features.append(feat)
                 elif ctype == "noise":
                     noise_features.append(feat)
-            log.info(f"Processed {d_date} ({i+1}/{total_days})")
+            log.info(f"Processed {d_date} ({i + 1}/{total_days})")
         except Exception as exc:
             log.warning("%s : %s", d_date, exc)
 
@@ -648,9 +676,9 @@ def visualize_period(start: date, end: date, location: str = "houston", no_docke
 
     function extractCurrentDate() {{
         var map = getMapInstance();
-        if (!map || !map.timeDimension || typeof map.timeDimension.getCurrentTime !== 'function') return '{start.strftime('%Y-%m-%d')}';
+        if (!map || !map.timeDimension || typeof map.timeDimension.getCurrentTime !== 'function') return '{start.strftime("%Y-%m-%d")}';
         var current = map.timeDimension.getCurrentTime();
-        if (!current) return '{start.strftime('%Y-%m-%d')}';
+        if (!current) return '{start.strftime("%Y-%m-%d")}';
         var cur = new Date(current);
         return cur.toISOString().slice(0, 10);
     }}
@@ -688,7 +716,10 @@ def visualize_period(start: date, end: date, location: str = "houston", no_docke
     """
     m.get_root().html.add_child(folium.Element(js_script))
 
-    out_path = OUT_DIR / f"{location}_semantic_{start.strftime('%Y_%m_%d')}_to_{end.strftime('%Y_%m_%d')}.html"
+    out_path = (
+        OUT_DIR
+        / f"{location}_semantic_{start.strftime('%Y_%m_%d')}_to_{end.strftime('%Y_%m_%d')}.html"
+    )
     m.save(str(out_path))
     log.info("Sauvegardé : %s", out_path)
     return out_path
@@ -733,8 +764,20 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # Charge automatiquement les zones d'attente si le fichier existe
+    config = None
+    try:
+        zones = load_waiting_zones(args.location)
+        config = ClusteringConfig(waiting_allowed_polygons=zones)
+        log.info("Zones d'attente chargees automatiquement : %d polygones", len(zones))
+    except FileNotFoundError:
+        log.info("Pas de fichier de zones d'attente pour %s — clustering standard", args.location)
+
+
     if args.date:
-        out = visualize_day(date.fromisoformat(args.date), location=args.location)
+        out = visualize_day(
+            date.fromisoformat(args.date), location=args.location, config=config
+        )
         print(f"\nOuvrir dans le navigateur :\n  {out.resolve()}")
         return
 
@@ -743,7 +786,15 @@ def main() -> None:
             parser.error("--end requis avec --start")
         start = date.fromisoformat(args.start)
         end = date.fromisoformat(args.end)
-        out = visualize_period(start, end, location=args.location, no_docked=args.no_docked, no_waiting=args.no_waiting, no_noise=args.no_noise)
+        out = visualize_period(
+            start,
+            end,
+            location=args.location,
+            no_docked=args.no_docked,
+            no_waiting=args.no_waiting,
+            no_noise=args.no_noise,
+            config=config,
+        )
         print(f"\nOuvrir dans le navigateur :\n  {out.resolve()}")
         return
 
