@@ -2,7 +2,10 @@
 Phase 2 — Manifold géospatial + Gravity Score.
 
 Usage:
-    python src/manifold/manifold_pipeline.py --both --start 2019-01-01 --end 2019-01-31 --location houston
+    python src/manifold/manifold_pipeline.py --both --start 2019-01-01 --end 2019-12-31 --location houston
+    python src/manifold/manifold_pipeline.py --identify --start 2020-01-01 --end 2020-12-31 --location houston
+    python src/manifold/manifold_pipeline.py --score --start 2020-01-01 --end 2020-12-31 --location la
+
 """
 
 import argparse
