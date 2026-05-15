@@ -4,13 +4,21 @@ Carte animée annuelle — HDBSCAN + classification docked/waiting par zones KML
 Pour chaque jour de l'année :
   1. Chargement parquet + prétraitement cinématique
   2. HDBSCAN sur épisodes statiques (SOG_corr < 1 kt)
-  3. Classification de chaque épisode via zones KML (docked.klm / waiting.klm)
+  3. Classification de chaque épisode via zones KML (docked / waiting)
   4. Collecte des features GeoJSON avec timestamp
 
 Output : une seule carte HTML avec slider jour par jour + stats live.
 
 Usage (depuis Nowcasting/) :
+    # Port de LA (défaut)
     python run_yearly_map.py --year 2019
+    python run_yearly_map.py --year 2019 --location la
+
+    # Houston Ship Channel
+    python run_yearly_map.py --year 2017 --location houston
+    python run_yearly_map.py --year 2020 --location houston
+
+    # Surcharge manuelle
     python run_yearly_map.py --year 2019 --parquet-dir data/parquet/la --out outputs/figures/la_2019_animated.html
 """
 import argparse
@@ -49,6 +57,34 @@ COLORS = {
     "other":   "#616161",
     "noise":   "#BDBDBD",
 }
+
+# Configs par location
+LOCATION_CONFIGS = {
+    "la": {
+        "prefix":       "la",
+        "center":       [33.72, -118.18],
+        "zoom":         11,
+        "title":        "Port de LA",
+        "docked_kml":   "docked.klm",
+        "waiting_kml":  "waiting.klm",
+        "parquet_dir":  "data/parquet/la",
+        "harvey":       False,
+    },
+    "houston": {
+        "prefix":       "houston",
+        "center":       [29.75, -95.00],
+        "zoom":         11,
+        "title":        "Houston Ship Channel",
+        "docked_kml":   "DockedHouston.klm",
+        "waiting_kml":  "WaitingHouston.klm",
+        "parquet_dir":  "data/parquet/houston",
+        "harvey":       True,   # badge Harvey affiché si year == 2017
+    },
+}
+
+# Période Harvey (pour badge conditionnel)
+HARVEY_START = date(2017, 8, 25)
+HARVEY_END   = date(2017, 9, 2)
 
 
 # ── KML ───────────────────────────────────────────────────────────────────────
@@ -277,10 +313,12 @@ def build_yearly_map(
     docked_poly: Polygon,
     waiting_poly: Polygon,
     out_path: Path,
+    cfg: dict,
 ) -> None:
-    files = sorted(parquet_dir.glob(f"la_{year}_*.parquet"))
+    prefix = cfg["prefix"]
+    files  = sorted(parquet_dir.glob(f"{prefix}_{year}_*.parquet"))
     if not files:
-        log.error("Aucun fichier parquet pour %d dans %s", year, parquet_dir)
+        log.error("Aucun fichier parquet %s_%d_*.parquet dans %s", prefix, year, parquet_dir)
         return
     log.info("%d fichiers pour %d", len(files), year)
 
@@ -310,7 +348,7 @@ def build_yearly_map(
              len(all_docked), len(all_waiting), len(all_noise))
 
     # ── Carte ────────────────────────────────────────────────────────────────
-    m = folium.Map(location=[33.72, -118.18], zoom_start=11, tiles="CartoDB positron")
+    m = folium.Map(location=cfg["center"], zoom_start=cfg["zoom"], tiles="CartoDB positron")
 
     folium.TileLayer(
         tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
@@ -348,29 +386,44 @@ def build_yearly_map(
     # ── Légende + panneau stats ───────────────────────────────────────────────
     max_waiting = max((v.get("n_waiting_v", 0) for v in daily_stats.values()), default=1) or 1
 
+    title        = cfg["title"]
+    show_harvey  = cfg.get("harvey", False) and year == 2017
+    harvey_note  = (
+        '<div style="margin-top:6px;padding:4px 8px;background:#FFF3E0;border-radius:4px;'
+        'font-size:10px;color:#E65100;border:1px solid #FFB74D;">⚠ Hurricane Harvey : 25 août – 2 sept 2017</div>'
+        if show_harvey else ""
+    )
+
     legend_html = f"""
     <div style="position:fixed;top:10px;right:10px;z-index:9999;background:white;
                 padding:14px 18px;border-radius:10px;border:1px solid #ddd;
                 font-family:sans-serif;font-size:12px;box-shadow:2px 2px 8px rgba(0,0,0,.2);
                 min-width:200px;">
-      <b style="font-size:14px;">Port de LA — {year}</b>
+      <b style="font-size:14px;">{title} — {year}</b>
       <hr style="margin:6px 0">
       <div style="margin:3px 0"><span style="color:{COLORS['docked']};font-size:18px;">■</span> Terminaux (docked)</div>
       <div style="margin:3px 0"><span style="color:{COLORS['waiting']};font-size:18px;">■</span> Anchorage (waiting)</div>
-      <div style="margin:3px 0;color:#bbb"><span style="font-size:18px;">●</span> Bruit HDBSCAN</div>
       <hr style="margin:8px 0">
-      <div style="font-size:10px;color:#888">Classification géographique (KML)<br>Zones KML en pointillé</div>
+      <div style="font-size:10px;color:#888">Classification géographique (KML)</div>
+      {harvey_note}
     </div>
     """
     m.get_root().html.add_child(folium.Element(legend_html))
 
     # Panneau stats dynamique (mis à jour par JS avec le slider)
-    stats_panel_html = """
+    harvey_badge_html = (
+        '<div id="harvey-badge" style="display:none;margin-top:4px;padding:3px 8px;background:#FFEBEE;'
+        'border-radius:4px;font-size:10px;color:#C62828;border:1px solid #EF9A9A;">⚠ Pendant Hurricane Harvey</div>'
+        if show_harvey else ""
+    )
+
+    stats_panel_html = f"""
     <div id="stats-panel" style="position:fixed;bottom:60px;left:10px;z-index:9999;background:white;
                 padding:14px 18px;border-radius:10px;border:1px solid #ddd;
                 font-family:sans-serif;font-size:12px;box-shadow:2px 2px 8px rgba(0,0,0,.2);
                 min-width:230px;">
       <b id="stats-date">—</b>
+      {harvey_badge_html}
       <hr style="margin:6px 0">
       <table style="width:100%;font-size:11px;border-collapse:collapse;">
         <tr><td>Navires total</td><td id="s-total" style="text-align:right;font-weight:bold">—</td></tr>
@@ -390,10 +443,20 @@ def build_yearly_map(
     # Nom exact de la variable map générée par folium — évite la recherche via Object.values(window)
     map_var = m.get_name()
 
+    harvey_js = (
+        f"var harveyStart = '{HARVEY_START.isoformat()}';\n"
+        f"    var harveyEnd   = '{HARVEY_END.isoformat()}';\n"
+        f"    function isHarvey(iso) {{ return iso >= harveyStart && iso <= harveyEnd; }}"
+        if show_harvey else
+        "var harveyStart = null; var harveyEnd = null;\n"
+        "    function isHarvey(iso) { return false; }"
+    )
+
     js = f"""
     <script>
     var dailyStats = {json.dumps(daily_stats)};
     var maxWaiting = {max_waiting};
+    {harvey_js}
 
     function isoFromTime(t) {{
         if (!t) return null;
@@ -411,6 +474,8 @@ def build_yearly_map(
         document.getElementById('s-clusters').textContent  = data.n_clusters   || 0;
         var pct = maxWaiting > 0 ? ((data.n_waiting_v || 0) / maxWaiting * 100) : 0;
         document.getElementById('gauge-bar').style.width   = pct + '%';
+        var badge = document.getElementById('harvey-badge');
+        if (badge) badge.style.display = isHarvey(iso) ? 'block' : 'none';
     }}
 
     // ── Tooltips — bindés via layeradd (TimeDimension swaps son layer interne) ──
@@ -497,27 +562,40 @@ def build_yearly_map(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Carte animée annuelle HDBSCAN + zones KML"
+        description="Carte animée annuelle HDBSCAN + zones KML (LA ou Houston)"
     )
-    parser.add_argument("--year",        type=int,  default=2019)
-    parser.add_argument("--parquet-dir", default="data/parquet/la")
-    parser.add_argument("--docked-kml",  default="docked.klm")
-    parser.add_argument("--waiting-kml", default="waiting.klm")
+    parser.add_argument("--location",    choices=["la", "houston"], default="la",
+                        help="Port cible : la (défaut) ou houston")
+    parser.add_argument("--year",        type=int,  default=None,
+                        help="Année à tracer (défaut: 2019 pour LA, 2017 pour Houston)")
+    parser.add_argument("--parquet-dir", default=None,
+                        help="Répertoire Parquet (surcharge la valeur par défaut du --location)")
+    parser.add_argument("--docked-kml",  default=None,
+                        help="Fichier KML zone docked (surcharge la valeur par défaut)")
+    parser.add_argument("--waiting-kml", default=None,
+                        help="Fichier KML zone waiting (surcharge la valeur par défaut)")
     parser.add_argument("--out",         default=None,
-                        help="Chemin HTML de sortie (défaut: outputs/figures/la_<year>_animated.html)")
+                        help="Chemin HTML de sortie")
     args = parser.parse_args()
 
-    out_path = Path(args.out) if args.out else Path(f"outputs/figures/la_{args.year}_animated.html")
+    cfg  = LOCATION_CONFIGS[args.location]
+    year = args.year or (2019 if args.location == "la" else 2017)
 
-    docked_poly  = load_polygon(Path(args.docked_kml))
-    waiting_poly = load_polygon(Path(args.waiting_kml))
+    parquet_dir  = Path(args.parquet_dir) if args.parquet_dir else Path(cfg["parquet_dir"])
+    docked_kml   = Path(args.docked_kml)  if args.docked_kml  else Path(cfg["docked_kml"])
+    waiting_kml  = Path(args.waiting_kml) if args.waiting_kml else Path(cfg["waiting_kml"])
+    out_path     = Path(args.out) if args.out else Path(f"outputs/figures/{args.location}_{year}_animated.html")
+
+    docked_poly  = load_polygon(docked_kml)
+    waiting_poly = load_polygon(waiting_kml)
 
     build_yearly_map(
-        year        = args.year,
-        parquet_dir = Path(args.parquet_dir),
+        year        = year,
+        parquet_dir = parquet_dir,
         docked_poly = docked_poly,
         waiting_poly= waiting_poly,
         out_path    = out_path,
+        cfg         = cfg,
     )
     print(f"\nOuvrir dans le navigateur : {out_path.resolve()}")
 
