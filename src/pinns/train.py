@@ -1,19 +1,11 @@
 """
-Phase 3 — Entraînement du PINN LWR sur Harvey.
-
-Fenêtre d'entraînement : 10 jours avant Harvey + fenêtre de crise + 10 jours après.
-Default : 2017-08-15 → 2017-09-10
-
-Les données AIS (ρ, v) sont extraites de la matrice de features Phase 1 et
-normalisées dans [0,1]. Les points de collocation PDE sont échantillonnés
-uniformément dans le domaine (x, t).
-
-Le modèle entraîné est sauvegardé dans outputs/models/lwr_pinn.pt.
+Phase 3 — Train the PINN on real spatiotemporal AIS data.
 
 Usage:
-    python src/pinns/train.py
-    python src/pinns/train.py --epochs 3000 --lr 1e-3
+    python src/pinns/train.py --location houston --start 2019-01-01 --end 2019-03-31
+    python src/pinns/train.py --location houston --start 2019-01-01 --end 2019-06-30 --epochs 3000
 """
+
 import argparse
 import logging
 import sys
@@ -23,140 +15,58 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import numpy as np
-import polars as pl
 import torch
 import torch.optim as optim
 
 from src.pinns.lwr_pinn import LWRPINN, total_loss, get_device
+from src.pinns.data_prep import get_tensors
 
 log = logging.getLogger(__name__)
 
-FEATURES_PATH = Path("data/features/houston_daily_features.parquet")
-MODEL_PATH    = Path("outputs/models/lwr_pinn.pt")
+MODEL_DIR = Path("outputs/models")
+LOG_EVERY = 200
+N_COLLOC = 2000
 
-# Fenêtre Harvey
-TRAIN_START   = date(2017, 8, 15)
-TRAIN_END     = date(2017, 9, 10)
-
-# Hyperparamètres par défaut
-DEFAULT_EPOCHS      = 2000
-DEFAULT_LR          = 5e-4
-DEFAULT_N_COL       = 2000   # points de collocation PDE
-DEFAULT_LAMBDA_PDE  = 0.1
-DEFAULT_LAMBDA_BC   = 0.1
-LOG_EVERY           = 200
-
-
-# ---------------------------------------------------------------------------
-# Préparation des données
-# ---------------------------------------------------------------------------
-
-def prepare_training_data(
-    train_start: date,
-    train_end:   date,
-    device: torch.device,
-    features_path: Path = FEATURES_PATH,
-) -> dict[str, torch.Tensor]:
-    """
-    Extrait et normalise les données AIS pour l'entraînement.
-
-    x = LON normalisé ∈ [0,1] (position le long du chenal)
-    t = jour normalisé ∈ [0,1] (depuis train_start)
-    ρ = utilization_rate_rho ∈ [0,1]  (déjà une fraction)
-    v = SOG_median normalisé ∈ [0,1]  (/ SOG_max observé)
-
-    Retourne un dict de tenseurs sur `device`.
-    """
-    df = (
-        pl.read_parquet(features_path)
-        .sort("date")
-        .filter(pl.col("date").is_between(train_start, train_end))
-    )
-
-    if len(df) == 0:
-        raise ValueError(f"Aucune donnée entre {train_start} et {train_end}")
-
-    n_days  = (train_end - train_start).days + 1
-    dates   = df["date"].to_list()
-
-    # t normalisé
-    t_vals  = np.array([(d - train_start).days / max(n_days - 1, 1) for d in dates])
-
-    # x : on utilise une position x=0.5 (centroid du chenal) —
-    # on n'a pas de coordonnée x par jour dans les features agrégées.
-    # Les trajectoires détaillées (trajectory.py) donneraient un x continu,
-    # mais pour le training sur features journalières, x=0.5 est un proxy valide.
-    x_vals  = np.full(len(df), 0.5)
-
-    # ρ = utilization_rate_rho (déjà ∈ [0,1])
-    rho_vals = df["utilization_rate_rho"].to_numpy().astype(float)
-
-    # v = SOG_mean normalisé (SOG_median=0 pour la plupart des jours car navires stationnaires)
-    sog = df["SOG_mean"].to_numpy().astype(float)
-    sog_max = sog.max()
-    v_vals = sog / sog_max if sog_max > 0 else sog
-
-    def t_(arr: np.ndarray, grad: bool = False) -> torch.Tensor:
-        return torch.tensor(arr, dtype=torch.float32, device=device,
-                            requires_grad=grad).reshape(-1, 1)
-
-    x_data   = t_(x_vals)
-    t_data   = t_(t_vals)
-    rho_obs  = t_(rho_vals)
-    v_obs    = t_(v_vals)
-
-    # Points de collocation PDE : grille uniforme (x, t) ∈ [0,1]²
-    n_col   = DEFAULT_N_COL
-    x_col_np = np.random.uniform(0, 1, n_col)
-    t_col_np = np.random.uniform(0, 1, n_col)
-    x_col    = t_(x_col_np, grad=True)
-    t_col    = t_(t_col_np, grad=True)
-
-    # Conditions aux limites : ρ = baseline aux bords temporels (t=0 et t=1)
-    n_bc   = 50
-    x_bc_np = np.random.uniform(0, 1, n_bc)
-    t_bc_np = np.concatenate([np.zeros(n_bc // 2), np.ones(n_bc // 2)])
-    rho_bc_np = np.full(n_bc, float(rho_vals[rho_vals > 0].mean()))
-    x_bc     = t_(x_bc_np)
-    t_bc     = t_(t_bc_np)
-    rho_bc   = t_(rho_bc_np)
-
-    log.info("Training data: %d days | rho=[%.3f, %.3f] | v=[%.3f, %.3f]",
-             len(df), rho_vals.min(), rho_vals.max(), v_vals.min(), v_vals.max())
-
-    return {
-        "x_data": x_data, "t_data": t_data,
-        "rho_obs": rho_obs, "v_obs": v_obs,
-        "x_col": x_col, "t_col": t_col,
-        "x_bc": x_bc, "t_bc": t_bc, "rho_bc": rho_bc,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Boucle d'entraînement
-# ---------------------------------------------------------------------------
 
 def train(
-    epochs:        int   = DEFAULT_EPOCHS,
-    lr:            float = DEFAULT_LR,
-    lambda_pde:    float = DEFAULT_LAMBDA_PDE,
-    lambda_bc:     float = DEFAULT_LAMBDA_BC,
-    train_start:   date  = TRAIN_START,
-    train_end:     date  = TRAIN_END,
-    features_path: Path  = FEATURES_PATH,
-    model_path:    Path  = MODEL_PATH,
-) -> LWRPINN:
-    if isinstance(train_start, str):
-        train_start = date.fromisoformat(train_start)
-    if isinstance(train_end, str):
-        train_end = date.fromisoformat(train_end)
+    location="houston",
+    start=date(2019, 1, 1),
+    end=date(2019, 3, 31),
+    epochs=2000,
+    lr=5e-4,
+    dx_km=2.0,
+    lambda_pde=0.1,
+    lambda_kin=0.05,
+    constituent_path=None,
+    model_name=None,
+):
+    if isinstance(start, str):
+        start = date.fromisoformat(start)
+    if isinstance(end, str):
+        end = date.fromisoformat(end)
 
     device = get_device()
     log.info("Device: %s", device)
 
-    data  = prepare_training_data(train_start, train_end, device, features_path=Path(features_path))
+    log.info("Loading spatiotemporal data: %s %s → %s", location, start, end)
+    X, y, meta = get_tensors(
+        device,
+        start,
+        end,
+        location,
+        dx_km=dx_km,
+        constituent_path=constituent_path,
+        use_raw_velocity=True,
+    )
+    log.info("Training points: %d", len(X))
+
+    x_data = X[:, 0:1].detach().requires_grad_(False)
+    t_data = X[:, 1:2].detach().requires_grad_(False)
+    rho_obs = y[:, 0:1].detach()
+    v_obs = y[:, 1:2].detach()
+
     model = LWRPINN(hidden_layers=4, hidden_size=64).to(device)
-    opt   = optim.Adam(model.parameters(), lr=lr)
+    opt = optim.Adam(model.parameters(), lr=lr)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(opt, patience=200, factor=0.5)
 
     best_loss = float("inf")
@@ -166,19 +76,31 @@ def train(
     for epoch in range(1, epochs + 1):
         opt.zero_grad()
 
-        # Refresh collocation points every 500 epochs (avoid overfitting to grid)
         if epoch % 500 == 1:
-            n_col = DEFAULT_N_COL
-            data["x_col"] = torch.rand(n_col, 1, device=device, requires_grad=True)
-            data["t_col"] = torch.rand(n_col, 1, device=device, requires_grad=True)
+            x_col = torch.rand(N_COLLOC, 1, device=device, requires_grad=True)
+            t_col = torch.rand(N_COLLOC, 1, device=device, requires_grad=True)
+        else:
+            x_col = (
+                x_col
+                if epoch > 1
+                else torch.rand(N_COLLOC, 1, device=device, requires_grad=True)
+            )
+            t_col = (
+                t_col
+                if epoch > 1
+                else torch.rand(N_COLLOC, 1, device=device, requires_grad=True)
+            )
 
-        loss, components = total_loss(
+        loss, comps = total_loss(
             model,
-            data["x_data"], data["t_data"], data["rho_obs"], data["v_obs"],
-            data["x_col"], data["t_col"],
-            data["x_bc"],  data["t_bc"],  data["rho_bc"],
+            x_data,
+            t_data,
+            rho_obs,
+            v_obs,
+            x_col,
+            t_col,
             lambda_pde=lambda_pde,
-            lambda_bc=lambda_bc,
+            lambda_kin=lambda_kin,
         )
 
         loss.backward()
@@ -186,55 +108,70 @@ def train(
         opt.step()
         scheduler.step(loss)
 
-        history.append(components["total"])
-
+        history.append(comps["total"])
         if loss.item() < best_loss:
-            best_loss  = loss.item()
+            best_loss = loss.item()
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
 
         if epoch % LOG_EVERY == 0 or epoch == 1:
             log.info(
-                "Epoch %4d/%d  total=%.6f  data=%.6f  pde=%.6f  bc=%.6f",
-                epoch, epochs,
-                components["total"], components["data"],
-                components["pde"],   components["bc"],
+                "Epoch %4d/%d  total=%.6f  data=%.6f  pde=%.6f  kin=%.6f",
+                epoch,
+                epochs,
+                comps["total"],
+                comps["data"],
+                comps["pde"],
+                comps["kin"],
             )
 
-    # Restore best weights
     if best_state:
         model.load_state_dict(best_state)
 
-    mp = Path(model_path)
-    mp.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({
-        "model_state": model.state_dict(),
-        "train_start": train_start.isoformat(),
-        "train_end":   train_end.isoformat(),
-        "best_loss":   best_loss,
-        "history":     history,
-        "epochs":      epochs,
-        "lambda_pde":  lambda_pde,
-        "lambda_bc":   lambda_bc,
-    }, mp)
-    log.info("Modèle sauvegardé → %s  (best_loss=%.6f)", mp, best_loss)
-    return model
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    name = model_name or f"pinn_{location}_{start.isoformat()}_{end.isoformat()}"
+    save_path = MODEL_DIR / f"{name}.pt"
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "location": location,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "best_loss": best_loss,
+            "history": history,
+            "epochs": epochs,
+            "meta": meta,
+        },
+        save_path,
+    )
+    log.info("Saved model → %s (best_loss=%.6f)", save_path, best_loss)
+    return model, history, meta
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Phase 3 — PINN LWR Training")
-    parser.add_argument("--epochs",     type=int,   default=DEFAULT_EPOCHS)
-    parser.add_argument("--lr",         type=float, default=DEFAULT_LR)
-    parser.add_argument("--lambda-pde", type=float, default=DEFAULT_LAMBDA_PDE)
-    parser.add_argument("--lambda-bc",  type=float, default=DEFAULT_LAMBDA_BC)
-    parser.add_argument("--train-start", default=TRAIN_START.isoformat(), metavar="YYYY-MM-DD")
-    parser.add_argument("--train-end",   default=TRAIN_END.isoformat(),   metavar="YYYY-MM-DD")
+def main():
+    parser = argparse.ArgumentParser(description="Phase 3 — PINN LWR training")
+    parser.add_argument("--location", default="houston")
+    parser.add_argument("--start", default="2019-01-01")
+    parser.add_argument("--end", default="2019-03-31")
+    parser.add_argument("--epochs", type=int, default=2000)
+    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--dx-km", type=float, default=2.0)
+    parser.add_argument("--lambda-pde", type=float, default=0.1)
+    parser.add_argument("--lambda-kin", type=float, default=0.05)
+    parser.add_argument("--constituent-path", default=None)
+    parser.add_argument("--model-name", default=None)
     args = parser.parse_args()
 
     train(
-        epochs=args.epochs, lr=args.lr,
-        lambda_pde=args.lambda_pde, lambda_bc=args.lambda_bc,
-        train_start=date.fromisoformat(args.train_start),
-        train_end=date.fromisoformat(args.train_end),
+        location=args.location,
+        start=date.fromisoformat(args.start),
+        end=date.fromisoformat(args.end),
+        epochs=args.epochs,
+        lr=args.lr,
+        dx_km=args.dx_km,
+        lambda_pde=args.lambda_pde,
+        lambda_kin=args.lambda_kin,
+        constituent_path=args.constituent_path,
+        model_name=args.model_name,
     )
 
 
