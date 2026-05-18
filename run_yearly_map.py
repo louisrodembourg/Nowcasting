@@ -1,11 +1,14 @@
 """
-Carte animée annuelle — HDBSCAN + classification docked/waiting par zones KML.
+Carte animée annuelle — HDBSCAN + classification docked/waiting par zone GeoJSON.
 
 Pour chaque jour de l'année :
   1. Chargement parquet + prétraitement cinématique
   2. HDBSCAN sur épisodes statiques (SOG_corr < 1 kt)
-  3. Classification de chaque épisode via zones KML (docked / waiting)
+  3. Classification : dans le polygone docked → "docked", sinon → "waiting"
   4. Collecte des features GeoJSON avec timestamp
+
+Zones : data/zones/{location}_docked.geojson
+  Seule la zone docked est définie — tout le reste est automatiquement "waiting".
 
 Output : une seule carte HTML avec slider jour par jour + stats live.
 
@@ -18,6 +21,10 @@ Usage (depuis Nowcasting/) :
     python run_yearly_map.py --year 2017 --location houston
     python run_yearly_map.py --year 2020 --location houston
 
+    # Comparer les deux modes de zone
+    python run_yearly_map.py --year 2019 --location la --zone-mode docked   # zone docked → reste waiting
+    python run_yearly_map.py --year 2019 --location la --zone-mode waiting  # zone waiting → reste docked
+
     # Surcharge manuelle
     python run_yearly_map.py --year 2019 --parquet-dir data/parquet/la --out outputs/figures/la_2019_animated.html
 """
@@ -25,7 +32,6 @@ import argparse
 import json
 import logging
 import sys
-import xml.etree.ElementTree as ET
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -39,8 +45,9 @@ import polars as pl
 import shapely
 import shapely.geometry as sg
 from scipy.spatial import ConvexHull
-from shapely.geometry import Polygon, Point, MultiPoint
+from shapely.geometry import Point, MultiPoint
 
+from src.clustering.hdbscan_daily import load_docked_zones_or_none, load_waiting_zones_or_none
 from src.ingestion.kinematic_filter import prepare_kinematics
 
 log = logging.getLogger(__name__)
@@ -54,52 +61,32 @@ SOG_STATIC_THRESHOLD     = 1.0
 COLORS = {
     "docked":  "#1565C0",
     "waiting": "#E65100",
-    "other":   "#616161",
     "noise":   "#BDBDBD",
 }
 
 # Configs par location
 LOCATION_CONFIGS = {
     "la": {
-        "prefix":       "la",
-        "center":       [33.72, -118.18],
-        "zoom":         11,
-        "title":        "Port de LA",
-        "docked_kml":   "docked.klm",
-        "waiting_kml":  "waiting.klm",
-        "parquet_dir":  "data/parquet/la",
+        "prefix":      "la",
+        "center":      [33.72, -118.18],
+        "zoom":        11,
+        "title":       "Port de LA",
+        "parquet_dir": "data/parquet/la",
         "harvey":       False,
     },
     "houston": {
-        "prefix":       "houston",
-        "center":       [29.75, -95.00],
-        "zoom":         11,
-        "title":        "Houston Ship Channel",
-        "docked_kml":   "DockedHouston.klm",
-        "waiting_kml":  "WaitingHouston.klm",
-        "parquet_dir":  "data/parquet/houston",
-        "harvey":       True,   # badge Harvey affiché si year == 2017
+        "prefix":      "houston",
+        "center":      [29.75, -95.00],
+        "zoom":        11,
+        "title":       "Houston Ship Channel",
+        "parquet_dir": "data/parquet/houston",
+        "harvey":      True,
     },
 }
 
 # Période Harvey (pour badge conditionnel)
 HARVEY_START = date(2017, 8, 25)
 HARVEY_END   = date(2017, 9, 2)
-
-
-# ── KML ───────────────────────────────────────────────────────────────────────
-
-def load_polygon(path: Path) -> Polygon:
-    tree = ET.parse(path)
-    root = tree.getroot()
-    ns   = root.tag[: root.tag.index("}") + 1] if root.tag.startswith("{") else ""
-    el   = root.find(f".//{ns}coordinates")
-    if el is None or not el.text:
-        raise ValueError(f"Pas de <coordinates> dans {path}")
-    pts  = [(float(t.split(",")[0]), float(t.split(",")[1]))
-            for t in el.text.strip().split()]
-    poly = Polygon(pts)
-    return poly if poly.is_valid else poly.buffer(0)
 
 
 # ── Géométrie ─────────────────────────────────────────────────────────────────
@@ -152,16 +139,18 @@ def cluster_geom_and_zone(cluster_df, label):
     lons  = rows["LON"].to_numpy()
     lats  = rows["LAT"].to_numpy()
     zones = rows["zone"].value_counts().sort("count", descending=True)
-    zone  = zones["zone"][0] if len(zones) else "other"
+    zone  = zones["zone"][0] if len(zones) else "waiting"
     geom  = _rotated_mbr(lons, lats) if zone == "docked" else _safe_hull(lons, lats)
     return geom, zone
 
 
 # ── Pipeline par jour ─────────────────────────────────────────────────────────
 
-def process_day(parquet_path: Path, docked_poly: Polygon, waiting_poly: Polygon):
+def process_day(parquet_path: Path, ref_poly, zone_mode: str = "docked"):
     """
     Charge un fichier parquet, exécute HDBSCAN + classification zone.
+    zone_mode "docked"  : ref_poly = zone docked, reste = waiting.
+    zone_mode "waiting" : ref_poly = zone waiting, reste = docked.
     Retourne (cluster_df, stats_dict) ou (None, stats_dict) si skip.
     """
     raw      = pl.read_parquet(parquet_path)
@@ -174,7 +163,6 @@ def process_day(parquet_path: Path, docked_poly: Polygon, waiting_poly: Polygon)
     if len(static) < HDBSCAN_MIN_CLUSTER_SIZE:
         return None, {"vessel_count": vessel_count, "n_docked_v": 0, "n_waiting_v": 0, "n_clusters": 0}
 
-    # Agrégation : un point par épisode statique
     cols = static.columns
     agg  = static.group_by(["MMSI", "traj_id"]).agg([
         pl.col("LAT").median().alias("LAT"),
@@ -189,7 +177,6 @@ def process_day(parquet_path: Path, docked_poly: Polygon, waiting_poly: Polygon)
     if len(agg) < HDBSCAN_MIN_CLUSTER_SIZE:
         return None, {"vessel_count": vessel_count, "n_docked_v": 0, "n_waiting_v": 0, "n_clusters": 0}
 
-    # HDBSCAN
     coords_rad = np.radians(agg.select(["LAT", "LON"]).to_numpy())
     clusterer  = hdbscan.HDBSCAN(
         min_cluster_size=HDBSCAN_MIN_CLUSTER_SIZE,
@@ -205,12 +192,17 @@ def process_day(parquet_path: Path, docked_poly: Polygon, waiting_poly: Polygon)
         pl.Series("membership_score", scores, dtype=pl.Float32),
     ])
 
-    # Classification par zone
-    lons      = agg["LON"].to_numpy()
-    lats      = agg["LAT"].to_numpy()
-    in_docked  = shapely.contains_xy(docked_poly,  lons, lats)
-    in_waiting = shapely.contains_xy(waiting_poly, lons, lats)
-    zone = np.where(in_docked, "docked", np.where(in_waiting, "waiting", "other"))
+    # Classification selon zone_mode
+    lons = agg["LON"].to_numpy()
+    lats = agg["LAT"].to_numpy()
+    if ref_poly is not None:
+        in_ref = shapely.contains_xy(ref_poly, lons, lats)
+    else:
+        in_ref = np.zeros(len(agg), dtype=bool)
+    if zone_mode == "waiting":
+        zone = np.where(in_ref, "waiting", "docked")
+    else:
+        zone = np.where(in_ref, "docked", "waiting")
     agg  = agg.with_columns(pl.Series("zone", zone, dtype=pl.Utf8))
 
     # Stats
@@ -261,7 +253,7 @@ def cluster_df_to_geojson_features(cluster_df, d: date) -> tuple[list, list, lis
         rows      = cluster_df.filter(pl.col("cluster_label") == label)
         n_vessels = rows["MMSI"].n_unique()
         n_ep      = len(rows)
-        color     = COLORS.get(zone, COLORS["other"])
+        color     = COLORS.get(zone, COLORS["waiting"])
 
         if geom.geom_type not in ("Polygon", "LineString", "MultiPolygon"):
             continue
@@ -297,10 +289,8 @@ def cluster_df_to_geojson_features(cluster_df, d: date) -> tuple[list, list, lis
 
         if zone == "docked":
             docked_feats.append(feat)
-        elif zone == "waiting":
-            waiting_feats.append(feat)
         else:
-            docked_feats.append(feat)  # "other" va dans docked par défaut (visible)
+            waiting_feats.append(feat)
 
     return docked_feats, waiting_feats, noise_feats
 
@@ -310,10 +300,10 @@ def cluster_df_to_geojson_features(cluster_df, d: date) -> tuple[list, list, lis
 def build_yearly_map(
     year: int,
     parquet_dir: Path,
-    docked_poly: Polygon,
-    waiting_poly: Polygon,
+    ref_poly,
     out_path: Path,
     cfg: dict,
+    zone_mode: str = "docked",
 ) -> None:
     prefix = cfg["prefix"]
     files  = sorted(parquet_dir.glob(f"{prefix}_{year}_*.parquet"))
@@ -332,7 +322,7 @@ def build_yearly_map(
         d     = date(int(stem[-3]), int(stem[-2]), int(stem[-1]))
         ds    = d.isoformat()
 
-        cluster_df, stats = process_day(f, docked_poly, waiting_poly)
+        cluster_df, stats = process_day(f, ref_poly, zone_mode)
         daily_stats[ds]   = stats
 
         if cluster_df is not None:
@@ -562,40 +552,70 @@ def build_yearly_map(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Carte animée annuelle HDBSCAN + zones KML (LA ou Houston)"
+        description="Carte animée annuelle HDBSCAN + zone docked GeoJSON (LA ou Houston)"
     )
-    parser.add_argument("--location",    choices=["la", "houston"], default="la",
+    parser.add_argument("--location",      choices=["la", "houston"], default="la",
                         help="Port cible : la (défaut) ou houston")
-    parser.add_argument("--year",        type=int,  default=None,
+    parser.add_argument("--year",          type=int, default=None,
                         help="Année à tracer (défaut: 2019 pour LA, 2017 pour Houston)")
-    parser.add_argument("--parquet-dir", default=None,
-                        help="Répertoire Parquet (surcharge la valeur par défaut du --location)")
-    parser.add_argument("--docked-kml",  default=None,
-                        help="Fichier KML zone docked (surcharge la valeur par défaut)")
-    parser.add_argument("--waiting-kml", default=None,
-                        help="Fichier KML zone waiting (surcharge la valeur par défaut)")
-    parser.add_argument("--out",         default=None,
+    parser.add_argument("--parquet-dir",   default=None,
+                        help="Répertoire Parquet (surcharge la valeur par défaut)")
+    parser.add_argument("--zone-mode",     choices=["docked", "waiting"], default="docked",
+                        help="Mode de classification : 'docked' (défaut) = zone docked comme référence, "
+                             "reste=waiting ; 'waiting' = zone waiting comme référence, reste=docked")
+    parser.add_argument("--docked-geojson", default=None,
+                        help="Fichier GeoJSON zone docked (surcharge data/zones/{location}_docked.geojson)")
+    parser.add_argument("--waiting-geojson", default=None,
+                        help="Fichier GeoJSON zone waiting (surcharge data/zones/{location}_waiting.geojson)")
+    parser.add_argument("--out",           default=None,
                         help="Chemin HTML de sortie")
     args = parser.parse_args()
 
     cfg  = LOCATION_CONFIGS[args.location]
     year = args.year or (2019 if args.location == "la" else 2017)
 
-    parquet_dir  = Path(args.parquet_dir) if args.parquet_dir else Path(cfg["parquet_dir"])
-    docked_kml   = Path(args.docked_kml)  if args.docked_kml  else Path(cfg["docked_kml"])
-    waiting_kml  = Path(args.waiting_kml) if args.waiting_kml else Path(cfg["waiting_kml"])
-    out_path     = Path(args.out) if args.out else Path(f"outputs/figures/{args.location}_{year}_animated.html")
+    parquet_dir = Path(args.parquet_dir) if args.parquet_dir else Path(cfg["parquet_dir"])
+    out_path    = Path(args.out) if args.out else Path(
+        f"outputs/figures/{args.location}_{year}_mode_{args.zone_mode}_animated.html"
+    )
 
-    docked_poly  = load_polygon(docked_kml)
-    waiting_poly = load_polygon(waiting_kml)
+    # Chargement de la zone de référence selon zone_mode
+    if args.zone_mode == "waiting":
+        if args.waiting_geojson:
+            import json as _json
+            from shapely.geometry import shape as _shape
+            from shapely.ops import unary_union as _uu
+            with open(args.waiting_geojson) as f:
+                fc = _json.load(f)
+            feats = fc.get("features", [fc] if fc.get("type") == "Feature" else [])
+            ref_poly = _uu([_shape(ft.get("geometry", ft)) for ft in feats])
+        else:
+            ref_poly = load_waiting_zones_or_none(args.location)
+        if ref_poly is None:
+            log.warning("Pas de zone waiting trouvée — tous les clusters seront classés 'docked'")
+    else:
+        if args.docked_geojson:
+            import json as _json
+            from shapely.geometry import shape as _shape
+            from shapely.ops import unary_union as _uu
+            with open(args.docked_geojson) as f:
+                fc = _json.load(f)
+            feats = fc.get("features", [fc] if fc.get("type") == "Feature" else [])
+            ref_poly = _uu([_shape(ft.get("geometry", ft)) for ft in feats])
+        else:
+            ref_poly = load_docked_zones_or_none(args.location)
+        if ref_poly is None:
+            log.warning("Pas de zone docked trouvée — tous les clusters seront classés 'waiting'")
+
+    log.info("zone_mode=%s  ref_poly=%s", args.zone_mode, "chargé" if ref_poly is not None else "None")
 
     build_yearly_map(
         year        = year,
         parquet_dir = parquet_dir,
-        docked_poly = docked_poly,
-        waiting_poly= waiting_poly,
+        ref_poly    = ref_poly,
         out_path    = out_path,
         cfg         = cfg,
+        zone_mode   = args.zone_mode,
     )
     print(f"\nOuvrir dans le navigateur : {out_path.resolve()}")
 

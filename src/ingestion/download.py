@@ -26,6 +26,9 @@ import requests
 
 log = logging.getLogger(__name__)
 
+# Project root (Nowcasting/) — works regardless of the CWD when the script is called
+_ROOT = Path(__file__).resolve().parents[2]
+
 # ── Location configs ─────────────────────────────────────────────────────────
 LOCATIONS = {
     "houston": {
@@ -34,7 +37,7 @@ LOCATIONS = {
         "lat_max":  29.85,
         "lon_min": -95.4,
         "lon_max": -94.7,
-        "out_dir":  Path("data/parquet/houston"),
+        "out_dir":  _ROOT / "data/parquet/houston",
         "prefix":   "houston",
     },
     "la": {
@@ -43,7 +46,7 @@ LOCATIONS = {
         "lat_max":  33.85,
         "lon_min": -118.35,
         "lon_max": -118.05,
-        "out_dir":  Path("data/parquet/la"),
+        "out_dir":  _ROOT / "data/parquet/la",
         "prefix":   "la",
     },
 }

@@ -1,5 +1,5 @@
 """
-Extraire le vecteur des 13 features quotidiennes pour l'entrée de la variété de Houston.
+Extraire le vecteur des 13 features quotidiennes pour l'entrée de la variété.
 
 Features (une ligne par jour) :
   1.  vessel_count           — nombre distinct de MMSI dans la bbox ce jour-là
@@ -17,7 +17,8 @@ Features (une ligne par jour) :
   13. tanker_ratio           — fraction MMSI pétroliers parmi MMSI statiques (VesselType 80–89)
 
 Usage (autonome, un jour):
-    python src/clustering/features_daily.py --date 2017-07-01
+    python src/clustering/features_daily.py --date 2017-07-01 --location houston
+    python src/clustering/features_daily.py --date 2019-03-15 --location la
 """
 import argparse
 import logging
@@ -30,12 +31,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import polars as pl
 
-from src.clustering.hdbscan_daily import cluster_day
+from src.clustering.hdbscan_daily import (
+    ClusteringConfig,
+    cluster_day,
+    load_docked_zones_or_none,
+)
+from src.ingestion.download import LOCATIONS
 
 log = logging.getLogger(__name__)
 
 SOG_STATIC_THRESHOLD = 1.0
-PARQUET_DIR = Path("data/parquet/houston")
 
 
 def _f(val, default: float = 0.0) -> float:
@@ -52,45 +57,35 @@ def compute_daily_features(
     Calcule les 13 features quotidiennes pour la variété.
 
     Args:
-        day_data:    Chemin vers le Parquet brut OU un DataFrame préparé (avec colonne SOG_corr).
-                     Quand un DataFrame est passé (déjà préparé par prepare_kinematics),
-                     la SOG corrigée est utilisée pour les stats de trafic. Sinon la SOG brute est utilisée.
-        cluster_df:  Sortie de cluster_day() — une ligne par épisode statique + métadonnées du cluster.
-                     Passer None si HDBSCAN n'a produit aucun résultat (features HDBSCAN défaut 0).
-        d:           La date, utilisée comme clé 'date' dans le dict de sortie.
+        day_data:   Chemin Parquet brut OU DataFrame préparé (avec colonne SOG_corr).
+        cluster_df: Sortie de cluster_day() — une ligne par épisode statique.
+                    Passer None si HDBSCAN n'a produit aucun résultat.
+        d:          La date (clé 'date' dans le dict de sortie).
 
-    Retourne un dict avec 14 clés (date + 13 features), ou None si les données manquent.
+    Retourne un dict avec 14 clés (date + 13 features), ou None si données manquantes.
     """
-    # Vérifie si day_data est un chemin ou un DataFrame déjà préparé
     if isinstance(day_data, Path):
         if not day_data.exists():
             log.warning("%s : Parquet non trouvé — %s", d, day_data)
             return None
-        # Charge le fichier brut et utilise la SOG brute
-        all_df = pl.read_parquet(day_data)
+        all_df  = pl.read_parquet(day_data)
         sog_col = "SOG"
     else:
-        # Utilise le DataFrame préparé, préférant la SOG corrigée si disponible
         all_df  = day_data
         sog_col = "SOG_corr" if "SOG_corr" in all_df.columns else "SOG"
 
-    # --- Trafic global (tous les messages, tous les navires) ----------------
-    vessel_count = all_df["MMSI"].n_unique()  # Nombre distinct de navires
-    sog_mean     = _f(all_df[sog_col].mean())  # Vitesse moyenne
-    sog_std      = _f(all_df[sog_col].std())   # Variabilité de vitesse
-    sog_median   = _f(all_df[sog_col].median())  # Vitesse médiane
+    # --- Trafic global -------------------------------------------------------
+    vessel_count = all_df["MMSI"].n_unique()
+    sog_mean     = _f(all_df[sog_col].mean())
+    sog_std      = _f(all_df[sog_col].std())
+    sog_median   = _f(all_df[sog_col].median())
 
-    # --- Fraction statique : MMSI distinct avec ≥1 épisode statique ---------
-    static_mmsi_count = (
-        all_df.filter(pl.col(sog_col) < SOG_STATIC_THRESHOLD)["MMSI"].n_unique()
-    )
-    # Ratio d'utilisation = navires statiques / navires totaux
+    static_mmsi_count    = all_df.filter(pl.col(sog_col) < SOG_STATIC_THRESHOLD)["MMSI"].n_unique()
     utilization_rate_rho = static_mmsi_count / vessel_count if vessel_count > 0 else 0.0
 
-    # --- Features dérivées de HDBSCAN ------------------------------------------
-    # Si pas de résultats de clustering, retourne les features par défaut (0)
+    # --- Features HDBSCAN ---------------------------------------------------
     if cluster_df is None or len(cluster_df) == 0:
-        log.warning("%s : aucune donnée de cluster — features HDBSCAN mises à 0", d)
+        log.warning("%s : aucune donnée cluster — features HDBSCAN = 0", d)
         return {
             "date":                  d.isoformat(),
             "vessel_count":          vessel_count,
@@ -108,41 +103,32 @@ def compute_daily_features(
             "tanker_ratio":          0.0,
         }
 
-    # Extrait les labels de cluster et calcule les statistiques de clustering
     labels     = cluster_df["cluster_label"].to_numpy()
-    n_episodes = len(cluster_df)                              # épisodes statiques
-    n_noise    = int((labels == -1).sum())                     # points bruits
-    n_clusters = len(set(labels)) - (1 if -1 in labels else 0)  # clusters significatifs
-    non_noise  = cluster_df.filter(pl.col("cluster_label") >= 0)  # exclu le bruit
+    n_episodes = len(cluster_df)
+    n_noise    = int((labels == -1).sum())
+    n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+    non_noise  = cluster_df.filter(pl.col("cluster_label") >= 0)
 
-    # Ratio de bruit et scores d'appartenance
     hdbscan_noise_ratio   = n_noise / n_episodes if n_episodes > 0 else 1.0
     membership_score_mean = _f(non_noise["membership_score"].mean())
     membership_score_std  = _f(non_noise["membership_score"].std())
 
-    # Tirant d'eau : ignorer les valeurs zéro / inconnues
-    draft_series   = cluster_df.filter(pl.col("Draft") > 0)["Draft"]
-    draft_mean     = _f(draft_series.mean())
-    draft_std      = _f(draft_series.std())
+    draft_series     = cluster_df.filter(pl.col("Draft") > 0)["Draft"]
+    draft_mean       = _f(draft_series.mean())
+    draft_std        = _f(draft_series.std())
 
-    # Capacité bloquée : Σ(Longueur × Largeur) — ignorer les navires avec dimensions inconnues
     cap_series = (
         cluster_df
         .filter((pl.col("Length") > 0) & (pl.col("Width") > 0))
         .select((pl.col("Length") * pl.col("Width")).alias("cap"))["cap"]
     )
-
-    # Enregistre le nombre d'épisodes avec dimensions valides
-    n_before = len(cluster_df)
-    n_after = len(cap_series)
-    log.info("%s : %d épisodes, %d avec dimensions valides pour blocked_capacity", d, n_before, n_after)
-
+    log.info("%s : %d épisodes, %d avec dimensions valides (blocked_capacity)",
+             d, n_episodes, len(cap_series))
     blocked_capacity = _f(cap_series.sum())
 
-    # Ratio pétroliérs : compte les MMSI uniques (pas les épisodes) avec VesselType 80–89
-    n_static_mmsi  = cluster_df["MMSI"].n_unique()
-    tanker_mmsi    = cluster_df.filter(pl.col("VesselType").is_between(80, 89))["MMSI"].n_unique()
-    tanker_ratio   = tanker_mmsi / n_static_mmsi if n_static_mmsi > 0 else 0.0
+    n_static_mmsi = cluster_df["MMSI"].n_unique()
+    tanker_mmsi   = cluster_df.filter(pl.col("VesselType").is_between(80, 89))["MMSI"].n_unique()
+    tanker_ratio  = tanker_mmsi / n_static_mmsi if n_static_mmsi > 0 else 0.0
 
     return {
         "date":                  d.isoformat(),
@@ -163,27 +149,35 @@ def compute_daily_features(
 
 
 def main() -> None:
-    """Point d'entrée pour l'exécution autonome — calcul des features pour un jour donné."""
     parser = argparse.ArgumentParser(
-        description="Calcule les 13 features quotidiennes pour un jour — Houston"
+        description="Calcule les 13 features quotidiennes pour un jour"
     )
-    parser.add_argument("--date", required=True, metavar="YYYY-MM-DD")
-    parser.add_argument("--parquet-dir", default=str(PARQUET_DIR))
+    parser.add_argument("--date",        required=True, metavar="YYYY-MM-DD")
+    parser.add_argument("--location",    default="houston",
+                        choices=list(LOCATIONS.keys()),
+                        help="Port cible (default: houston)")
+    parser.add_argument("--parquet-dir", default=None,
+                        help="Répertoire Parquet (défaut : data/parquet/{location})")
     args = parser.parse_args()
 
-    # Charge la date et construit le chemin du fichier Parquet
-    d            = date.fromisoformat(args.date)
-    parquet_path = Path(args.parquet_dir) / f"houston_{d.strftime('%Y_%m_%d')}.parquet"
+    loc_cfg     = LOCATIONS[args.location]
+    parquet_dir = Path(args.parquet_dir) if args.parquet_dir else Path("data/parquet") / args.location
+    d           = date.fromisoformat(args.date)
+    parquet_path = parquet_dir / f"{loc_cfg['prefix']}_{d.strftime('%Y_%m_%d')}.parquet"
 
-    # Exécute le pipeline complet : clustering puis extraction des features
-    cluster_df, prepared_df = cluster_day(parquet_path)
+    # Charge les zones docked si disponibles
+    docked_poly = load_docked_zones_or_none(args.location)
+    config = ClusteringConfig(docked_polygon=docked_poly)
+    if docked_poly is not None:
+        log.info("Zones docked chargées pour '%s'", args.location)
+
+    cluster_df, prepared_df = cluster_day(parquet_path, config=config)
     features = compute_daily_features(
         prepared_df if prepared_df is not None else parquet_path,
         cluster_df,
         d,
     )
 
-    # Affiche les résultats ou un message d'erreur
     if features:
         for k, v in features.items():
             print(f"  {k:<26} {v}")
@@ -192,6 +186,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    # Configure le logging pour afficher les messages d'info avec timestamps
     logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
     main()
