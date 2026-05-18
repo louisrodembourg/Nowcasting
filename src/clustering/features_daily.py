@@ -167,7 +167,7 @@ def main() -> None:
 
     # Charge les zones docked si disponibles
     docked_poly = load_docked_zones_or_none(args.location)
-    config = ClusteringConfig(docked_polygon=docked_poly)
+    config = ClusteringConfig(ref_polygon=docked_poly)
     if docked_poly is not None:
         log.info("Zones docked chargées pour '%s'", args.location)
 

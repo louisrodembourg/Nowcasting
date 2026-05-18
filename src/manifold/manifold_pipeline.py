@@ -31,7 +31,11 @@ from scipy import sparse
 from scipy.sparse.linalg import eigsh
 from sklearn.neighbors import NearestNeighbors
 
-from src.clustering.hdbscan_daily import cluster_day
+from src.clustering.hdbscan_daily import (
+    ClusteringConfig,
+    cluster_day,
+    load_docked_zones_or_none,
+)
 from src.ingestion.download import LOCATIONS
 
 log = logging.getLogger(__name__)
@@ -117,7 +121,12 @@ def find_constituent_zones(
     return is_constituent
 
 
-def build_zone_matrix(start: date, end: date, location: str):
+def build_zone_matrix(
+    start: date,
+    end: date,
+    location: str,
+    config: Optional[ClusteringConfig] = None,
+):
     """Construit la matrice (zones × jours) pour le manifold."""
     loc_cfg = LOCATIONS[location]
     prefix = loc_cfg["prefix"]
@@ -133,7 +142,7 @@ def build_zone_matrix(start: date, end: date, location: str):
         parquet_path = parquet_dir / f"{prefix}_{d.strftime('%Y_%m_%d')}.parquet"
 
         if parquet_path.exists():
-            cluster_df, _ = cluster_day(parquet_path)
+            cluster_df, _ = cluster_day(parquet_path, config=config)
 
             if cluster_df is not None and len(cluster_df) > 0:
                 for row in cluster_df.iter_rows(named=True):
@@ -201,8 +210,9 @@ def identify_constituent_zones(
     n_eigenvectors: int = DEFAULT_N_EIGENVECTORS,
 ) -> pl.DataFrame:
     """Point d'entrée : identification des zones constituantes."""
+    config = ClusteringConfig(ref_polygon=load_docked_zones_or_none(location))
     log.info(f"Building zone matrix: {start} → {end}")
-    zone_df, X, dates = build_zone_matrix(start, end, location)
+    zone_df, X, dates = build_zone_matrix(start, end, location, config=config)
 
     if len(X) == 0:
         raise ValueError("No zones found")
@@ -243,6 +253,7 @@ def compute_daily_gravity(
     d: date,
     location: str,
     constituent_zones: pl.DataFrame,
+    config: Optional[ClusteringConfig] = None,
 ) -> pl.DataFrame:
     """
     Calcule le gravity score quotidien sur les zones constituantes.
@@ -258,7 +269,9 @@ def compute_daily_gravity(
         log.warning(f"Parquet not found: {parquet_path}")
         return pl.DataFrame()
 
-    cluster_df, _ = cluster_day(parquet_path)
+    if config is None:
+        config = ClusteringConfig(ref_polygon=load_docked_zones_or_none(location))
+    cluster_df, _ = cluster_day(parquet_path, config=config)
 
     if cluster_df is None or len(cluster_df) == 0:
         return pl.DataFrame()
@@ -379,10 +392,12 @@ def main():
             return
 
         constituent_zones = pl.read_parquet(constituent_path)
+        score_config = ClusteringConfig(ref_polygon=load_docked_zones_or_none(args.location))
 
         if args.date:
             daily_df = compute_daily_gravity(
-                date.fromisoformat(args.date), args.location, constituent_zones
+                date.fromisoformat(args.date), args.location, constituent_zones,
+                config=score_config,
             )
             if len(daily_df) > 0:
                 agg = aggregate_gravity_score(daily_df)
@@ -399,7 +414,8 @@ def main():
             all_scores = []
             d = start
             while d <= end:
-                daily_df = compute_daily_gravity(d, args.location, constituent_zones)
+                daily_df = compute_daily_gravity(d, args.location, constituent_zones,
+                                                 config=score_config)
                 if len(daily_df) > 0:
                     agg = aggregate_gravity_score(daily_df)
                     all_scores.append(agg)

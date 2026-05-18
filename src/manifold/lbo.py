@@ -9,7 +9,8 @@ Phase 2 — Manifold Learning : Laplace-Beltrami Operator (LBO).
 
 Usage (standalone):
     python src/manifold/lbo.py
-    python src/manifold/lbo.py --k 7 --n-eigenvectors 10
+    python src/manifold/lbo.py --location houston --k 7 --n-eigenvectors 10
+    python src/manifold/lbo.py --location la
 """
 import argparse
 import logging
@@ -26,8 +27,7 @@ from sklearn.neighbors import NearestNeighbors
 
 log = logging.getLogger(__name__)
 
-FEATURES_PATH = Path("data/features/houston_daily_features.parquet")
-OUTPUT_PATH   = Path("data/features/houston_manifold.parquet")
+DEFAULT_LOCATION = "houston"
 
 FEATURE_COLS = [
     "vessel_count", "SOG_mean", "SOG_std", "SOG_median",
@@ -189,19 +189,23 @@ def find_characteristic_points(
 def run_lbo(
     k: int = DEFAULT_K,
     n_eigenvectors: int = DEFAULT_N_EIGENVECTORS,
+    location: str = DEFAULT_LOCATION,
     features_path: Path | None = None,
     output_path: Path | None = None,
 ) -> pl.DataFrame:
     """
-    Pipeline LBO complet sur un parquet de features (par défaut : houston_daily_features.parquet).
-    Sauvegarde les résultats dans houston_manifold.parquet et retourne le DataFrame.
+    Pipeline LBO complet sur un parquet de features.
+    Sauvegarde les résultats dans data/features/{location}_manifold.parquet et retourne le DataFrame.
 
     Colonnes de sortie (ajoutées aux features originales):
         phi_1 … phi_N  : coordonnées des vecteurs propres (plongement de variété)
         eigenvalue_1…N : valeurs propres correspondantes
         is_characteristic: True si extremum local dans l'un des 3 premiers vecteurs propres
     """
-    path = Path(features_path) if features_path is not None else FEATURES_PATH
+    path = (Path(features_path) if features_path is not None
+            else Path(f"data/features/{location}_daily_features.parquet"))
+    out  = (Path(output_path)   if output_path   is not None
+            else Path(f"data/features/{location}_manifold.parquet"))
     df = pl.read_parquet(path).sort("date")
     log.info("Chargé %d jours × %d features", *df.select(FEATURE_COLS).shape)
 
@@ -230,7 +234,6 @@ def run_lbo(
         if isinstance(extra_cols[name], list)
     ])
 
-    out = Path(output_path) if output_path is not None else OUTPUT_PATH
     out.parent.mkdir(parents=True, exist_ok=True)
     df_out.write_parquet(out)
     log.info("Sortie de variété sauvegardée → %s", out)
@@ -240,13 +243,15 @@ def run_lbo(
 def main() -> None:
     """Point d'entrée pour l'exécution autonome — Phase 2 du pipeline manifold."""
     parser = argparse.ArgumentParser(description="Phase 2 — LBO Manifold Learning")
+    parser.add_argument("--location",        default=DEFAULT_LOCATION,
+                        help=f"Port cible (défaut {DEFAULT_LOCATION})")
     parser.add_argument("--k",               type=int, default=DEFAULT_K,
                         help=f"Voisins KNN (défaut {DEFAULT_K})")
     parser.add_argument("--n-eigenvectors",  type=int, default=DEFAULT_N_EIGENVECTORS,
                         help=f"Nombre de vecteurs propres (défaut {DEFAULT_N_EIGENVECTORS})")
     args = parser.parse_args()
 
-    df = run_lbo(k=args.k, n_eigenvectors=args.n_eigenvectors)
+    df = run_lbo(k=args.k, n_eigenvectors=args.n_eigenvectors, location=args.location)
     print(df.select(["date", "is_characteristic"] +
                     [c for c in df.columns if c.startswith("phi_")]))
 
