@@ -4,18 +4,18 @@ Phase 2 — Manifold : Score de Gravité (Étape 5).
 Prend le manifold en entrée (houston_manifold.parquet) et calcule
 le Score de Gravité quotidien :
 
-    gravity_score_i = Σ_c  |ϕ_c(i) - μ_c|  ×  blocked_capacity_i
+    gravity_score_i = Σ_c  |ϕ_c(i) - μ_c|  ×  waiting_capacity_i
                       ─────────────────────────────────────────────
                              Σ_c  σ_c  ×  baseline_capacity
 
 Où :
-  - ϕ_c(i)          : coordonnée du jour i sur le c-ième vecteur propre
-  - μ_c, σ_c        : moyenne et écart-type de ϕ_c sur la période baseline (jours non-Harvey)
-  - blocked_capacity: capacité bloquée (Σ Longueur×Largeur) du jour i
-  - baseline_capacity: médiane de blocked_capacity sur la baseline
+  - ϕ_c(i)           : coordonnée du jour i sur le c-ième vecteur propre
+  - μ_c, σ_c         : moyenne et écart-type de ϕ_c sur la période baseline (jours non-Harvey)
+  - waiting_capacity : Σ(L×W) des navires en zone d'attente uniquement (congestion réelle)
+  - baseline_capacity: médiane de waiting_capacity sur la baseline
 
 Le score est normalisé à [0, 1] sur toute la période.
-Les jours Harvey (port fermé) ont blocked_capacity=0 → score=0 par conception,
+Les jours Harvey (port fermé) ont waiting_capacity=0 → score=0 par conception,
 puis remplacés par la valeur max post-Harvey (réouverture = pic de gravité réelle).
 
 Usage :
@@ -52,7 +52,7 @@ def compute_gravity_score(
 
     Retourne df avec deux colonnes supplémentaires :
         deviation_score : déviation brute du manifold (non normalisée)
-        gravity_score   : score final ∈ [0, 1], pondéré par blocked_capacity
+        gravity_score   : score final ∈ [0, 1], pondéré par waiting_capacity
     """
     phi_cols = sorted([c for c in df.columns if c.startswith("phi_")])
     if not phi_cols:
@@ -76,8 +76,8 @@ def compute_gravity_score(
     # Déviation normalisée par rapport à la baseline pour chaque jour
     deviation = np.abs((phi_matrix - mu) / sigma).mean(axis=1)  # (N,)
 
-    # Poids de capacité : blocked_capacity / médiane baseline
-    capacity        = df["blocked_capacity"].to_numpy().astype(float)
+    # Poids de capacité : waiting_capacity / médiane baseline
+    capacity        = df["waiting_capacity"].to_numpy().astype(float)
     baseline_cap    = np.median(capacity[baseline_mask & (capacity > 0)])
     if baseline_cap == 0:
         baseline_cap = 1.0
@@ -150,7 +150,7 @@ def main() -> None:
     )
     # Affiche les résultats triés par score de gravité (le plus élevé en premier)
     print(df.select(["date", "deviation_score", "gravity_score",
-                     "blocked_capacity", "is_characteristic"]).sort("gravity_score", descending=True))
+                     "waiting_capacity", "is_characteristic"]).sort("gravity_score", descending=True))
 
 
 if __name__ == "__main__":

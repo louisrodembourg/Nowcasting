@@ -63,11 +63,11 @@ def plot_density_timeseries(
     )
     obs_dates = [d for d in obs["date"].to_list()]
 
-    # Normalise blocked_capacity comme dans train.py (95e percentile)
-    if "blocked_capacity" in obs.columns and obs["blocked_capacity"].max() > 0:
-        full_cap = df_features["blocked_capacity"].to_numpy().astype(float)
+    # Normalise waiting_capacity comme dans train.py (95e percentile)
+    if "waiting_capacity" in obs.columns and obs["waiting_capacity"].max() > 0:
+        full_cap = df_features["waiting_capacity"].to_numpy().astype(float)
         cap_95   = float(np.percentile(full_cap[full_cap > 0], 95))
-        obs_rho  = np.clip(obs["blocked_capacity"].to_numpy().astype(float) / cap_95, 0.0, 1.0)
+        obs_rho  = np.clip(obs["waiting_capacity"].to_numpy().astype(float) / cap_95, 0.0, 1.0)
         rho_label = "Capacité bloquée ρ (norm.)"
     else:
         obs_rho   = obs["utilization_rate_rho"].to_numpy()

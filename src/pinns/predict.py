@@ -104,15 +104,15 @@ def compute_time_to_clear(
     crisis_end   = harvey_peak + timedelta(days=14)
     df_baseline  = df_feat.filter(~pl.col("date").is_between(crisis_start, crisis_end))
 
-    # ρ normalisée via blocked_capacity (comme dans train.py) ou utilization_rate_rho
-    if "blocked_capacity" in df_feat.columns and df_feat["blocked_capacity"].max() > 0:
-        cap_arr  = df_feat["blocked_capacity"].to_numpy().astype(float)
+    # ρ normalisée via waiting_capacity (comme dans train.py) ou utilization_rate_rho
+    if "waiting_capacity" in df_feat.columns and df_feat["waiting_capacity"].max() > 0:
+        cap_arr  = df_feat["waiting_capacity"].to_numpy().astype(float)
         cap_95   = float(np.percentile(cap_arr[cap_arr > 0], 95))
-        base_cap = df_baseline.filter(pl.col("blocked_capacity") > 0)["blocked_capacity"].to_numpy()
+        base_cap = df_baseline.filter(pl.col("waiting_capacity") > 0)["waiting_capacity"].to_numpy()
         baseline_rho = float(np.mean(base_cap) / cap_95)
         # TTC = quand la capacité bloquée REDESCEND sous le seuil (crisis clearing)
         ttc_direction = "below"
-        log.info("ρ = blocked_capacity norm. (95p=%.0f) | baseline_ρ=%.4f", cap_95, baseline_rho)
+        log.info("ρ = waiting_capacity norm. (95p=%.0f) | baseline_ρ=%.4f", cap_95, baseline_rho)
     else:
         baseline_rho  = float(
             df_baseline.filter(pl.col("utilization_rate_rho") > 0)

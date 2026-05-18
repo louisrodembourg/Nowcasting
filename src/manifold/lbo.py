@@ -31,9 +31,9 @@ DEFAULT_LOCATION = "houston"
 
 FEATURE_COLS = [
     "vessel_count", "SOG_mean", "SOG_std", "SOG_median",
-    "utilization_rate_rho", "hdbscan_cluster_count", "hdbscan_noise_ratio",
+    "utilization_rate_rho", "waiting_cluster_count", "hdbscan_noise_ratio",
     "membership_score_mean", "membership_score_std",
-    "draft_mean", "draft_std", "blocked_capacity", "tanker_ratio",
+    "draft_mean", "draft_std", "waiting_capacity", "tanker_ratio",
 ]
 
 # Paramètres par défaut pour le clustering KNN et la décomposition spectrale

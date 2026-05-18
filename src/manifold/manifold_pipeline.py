@@ -301,7 +301,7 @@ def compute_daily_gravity(
                 "cluster_label": row["cluster_label"],
                 "cluster_type": row.get("cluster_type", "unknown"),
                 "is_constituent": is_const,
-                "blocked_capacity": capacity,
+                "waiting_capacity": capacity,
             }
         )
 
@@ -321,11 +321,11 @@ def aggregate_gravity_score(daily_df: pl.DataFrame) -> dict:
         "constituent_vessels": const_only["mmsi"].n_unique()
         if len(const_only) > 0
         else 0,
-        "total_blocked_capacity": daily_df["blocked_capacity"].sum(),
-        "constituent_blocked_capacity": const_only["blocked_capacity"].sum()
+        "total_waiting_capacity": daily_df["waiting_capacity"].sum(),
+        "constituent_waiting_capacity": const_only["waiting_capacity"].sum()
         if len(const_only) > 0
         else 0,
-        "gravity_score": const_only["blocked_capacity"].sum()
+        "gravity_score": const_only["waiting_capacity"].sum()
         if len(const_only) > 0
         else 0,
     }

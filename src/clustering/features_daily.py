@@ -7,13 +7,13 @@ Features (une ligne par jour) :
   3.  SOG_std                — écart-type de la SOG corrigée
   4.  SOG_median             — médiane de la SOG corrigée
   5.  utilization_rate_rho   — fraction de MMSI distincts avec ≥1 épisode statique
-  6.  hdbscan_cluster_count  — nombre de clusters HDBSCAN (hors bruit)
+  6.  waiting_cluster_count  — nombre de clusters HDBSCAN en zone d'attente (hors bruit, hors docked)
   7.  hdbscan_noise_ratio    — épisodes bruits / total épisodes statiques
   8.  membership_score_mean  — probabilité moyenne d'appartenance HDBSCAN (hors bruit)
   9.  membership_score_std   — écart-type des probabilités d'appartenance
   10. draft_mean             — tirant d'eau moyen parmi les épisodes statiques (m)
   11. draft_std              — écart-type du tirant d'eau
-  12. blocked_capacity       — Σ(Longueur × Largeur) pour épisodes statiques (proxy m²)
+  12. waiting_capacity       — Σ(Longueur × Largeur) des navires en zone d'attente uniquement (proxy m²)
   13. tanker_ratio           — fraction MMSI pétroliers parmi MMSI statiques (VesselType 80–89)
 
 Usage (autonome, un jour):
@@ -93,21 +93,27 @@ def compute_daily_features(
             "SOG_std":               round(sog_std,    4),
             "SOG_median":            round(sog_median, 4),
             "utilization_rate_rho":  round(utilization_rate_rho, 4),
-            "hdbscan_cluster_count": 0,
+            "waiting_cluster_count": 0,
             "hdbscan_noise_ratio":   1.0,
             "membership_score_mean": 0.0,
             "membership_score_std":  0.0,
             "draft_mean":            0.0,
             "draft_std":             0.0,
-            "blocked_capacity":      0.0,
+            "waiting_capacity":      0.0,
             "tanker_ratio":          0.0,
         }
 
     labels     = cluster_df["cluster_label"].to_numpy()
     n_episodes = len(cluster_df)
     n_noise    = int((labels == -1).sum())
-    n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
     non_noise  = cluster_df.filter(pl.col("cluster_label") >= 0)
+
+    # waiting_cluster_count : only clusters in the waiting zone are congestion signal
+    waiting_df = cluster_df.filter(pl.col("cluster_type") == "waiting")
+    waiting_labels = waiting_df["cluster_label"].to_numpy()
+    waiting_cluster_count = (
+        len(set(waiting_labels) - {-1}) if len(waiting_labels) > 0 else 0
+    )
 
     hdbscan_noise_ratio   = n_noise / n_episodes if n_episodes > 0 else 1.0
     membership_score_mean = _f(non_noise["membership_score"].mean())
@@ -119,12 +125,16 @@ def compute_daily_features(
 
     cap_series = (
         cluster_df
-        .filter((pl.col("Length") > 0) & (pl.col("Width") > 0))
+        .filter(
+            (pl.col("cluster_type") == "waiting") &
+            (pl.col("Length") > 0) &
+            (pl.col("Width") > 0)
+        )
         .select((pl.col("Length") * pl.col("Width")).alias("cap"))["cap"]
     )
-    log.info("%s : %d épisodes, %d avec dimensions valides (blocked_capacity)",
+    log.info("%s : %d épisodes, %d en attente avec dimensions valides (waiting_capacity)",
              d, n_episodes, len(cap_series))
-    blocked_capacity = _f(cap_series.sum())
+    waiting_capacity = _f(cap_series.sum())
 
     n_static_mmsi = cluster_df["MMSI"].n_unique()
     tanker_mmsi   = cluster_df.filter(pl.col("VesselType").is_between(80, 89))["MMSI"].n_unique()
@@ -137,13 +147,13 @@ def compute_daily_features(
         "SOG_std":               round(sog_std,    4),
         "SOG_median":            round(sog_median, 4),
         "utilization_rate_rho":  round(utilization_rate_rho, 4),
-        "hdbscan_cluster_count": n_clusters,
+        "waiting_cluster_count": waiting_cluster_count,
         "hdbscan_noise_ratio":   round(hdbscan_noise_ratio,   4),
         "membership_score_mean": round(membership_score_mean, 4),
         "membership_score_std":  round(membership_score_std,  4),
         "draft_mean":            round(draft_mean, 2),
         "draft_std":             round(draft_std,  2),
-        "blocked_capacity":      round(blocked_capacity, 1),
+        "waiting_capacity":      round(waiting_capacity, 1),
         "tanker_ratio":          round(tanker_ratio, 4),
     }
 

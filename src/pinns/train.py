@@ -84,13 +84,13 @@ def prepare_training_data(
     dates  = df["date"].to_list()
     t_vals = np.array([(d - train_start).days / max(n_days - 1, 1) for d in dates])
 
-    # ρ : blocked_capacity normalisée pour LA (pic de crise = haute capacité bloquée)
+    # ρ : waiting_capacity normalisée pour LA (pic de crise = haute capacité bloquée)
     #     utilization_rate_rho pour Houston (port fermé = chute de ρ)
-    if "blocked_capacity" in df.columns and df["blocked_capacity"].max() > 0:
-        cap_arr  = df["blocked_capacity"].to_numpy().astype(float)
+    if "waiting_capacity" in df.columns and df["waiting_capacity"].max() > 0:
+        cap_arr  = df["waiting_capacity"].to_numpy().astype(float)
         cap_95   = float(np.percentile(cap_arr[cap_arr > 0], 95)) if cap_arr.max() > 0 else 1.0
         rho_vals = np.clip(cap_arr / cap_95, 0.0, 1.0)
-        log.info("ρ = blocked_capacity normalisée (95p=%.0f)", cap_95)
+        log.info("ρ = waiting_capacity normalisée (95p=%.0f)", cap_95)
     else:
         rho_vals = df["utilization_rate_rho"].to_numpy().astype(float)
         log.info("ρ = utilization_rate_rho")

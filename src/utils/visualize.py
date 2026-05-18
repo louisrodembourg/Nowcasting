@@ -233,7 +233,7 @@ def plot_gravity_score(location: str = "houston") -> tuple[Path, Path]:
     df       = pl.read_parquet(gravity_path).sort("date")
     dates    = df["date"].to_list()
     gravity  = df["gravity_score"].to_numpy()
-    capacity = df["blocked_capacity"].to_numpy()
+    capacity = df["waiting_capacity"].to_numpy()
     is_char  = df["is_characteristic"].to_numpy()
     phi_cols = sorted([c for c in df.columns if c.startswith("phi_")])
 
