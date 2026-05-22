@@ -16,10 +16,11 @@ Usage (autonome) :
     python src/clustering/hdbscan_daily.py data/parquet/houston/houston_2017_07_01.parquet
 """
 
+import argparse
 import json
 import logging
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -35,10 +36,9 @@ from src.ingestion.kinematic_filter import prepare_kinematics
 log = logging.getLogger(__name__)
 
 # Paramètres de clustering et seuils cinématiques (valeurs par défaut)
-SOG_STATIC_THRESHOLD = 1.0  # nœuds — en dessous = navire stationnaire
-HEADING_DOCKED_MAX_STD = 25.0  # degrés — écart-type en dessous = à quai
-HDBSCAN_MIN_CLUSTER_SIZE = 3  # taille minimale du cluster HDBSCAN
-HDBSCAN_MIN_SAMPLES = 2  # nombre minimal d'échantillons pour HDBSCAN
+SOG_STATIC_THRESHOLD = 1.0   # nœuds — en dessous = navire stationnaire
+HDBSCAN_MIN_CLUSTER_SIZE = 5  # taille minimale du cluster (CLAUDE.md spec)
+HDBSCAN_MIN_SAMPLES = 2       # nombre minimal d'échantillons pour HDBSCAN
 
 
 @dataclass
@@ -49,7 +49,6 @@ class ClusteringConfig:
     """
 
     sog_static_threshold: float = SOG_STATIC_THRESHOLD
-    heading_docked_max_std: float = HEADING_DOCKED_MAX_STD
     hdbscan_min_cluster_size: int = HDBSCAN_MIN_CLUSTER_SIZE
     hdbscan_min_samples: int = HDBSCAN_MIN_SAMPLES
     # Rayon max (en nm) pour qu'un cluster soit classé "docked".
@@ -59,11 +58,7 @@ class ClusteringConfig:
     # Polygones délimitant les zones où le statut "waiting" est possible.
     # Chaque polygone = liste de (lat, lon) — fermé implicitement.
     # Tout cluster en DEHORS de TOUS ces polygones est forcé à "docked".
-    # Ainsi, il ne peut pas y avoir de waiting en dehors des zones définies.
     waiting_allowed_polygons: Optional[list[list[tuple[float, float]]]] = None
-    # NOTE: the previous heading-based docked/waiting filter is deprecated.
-    # Heading thresholds remain in the config for compatibility only.
-    min_heading_data_ratio: float = 0.3
 
 
 def cluster_day_from_df(
@@ -261,17 +256,20 @@ def _point_in_polygon(
 
 def _load_geojson_polygons(path: Path) -> list[list[tuple[float, float]]]:
     """
-    Charge les polygones d'un fichier GeoJSON.
+    Charge les polygones d'un fichier GeoJSON (Polygon ou MultiPolygon).
     Retourne une liste de polygones (chacun = liste de (lat, lon)).
     """
-    import json
-
     with open(path) as f:
         fc = json.load(f)
     zones = []
     for feat in fc["features"]:
-        coords = feat["geometry"]["coordinates"][0]  # ring extérieur
-        zones.append([(c[1], c[0]) for c in coords])  # (lon, lat) -> (lat, lon)
+        geom = feat["geometry"]
+        if geom["type"] == "Polygon":
+            # coordinates[0] = anneau extérieur ; on ignore les trous
+            zones.append([(c[1], c[0]) for c in geom["coordinates"][0]])
+        elif geom["type"] == "MultiPolygon":
+            for polygon in geom["coordinates"]:
+                zones.append([(c[1], c[0]) for c in polygon[0]])
     return zones
 
 
@@ -308,10 +306,6 @@ def _classify_clusters(df: pl.DataFrame, config: ClusteringConfig) -> pl.DataFra
     rows: list[dict] = []
     for label in valid["cluster_label"].unique().to_list():
         cluster = valid.filter(pl.col("cluster_label") == label)
-        mean_hstd = float(cluster["Heading_std"].fill_null(180.0).mean())
-
-        lat_med = float(cluster["LAT"].median())
-        lon_med = float(cluster["LON"].median())
 
         # Règle 0 : waiting_allowed_polygons — waiting si au moins un point du
         # cluster tombe dans une zone d'attente.
