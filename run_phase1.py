@@ -28,10 +28,24 @@ from pathlib import Path
 import polars as pl
 
 from src.ingestion.download import download_day, LOCATIONS
-from src.clustering.hdbscan_daily import cluster_day
+from src.clustering.hdbscan_daily import (
+    cluster_day,
+    ClusteringConfig,
+    load_docked_zones_or_none,
+)
 from src.clustering.features_daily import compute_daily_features
 
 log = logging.getLogger(__name__)
+
+
+def build_config_for_location(location: str) -> ClusteringConfig:
+    """Build ClusteringConfig with docked polygons if available for the location."""
+    docked_polys = load_docked_zones_or_none(location)
+    if docked_polys:
+        log.info("Zones docked chargées pour '%s' (%d polygones)", location, len(docked_polys))
+        return ClusteringConfig(docked_polygons=docked_polys)
+    log.info("Pas de zones docked pour '%s' — classification par défaut", location)
+    return ClusteringConfig()
 
 
 def run_pipeline(
@@ -43,6 +57,7 @@ def run_pipeline(
     skip_download: bool = False,
     force: bool = False,
     delay: float = 3.0,
+    config: ClusteringConfig | None = None,
 ) -> pl.DataFrame:
     """
     Run the full Phase 1 pipeline for [start, end].
@@ -83,7 +98,7 @@ def run_pipeline(
             continue
 
         # Step 2 — kinematic preprocessing + HDBSCAN
-        cluster_df, prepared_df = cluster_day(parquet_path)
+        cluster_df, prepared_df = cluster_day(parquet_path, config=config)
 
         # Step 3 — features (use prepared_df with SOG_corr when available)
         features = compute_daily_features(
@@ -157,6 +172,8 @@ def main() -> None:
     log.info("Features : %s", features_path)
     log.info("Download : %s (delay=%.0fs)", "skip" if args.no_download else "yes", args.delay)
 
+    config = build_config_for_location(args.location)
+
     df_features = run_pipeline(
         start, end,
         parquet_dir=parquet_dir,
@@ -165,6 +182,7 @@ def main() -> None:
         skip_download=args.no_download,
         force=args.force,
         delay=args.delay,
+        config=config,
     )
 
     if len(df_features) == 0:

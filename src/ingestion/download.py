@@ -4,9 +4,13 @@ Download Marine Cadastre AIS daily files for Houston Ship Channel or LA/Long Bea
 For each day in [--start, --end]:
   1. Download ZIP from NOAA coast server
   2. Extract CSV from ZIP (in memory)
-  3. Filter by location bbox + valid MMSI + realistic SOG via DuckDB
+  3. Filter by location bbox (envelope of GeoJSON zone) + valid MMSI + realistic SOG via DuckDB
   4. Save as Parquet (ZSTD compressed) — ~30–100x smaller than raw CSV
   5. Delete temp CSV
+
+Download zones : data/zones/{location}_download.geojson
+  The bounding box used for DuckDB filtering is derived from the polygon envelope.
+  Falls back to hardcoded values if the GeoJSON is absent.
 
 Usage (run from Nowcasting/ root):
     python src/ingestion/download.py --location houston --start 2017-07-25 --end 2017-09-15
@@ -15,9 +19,11 @@ Usage (run from Nowcasting/ root):
 """
 import argparse
 import io
+import json
 import logging
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -29,23 +35,80 @@ log = logging.getLogger(__name__)
 # Project root (Nowcasting/) — works regardless of the CWD when the script is called
 _ROOT = Path(__file__).resolve().parents[2]
 
+DOWNLOAD_ZONES_DIR = _ROOT / "data/zones"
+
+
+# ── Zones de téléchargement (GeoJSON) ────────────────────────────────────────
+
+def bbox_from_geojson(path: Path) -> tuple[float, float, float, float]:
+    """
+    Calcule la bounding box (lat_min, lat_max, lon_min, lon_max)
+    depuis un fichier GeoJSON — enveloppe de l'union de toutes les géométries.
+    Lève FileNotFoundError si le fichier est absent.
+    """
+    with open(path) as f:
+        fc = json.load(f)
+
+    all_coords: list[list[float]] = []
+    features = fc.get("features", [fc] if fc.get("type") == "Feature" else [])
+    for feat in features:
+        geom = feat.get("geometry", feat) if isinstance(feat, dict) else feat
+        if not geom:
+            continue
+        gtype = geom.get("type", "")
+        if gtype == "Polygon":
+            for ring in geom["coordinates"]:
+                all_coords.extend(ring)
+        elif gtype == "MultiPolygon":
+            for poly in geom["coordinates"]:
+                for ring in poly:
+                    all_coords.extend(ring)
+
+    if not all_coords:
+        raise ValueError(f"Aucune coordonnée trouvée dans {path}")
+
+    lons = [c[0] for c in all_coords]
+    lats = [c[1] for c in all_coords]
+    bbox = (min(lats), max(lats), min(lons), max(lons))
+    log.info("bbox depuis %s : LAT[%.4f, %.4f]  LON[%.4f, %.4f]", path.name, *bbox)
+    return bbox
+
+
+def _load_bbox(
+    location: str,
+    fallback: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    """Charge la bbox depuis le GeoJSON ; fallback hardcodé si le fichier est absent."""
+    path = DOWNLOAD_ZONES_DIR / f"{location}_download.geojson"
+    try:
+        return bbox_from_geojson(path)
+    except FileNotFoundError:
+        log.warning("Zone de téléchargement introuvable : %s — bbox hardcodée utilisée", path)
+        return fallback
+
+
 # ── Location configs ─────────────────────────────────────────────────────────
+
+# Bbox dérivées des GeoJSON ; valeurs hardcodées = fallback si fichier absent
+_houston_bbox = _load_bbox("houston", (28.95, 29.81, -95.31, -94.19))
+_la_bbox      = _load_bbox("la",      (33.48, 33.79, -118.53, -117.96))
+
 LOCATIONS = {
     "houston": {
-        # Houston Ship Channel — Galveston Bay entrance to turning basin
-        "lat_min":  29.3,
-        "lat_max":  29.85,
-        "lon_min": -95.4,
-        "lon_max": -94.7,
+        "lat_min":  _houston_bbox[0],
+        "lat_max":  _houston_bbox[1],
+        "lon_min":  _houston_bbox[2],
+        "lon_max":  _houston_bbox[3],
+        "geojson":  DOWNLOAD_ZONES_DIR / "houston_download.geojson",
         "out_dir":  _ROOT / "data/parquet/houston",
         "prefix":   "houston",
     },
     "la": {
-        # Port of Los Angeles + Port of Long Beach — San Pedro Bay + approaches
-        "lat_min":  33.55,
-        "lat_max":  33.85,
-        "lon_min": -118.35,
-        "lon_max": -118.05,
+        "lat_min":  _la_bbox[0],
+        "lat_max":  _la_bbox[1],
+        "lon_min":  _la_bbox[2],
+        "lon_max":  _la_bbox[3],
+        "geojson":  DOWNLOAD_ZONES_DIR / "la_download.geojson",
         "out_dir":  _ROOT / "data/parquet/la",
         "prefix":   "la",
     },
@@ -173,8 +236,11 @@ def main() -> None:
                         help="Output directory (default: data/parquet/<location>)")
     parser.add_argument("--force", action="store_true",
                         help="Re-download and overwrite existing Parquet files")
-    parser.add_argument("--delay", type=float, default=3.0,
-                        help="Seconds to wait between downloads (default: 3)")
+    parser.add_argument("--delay", type=float, default=1.0,
+                        help="Seconds to wait between downloads in sequential mode (default: 1)")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Parallel download workers (default: 1 = sequential). "
+                             "4–6 is a good balance for NOAA.")
     args = parser.parse_args()
 
     loc     = LOCATIONS[args.location]
@@ -185,24 +251,48 @@ def main() -> None:
 
     log.info("Location : %s  bbox LAT[%.2f,%.2f] LON[%.2f,%.2f]",
              args.location, loc["lat_min"], loc["lat_max"], loc["lon_min"], loc["lon_max"])
-    log.info("Downloading %s → %s into %s", start, end, out_dir)
 
-    ok = failed = 0
+    dates = []
     d = start
     while d <= end:
-        result = download_day(
-            d, out_dir, force=args.force,
-            lat_min=loc["lat_min"], lat_max=loc["lat_max"],
-            lon_min=loc["lon_min"], lon_max=loc["lon_max"],
-            prefix=loc["prefix"],
-        )
-        if result is not None:
-            ok += 1
-        else:
-            failed += 1
-        if d < end:
-            time.sleep(args.delay)
+        dates.append(d)
         d += timedelta(days=1)
+
+    log.info("Downloading %d days (%s → %s) with %d worker(s) into %s",
+             len(dates), start, end, args.workers, out_dir)
+
+    kwargs = dict(
+        out_dir=out_dir, force=args.force,
+        lat_min=loc["lat_min"], lat_max=loc["lat_max"],
+        lon_min=loc["lon_min"], lon_max=loc["lon_max"],
+        prefix=loc["prefix"],
+    )
+
+    ok = failed = 0
+
+    if args.workers <= 1:
+        for i, day in enumerate(dates):
+            result = download_day(day, **kwargs)
+            if result is not None:
+                ok += 1
+            else:
+                failed += 1
+            if i < len(dates) - 1:
+                time.sleep(args.delay)
+    else:
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futures = {pool.submit(download_day, day, **kwargs): day for day in dates}
+            for fut in as_completed(futures):
+                try:
+                    result = fut.result()
+                except ConnectionAbortedError as exc:
+                    log.error("DNS failure — aborting: %s", exc)
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    raise SystemExit(1) from exc
+                if result is not None:
+                    ok += 1
+                else:
+                    failed += 1
 
     log.info("Done — %d downloaded/existing, %d failed/skipped", ok, failed)
 
