@@ -7,44 +7,44 @@ MODE RECOMMANDÉ — Baseline fixe + Scoring (2 étapes séparées)
 
   Étape 1 — Apprendre la topologie sur une période de référence calme :
 
-    python src/manifold/manifold_pipeline.py --identify \\
-        --baseline-start 2015-01-01 --baseline-end 2016-12-31 \\
-        --start 2015-01-01 --end 2016-12-31 \\
+    python src/manifold/manifold_pipeline.py --identify `
+        --baseline-start 2017-01-01 --baseline-end 2017-01-30 `
+        --start 2017-01-01 --end 2017-01-30 `
         --location houston
 
     → Sauvegarde data/features/houston_constituent_zones.parquet
 
   Étape 2 — Scorer la période de crise avec la topologie figée :
 
-    python src/manifold/manifold_pipeline.py --score \\
-        --start 2017-06-01 --end 2017-10-31 \\
-        --location houston
+    python src/manifold/manifold_pipeline.py --score `
+        --start 2020-01-01 --end 2020-12-31 `
+        --location la
 
     → Sauvegarde data/features/houston_gravity_daily.parquet
       + outputs/figures/houston_gravity_score.html
 
   Raccourci (étapes 1+2 en une seule commande) :
 
-    python src/manifold/manifold_pipeline.py --both \\
-        --baseline-start 2015-01-01 --baseline-end 2016-12-31 \\
-        --start 2017-06-01 --end 2017-10-31 \\
+    python src/manifold/manifold_pipeline.py --both `
+        --baseline-start 2017-01-01 --baseline-end 2017-12-31 `
+        --start 2017-01-01 --end 2017-12-31 `
         --location houston
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 MODE ROLLING — Fenêtre glissante de 3 mois (expérimental)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━═════════════════════════════════════
 
   Sans normalisation baseline (dynamique par fenêtre) :
 
-    python src/manifold/manifold_pipeline.py --rolling \\
-        --start 2017-01-01 --end 2017-12-31 \\
+    python src/manifold/manifold_pipeline.py --rolling `
+        --start 2017-01-01 --end 2017-12-31 `
         --location houston
 
   Avec normalisation baseline (valeurs > 1.0 = disruption) :
 
-    python src/manifold/manifold_pipeline.py --rolling \\
-        --start 2017-01-01 --end 2017-12-31 \\
-        --baseline-start 2015-01-01 --baseline-end 2016-12-31 \\
+    python src/manifold/manifold_pipeline.py --rolling `
+        --start 2017-01-01 --end 2017-12-31 `
+        --baseline-start 2015-01-01 --baseline-end 2016-12-31 `
         --location houston
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -320,6 +320,30 @@ def identify_constituent_zones(
 
     log.info(f"Found {len(zone_df)} zones across {len(dates)} days")
 
+    date_cols = {d.isoformat(): pl.Series(d.isoformat(), X[:, j].tolist()) for j, d in enumerate(dates)}
+    zone_matrix_df = zone_df.select(["zone_key", "lat", "lon", "cluster_type"]).with_columns(
+        list(date_cols.values())
+    )
+    matrix_path = Path(f"data/features/{location}_zone_matrix.parquet")
+    zone_matrix_df.write_parquet(matrix_path)
+    csv_path = Path(f"data/features/{location}_zone_matrix.csv")
+    zone_matrix_df.write_csv(csv_path)
+    log.info(f"Zone matrix saved: {matrix_path} + {csv_path}  ({len(zone_df)} zones x {len(dates)} days)")
+
+    n_preview = min(8, len(zone_df))
+    n_days_preview = min(7, len(dates))
+    preview_dates = [d.isoformat()[5:] for d in dates[:n_days_preview]]
+    header = f"{'zone_key':<22} {'type':<8} " + "  ".join(f"{d:>5}" for d in preview_dates)
+    print(f"\n--- Zone matrix preview ({n_preview}/{len(zone_df)} zones, {n_days_preview}/{len(dates)} days) ---")
+    print(header)
+    print("-" * len(header))
+    zone_keys = zone_df["zone_key"].to_list()
+    types = zone_df["cluster_type"].to_list()
+    for i in range(n_preview):
+        vals = "  ".join(f"{X[i, j]:>5.3f}" for j in range(n_days_preview))
+        print(f"{zone_keys[i]:<22} {(types[i] or '?'):<8} {vals}")
+    print(f"  ... ({len(zone_df) - n_preview} more zones)\n")
+
     X_norm = normalize_features(X)
     W = build_weight_matrix(X_norm, k=k)
     eigenvalues, eigenvectors = compute_eigenvectors(W, n_eigenvectors)
@@ -493,6 +517,77 @@ def aggregate_gravity_score(daily_df):
 
 
 # ============================================================================
+# DAY-LEVEL MANIFOLD
+# ============================================================================
+
+DAILY_FEATURE_COLS = [
+    "vessel_count", "SOG_mean", "SOG_std", "SOG_median",
+    "utilization_rate_rho", "hdbscan_cluster_count", "hdbscan_noise_ratio",
+    "membership_score_mean", "membership_score_std",
+    "draft_mean", "draft_std", "blocked_capacity", "tanker_ratio",
+]
+
+
+def compute_day_manifold(
+    location: str,
+    start: date | None = None,
+    end: date | None = None,
+    k: int = DEFAULT_K,
+    n_eigenvectors: int = DEFAULT_N_EIGENVECTORS,
+) -> pl.DataFrame:
+    """
+    Apply LBO to the daily feature matrix: each day is a node, the 13 AIS
+    features are its coordinates.  Saves {location}_manifold.parquet with
+    columns: date, <13 features>, phi_1 .. phi_k, is_characteristic.
+
+    is_characteristic flags days that are local extrema of phi_1 in the
+    KNN graph — the same criterion used for zones.
+    """
+    features_path = Path(f"data/features/{location}_daily_features.parquet")
+    if not features_path.exists():
+        raise FileNotFoundError(f"Daily features not found: {features_path}")
+
+    df = pl.read_parquet(features_path)
+
+    if df["date"].dtype == pl.Utf8:
+        df = df.with_columns(pl.col("date").str.to_date())
+
+    if start is not None:
+        df = df.filter(pl.col("date") >= start)
+    if end is not None:
+        df = df.filter(pl.col("date") <= end)
+
+    if len(df) < k + 2:
+        raise ValueError(f"Not enough days ({len(df)}) for k={k}")
+
+    # Fill nulls with column median so LBO is not distorted by missing days
+    for col in DAILY_FEATURE_COLS:
+        if col in df.columns:
+            med = df[col].median()
+            df = df.with_columns(pl.col(col).fill_null(med if med is not None else 0.0))
+
+    X = df.select(DAILY_FEATURE_COLS).to_numpy().astype(float)
+    X_norm = normalize_features(X)
+
+    W = build_weight_matrix(X_norm, k=k)
+    eigenvalues, eigenvectors = compute_eigenvectors(W, n_eigenvectors)
+
+    # is_characteristic: days that are local extrema of phi_1 in the KNN graph
+    is_char = find_constituent_zones(eigenvectors, W, n_components=1)
+
+    for i in range(1, min(n_eigenvectors + 1, eigenvectors.shape[1])):
+        df = df.with_columns(pl.Series(f"phi_{i}", eigenvectors[:, i].tolist()))
+
+    df = df.with_columns(pl.Series("is_characteristic", is_char.tolist()))
+
+    log.info(
+        "Day manifold: %d days, %d characteristic, eigenvalues=%s",
+        len(df), int(is_char.sum()), np.round(eigenvalues[:5], 4),
+    )
+    return df
+
+
+# ============================================================================
 # ROLLING MANIFOLD
 # ============================================================================
 
@@ -623,6 +718,8 @@ def main():
     mode.add_argument("--score", action="store_true")
     mode.add_argument("--both", action="store_true")
     mode.add_argument("--rolling", action="store_true", help="Use rolling manifold approach")
+    mode.add_argument("--day-manifold", action="store_true",
+                      help="LBO on daily features (one node per day) → saves {location}_manifold.parquet")
 
     parser.add_argument("--start", help="Start date")
     parser.add_argument("--end", help="End date")
@@ -635,8 +732,21 @@ def main():
     OUTPUT_DIR = Path("outputs/figures")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    if not args.identify and not args.score and not args.both and not args.rolling:
+    if not args.identify and not args.score and not args.both and not args.rolling \
+            and not args.day_manifold:
         parser.print_help()
+        return
+
+    if args.day_manifold:
+        start = date.fromisoformat(args.start) if args.start else None
+        end   = date.fromisoformat(args.end)   if args.end   else None
+        manifold_df = compute_day_manifold(
+            args.location, start, end, args.k, args.n_eigenvectors
+        )
+        out_path = Path(f"data/features/{args.location}_manifold.parquet")
+        manifold_df.write_parquet(out_path)
+        n_char = int(manifold_df["is_characteristic"].sum())
+        print(f"Saved {len(manifold_df)} days ({n_char} characteristic) -> {out_path}")
         return
 
     if args.rolling:

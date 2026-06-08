@@ -152,7 +152,7 @@ def visualize_manifold_day(
 def visualize_manifold_map(
     start: date,
     end: date,
-    location: str = "houston",
+    location: str = "la",
 ) -> Path:
     """Affiche tous les jours avec leurs points caractéristiques sur une carte."""
     from src.clustering.hdbscan_daily import cluster_day
@@ -299,7 +299,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--location",
-        default="houston",
+        default="la",
         choices=list(LOCATIONS.keys()),
     )
     parser.add_argument("--date", help="Un jour spécifique")

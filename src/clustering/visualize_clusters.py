@@ -256,19 +256,24 @@ def build_features_and_stats(
             f'<span style="font-size:11px;">Draft : {row.get("Draft", "N/A")}</span>'
             f"</div>"
         )
+        # Buffer converts Point → Polygon so TimestampedGeoJson applies the
+        # style color (points render as default Leaflet markers and ignore style).
+        # 0.0002° ≈ 20 m — small enough to look like a dot at port zoom levels.
+        geom_noise = Point(row["LON"], row["LAT"]).buffer(0.0002)
         features.append({
             "type": "Feature",
-            "geometry": sg.mapping(Point(row["LON"], row["LAT"])),
+            "geometry": sg.mapping(geom_noise),
             "properties": {
                 "times": [date_str],
                 "cluster_label": -1,
                 "cluster_type": "noise",
                 "popup": popup_html,
                 "style": {
-                    "radius": 2,
                     "color": COLORS["noise"],
                     "fillColor": COLORS["noise"],
-                    "fillOpacity": 0.35,
+                    "fillOpacity": 0.50,
+                    "weight": 1,
+                    "opacity": 0.7,
                 },
             },
         })
@@ -320,8 +325,9 @@ def visualize_day(
     m = folium.Map(location=[center_lat, center_lon], zoom_start=12, tiles="CartoDB positron")
     _add_satellite_layer(m)
 
-    cluster_group = folium.FeatureGroup(name="Zones HDBSCAN", show=True)
-    noise_group   = folium.FeatureGroup(name="Bruit (-1)", show=False)
+    docked_group  = folium.FeatureGroup(name="Terminaux (docked)",    show=True)
+    waiting_group = folium.FeatureGroup(name="Congestion (waiting)",  show=True)
+    noise_group   = folium.FeatureGroup(name="Bruit",                 show=False)
 
     for feat in features:
         props = feat["properties"]
@@ -341,6 +347,7 @@ def visualize_day(
                 popup=popup,
             ).add_to(noise_group)
         else:
+            target_group = docked_group if ctype == "docked" else waiting_group
             coords = geom["coordinates"]
             if geom["type"] == "Polygon":
                 folium.Polygon(
@@ -355,16 +362,17 @@ def visualize_day(
                     fill_opacity=style["fillOpacity"],
                     weight=style["weight"],
                     opacity=style["opacity"],
-                ).add_to(cluster_group)
+                ).add_to(target_group)
             elif geom["type"] == "LineString":
                 folium.PolyLine(
                     locations=[[p[1], p[0]] for p in coords],
                     popup=popup,
                     color=style["color"],
                     weight=style["weight"],
-                ).add_to(cluster_group)
+                ).add_to(target_group)
 
-    cluster_group.add_to(m)
+    docked_group.add_to(m)
+    waiting_group.add_to(m)
     noise_group.add_to(m)
 
     if config.waiting_allowed_polygons:
@@ -402,7 +410,9 @@ def visualize_period(
     center_lat = (loc_cfg.get("lat_min", 29.0) + loc_cfg.get("lat_max", 30.0)) / 2
     center_lon = (loc_cfg.get("lon_min", -95.0) + loc_cfg.get("lon_max", -94.0)) / 2
 
-    all_features: list[dict] = []
+    docked_features:  list[dict] = []
+    waiting_features: list[dict] = []
+    noise_features:   list[dict] = []
     congestion_data: dict[str, dict] = {}
     total_days = (end - start).days + 1
 
@@ -422,9 +432,13 @@ def visualize_period(
                 "total_vessels": total_vessels,
             }
             for feat in features:
-                if not show_noise and feat["properties"]["cluster_type"] == "noise":
-                    continue
-                all_features.append(feat)
+                ctype = feat["properties"]["cluster_type"]
+                if ctype == "docked":
+                    docked_features.append(feat)
+                elif ctype == "waiting":
+                    waiting_features.append(feat)
+                elif show_noise:
+                    noise_features.append(feat)
             log.info("Processed %s (%d/%d)", d, i + 1, total_days)
         except FileNotFoundError:
             log.warning("Parquet manquant pour %s — ignoré", d)
@@ -434,16 +448,13 @@ def visualize_period(
     m = folium.Map(location=[center_lat, center_lon], zoom_start=12, tiles="CartoDB positron")
     _add_satellite_layer(m)
 
+    all_features = docked_features + waiting_features + noise_features
+
     if all_features:
         plugins.TimestampedGeoJson(
             {"type": "FeatureCollection", "features": all_features},
-            period="P1D",
-            duration="P1D",
-            auto_play=False,
-            loop=False,
-            max_speed=10,
-            loop_button=True,
-            date_options="YYYY-MM-DD",
+            period="P1D", duration="PT23H", auto_play=False, loop=False,
+            max_speed=10, loop_button=True, date_options="YYYY-MM-DD",
             time_slider_drag_update=True,
         ).add_to(m)
 
@@ -454,27 +465,64 @@ def visualize_period(
                 fill=True, fill_color="#FF6F00", fill_opacity=0.08,
             ).add_to(m)
 
-    # --- Légende fixe --------------------------------------------------------
+    # --- Légende + boutons toggle --------------------------------------------
     legend_html = (
         f'<div style="position:fixed;top:10px;right:10px;z-index:9999;'
         f'background:white;padding:14px 18px;border-radius:10px;'
         f'border:1px solid #ddd;font-family:sans-serif;font-size:12px;'
-        f'box-shadow:2px 2px 8px rgba(0,0,0,.18);min-width:190px;">'
+        f'box-shadow:2px 2px 8px rgba(0,0,0,.18);min-width:200px;">'
         f'<b style="font-size:14px;">{location.upper()} — {start.year}</b>'
         f'<hr style="margin:6px 0;border:none;border-top:1px solid #eee">'
-        f'<div style="margin-bottom:4px;">'
+        f'<div style="margin-bottom:6px;">'
+        f'<button id="btn-docked" onclick="toggleLayer(\'docked\')" '
+        f'style="width:100%;text-align:left;background:none;border:none;cursor:pointer;'
+        f'padding:3px 0;font-size:12px;font-family:sans-serif;">'
         f'<span style="display:inline-block;width:12px;height:12px;'
-        f'background:{COLORS["docked"]};border-radius:2px;"></span>'
-        f'&nbsp;Terminaux (docked)</div>'
-        f'<div style="margin-bottom:4px;">'
+        f'background:{COLORS["docked"]};border-radius:2px;vertical-align:middle;"></span>'
+        f'&nbsp;Terminaux (docked)</button></div>'
+        f'<div style="margin-bottom:6px;">'
+        f'<button id="btn-waiting" onclick="toggleLayer(\'waiting\')" '
+        f'style="width:100%;text-align:left;background:none;border:none;cursor:pointer;'
+        f'padding:3px 0;font-size:12px;font-family:sans-serif;">'
         f'<span style="display:inline-block;width:12px;height:12px;'
-        f'background:{COLORS["waiting"]};border-radius:2px;"></span>'
-        f'&nbsp;Congestion (waiting)</div>'
+        f'background:{COLORS["waiting"]};border-radius:2px;vertical-align:middle;"></span>'
+        f'&nbsp;Congestion (waiting)</button></div>'
         f'<div>'
+        f'<button id="btn-noise" onclick="toggleLayer(\'noise\')" '
+        f'style="width:100%;text-align:left;background:none;border:none;cursor:pointer;'
+        f'padding:3px 0;font-size:12px;font-family:sans-serif;opacity:0.4;" data-visible="false">'
         f'<span style="display:inline-block;width:12px;height:12px;'
-        f'background:{COLORS["noise"]};border-radius:2px;"></span>'
-        f'&nbsp;Bruit</div>'
+        f'background:{COLORS["noise"]};border-radius:2px;vertical-align:middle;"></span>'
+        f'&nbsp;Bruit (masqué)</button></div>'
         f"</div>"
+    )
+
+    toggle_js = (
+        "<style id='layer-style'>"
+        f".hide-docked  path[stroke='{COLORS['docked']}'],  .hide-docked  path[fill='{COLORS['docked']}']  {{ display:none!important }}"
+        f".hide-waiting path[stroke='{COLORS['waiting']}'], .hide-waiting path[fill='{COLORS['waiting']}'] {{ display:none!important }}"
+        f".hide-noise   path[stroke='{COLORS['noise']}'],   .hide-noise   path[fill='{COLORS['noise']}'],  "
+        f".hide-noise   circle[stroke='{COLORS['noise']}'], .hide-noise   circle[fill='{COLORS['noise']}']{{ display:none!important }}"
+        "</style>"
+        """<script>
+    var _layerVisible = {docked: true, waiting: true, noise: false};
+
+    function toggleLayer(ctype) {
+        var visible = _layerVisible[ctype];
+        var body = document.body;
+        if (visible) {
+            body.classList.add('hide-' + ctype);
+        } else {
+            body.classList.remove('hide-' + ctype);
+        }
+        _layerVisible[ctype] = !visible;
+        var btn = document.getElementById('btn-' + ctype);
+        if (btn) btn.style.opacity = visible ? '0.4' : '1.0';
+    }
+
+    // Masquer le bruit dès le chargement
+    document.body.classList.add('hide-noise');
+    </script>"""
     )
 
     # --- Gauge de congestion dynamique ---------------------------------------
@@ -537,6 +585,7 @@ def visualize_period(
     """
 
     m.get_root().html.add_child(folium.Element(legend_html))
+    m.get_root().html.add_child(folium.Element(toggle_js))
     m.get_root().html.add_child(folium.Element(gauge_html))
     m.get_root().html.add_child(folium.Element(js_script))
 
@@ -558,9 +607,6 @@ def main() -> None:
         "--location", default="houston", choices=list(LOCATIONS.keys())
     )
     parser.add_argument("--out", default=None, metavar="PATH")
-    parser.add_argument(
-        "--no-noise", action="store_true", help="Masquer les points de bruit"
-    )
 
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--date",  metavar="YYYY-MM-DD", help="Carte pour un seul jour")
@@ -593,7 +639,7 @@ def main() -> None:
             if args.out
             else OUT_DIR / f"{args.location}_clusters_{args.start}_{args.end}.html"
         )
-        visualize_period(start, end, args.location, config, out, show_noise=not args.no_noise)
+        visualize_period(start, end, args.location, config, out)
 
 
 if __name__ == "__main__":
