@@ -1,5 +1,11 @@
 """
-Phase 2 — Manifold : Score de Gravité (Étape 5).
+Phase 2 — Gravity Score sur manifold TEMPOREL (analyse exploratoire uniquement).
+
+ATTENTION : Ce module calcule le gravity score depuis le manifold TEMPOREL
+(lbo.py → {loc}_manifold.parquet). Il NE correspond PAS au gravity score
+utilisé dans le pipeline Phase 3 (PINNs), qui provient du manifold GÉOSPATIAL :
+    manifold_pipeline.py → {loc}_gravity_daily.parquet   ← utilisé par les PINNs
+    run_phase2.py        → orchestrateur du pipeline géospatial
 
 Prend le manifold en entrée (houston_manifold.parquet) et calcule
 le Score de Gravité quotidien :

@@ -72,7 +72,7 @@ from sklearn.neighbors import NearestNeighbors
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from src.clustering.hdbscan_daily import cluster_day, ClusteringConfig, load_waiting_zones
+from src.clustering.hdbscan_daily import cluster_day, ClusteringConfig, load_waiting_zones, load_docked_zones_or_none
 from src.ingestion.download import LOCATIONS
 
 log = logging.getLogger(__name__)
@@ -82,16 +82,27 @@ DEFAULT_N_EIGENVECTORS = 5
 
 
 def _load_config(location: str) -> ClusteringConfig:
-    """Load ClusteringConfig with waiting-zone polygons if available."""
-    try:
-        polygons = load_waiting_zones(location)
-        log.info("Loaded %d waiting zone polygons for %s", len(polygons), location)
-        return ClusteringConfig(waiting_allowed_polygons=polygons)
-    except FileNotFoundError:
-        log.warning(
-            "No waiting zones file for %s — clusters will all default to 'docked'", location
+    """Load ClusteringConfig using docked polygons as primary reference.
+
+    Logic (same for all locations):
+    1. {location}_docked.geojson exists → ClusteringConfig(docked_polygons=...)
+       clusters INSIDE  → 'docked'
+       clusters OUTSIDE → 'waiting'
+    2. No docked file → all clusters default to 'docked' (gravity_score = 0)
+    """
+    docked_polys = load_docked_zones_or_none(location)
+    if docked_polys is not None:
+        log.info(
+            "Using docked polygons for %s — clusters outside docked zone → 'waiting'",
+            location,
         )
-        return ClusteringConfig()
+        return ClusteringConfig(docked_polygons=docked_polys)
+
+    log.warning(
+        "No docked zone file for %s — all clusters default to 'docked', gravity_score will be 0",
+        location,
+    )
+    return ClusteringConfig()
 
 
 # ============================================================================

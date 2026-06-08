@@ -23,14 +23,14 @@ log = logging.getLogger(__name__)
 
 TRAIN_CONFIG = {
     "houston": {
-        "train_start": "2017-08-15",
-        "train_end":   "2017-09-10",
-        "peak_date":   "2017-08-28",
+        "train_start": "2017-06-01",
+        "train_end":   "2018-06-30",   # Harvey (sept 2017) + récupération complète (13 mois)
+        "peak_date":   "2017-09-07",   # pic réel waiting_capacity post-Harvey
     },
     "la": {
-        "train_start": "2020-01-01",
-        "train_end":   "2020-12-31",
-        "peak_date":   "2020-08-11",   # gravity_score=1.0 — pic COVID backlog
+        "train_start": "2021-01-01",
+        "train_end":   "2022-12-31",   # backlog (pic jan 2022) + clearing (T3-T4 2022)
+        "peak_date":   "2022-01-06",   # pic réel waiting_capacity COVID backlog
     },
 }
 
@@ -64,12 +64,20 @@ def main() -> None:
     parser.add_argument("--skip-viz",      action="store_true")
     parser.add_argument("--epochs",        type=int,   default=DEFAULT_EPOCHS)
     parser.add_argument("--lr",            type=float, default=DEFAULT_LR)
-    parser.add_argument("--lambda-pde",    type=float, default=0.1)
-    parser.add_argument("--lambda-bc",     type=float, default=0.1)
-    parser.add_argument("--lambda-kin",    type=float, default=DEFAULT_LAMBDA_KIN)
-    parser.add_argument("--rho-threshold", type=float, default=0.85)
-    parser.add_argument("--n-consecutive", type=int,   default=3)
-    parser.add_argument("--gravity-weight",type=float, default=0.3)
+    parser.add_argument("--lambda-pde",         type=float, default=0.1)
+    parser.add_argument("--lambda-bc",          type=float, default=0.1)
+    parser.add_argument("--lambda-kin",         type=float, default=DEFAULT_LAMBDA_KIN)
+    parser.add_argument("--curriculum-warmup",  type=int,   default=500)
+    parser.add_argument("--obs-per-day",        type=int,   default=5)
+    parser.add_argument("--lra",                action="store_true", default=True)
+    parser.add_argument("--no-lra",             dest="lra", action="store_false")
+    parser.add_argument("--rho-threshold",      type=float, default=0.85)
+    parser.add_argument("--n-consecutive",      type=int,   default=3)
+    parser.add_argument("--gravity-weight",     type=float, default=0.3)
+    parser.add_argument("--ttc-mode",           default="threshold",
+                        choices=["threshold", "threshold_relaxed", "ma_threshold", "inflection"])
+    parser.add_argument("--relaxation-margin",  type=float, default=0.05)
+    parser.add_argument("--ma-window",          type=int,   default=7)
     parser.add_argument("--train-start",   default=None, metavar="YYYY-MM-DD")
     parser.add_argument("--train-end",     default=None, metavar="YYYY-MM-DD")
     parser.add_argument("--peak-date",     default=None, metavar="YYYY-MM-DD")
@@ -115,8 +123,15 @@ def main() -> None:
 
     # ── Entraînement ──────────────────────────────────────────────────────────
     if not args.skip_train:
-        log.info("--- Entraînement PINN (%d epochs, λ_kin=%.3f) ---",
-                 args.epochs, args.lambda_kin)
+        if not zones_path.exists():
+            log.error(
+                "Manifold géospatial introuvable : %s\n"
+                "Lancez d'abord : python run_phase2.py --location %s ...",
+                zones_path, loc,
+            )
+            return
+        log.info("--- Entraînement PINN (%d epochs, curriculum=%d, LRA=%s) ---",
+                 args.epochs, args.curriculum_warmup, args.lra)
         train(
             epochs=args.epochs,
             lr=args.lr,
@@ -126,8 +141,11 @@ def main() -> None:
             train_start=train_start,
             train_end=train_end,
             features_path=features_path,
-            zones_path=zones_path if zones_path.exists() else None,
+            zones_path=zones_path,
             gravity_path=gravity_path if gravity_path.exists() else None,
+            curriculum_warmup=args.curriculum_warmup,
+            obs_per_day=args.obs_per_day,
+            use_lra=args.lra,
             model_path=model_path,
         )
     else:
@@ -137,7 +155,7 @@ def main() -> None:
         log.info("--- Skip entraînement (modèle existant) ---")
 
     # ── Inférence Time to Clear ────────────────────────────────────────────────
-    log.info("--- Inférence Time to Clear ---")
+    log.info("--- Inférence Time to Clear (mode=%s) ---", args.ttc_mode)
     df = compute_time_to_clear(
         rho_threshold=args.rho_threshold,
         n_consecutive=args.n_consecutive,
@@ -147,6 +165,9 @@ def main() -> None:
         harvey_peak=peak_date,
         gravity_path=gravity_path if gravity_path.exists() else None,
         gravity_weight=args.gravity_weight,
+        ttc_mode=args.ttc_mode,
+        relaxation_margin=args.relaxation_margin,
+        ma_window=args.ma_window,
     )
 
     # Résumé TTC

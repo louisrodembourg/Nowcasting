@@ -15,7 +15,8 @@ Modèle de vitesse de Greenshields (linéaire) :
 Contrainte cinématique (Alam et al. 2025) :
     |∂v/∂t| ≤ a_max  — pénalise les accélérations irréalistes pour un cargo lourd.
 
-Pour LA, x représente la longitude normalisée sur la bbox de San Pedro Bay.
+x représente la longitude normalisée sur la bbox du port, dérivée du manifold
+géospatial Phase 2 (data/features/{loc}_constituent_zones.parquet).
 """
 import logging
 from pathlib import Path

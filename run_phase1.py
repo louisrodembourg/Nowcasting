@@ -197,8 +197,8 @@ def main() -> None:
     log.info("vessel_count  avg=%.0f  max=%d",
              df_features["vessel_count"].mean(), df_features["vessel_count"].max())
     log.info("clusters      avg=%.1f  max=%d",
-             df_features["hdbscan_cluster_count"].mean(),
-             df_features["hdbscan_cluster_count"].max())
+             df_features["waiting_cluster_count"].mean(),
+             df_features["waiting_cluster_count"].max())
     log.info("rho (static)  avg=%.3f",
              df_features["utilization_rate_rho"].mean())
 

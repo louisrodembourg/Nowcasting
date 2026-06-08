@@ -19,6 +19,7 @@ Usage:
 import argparse
 import logging
 import sys
+from collections import deque
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -51,43 +52,60 @@ def load_model(device: torch.device, model_path: Path) -> tuple[LWRPINN, dict]:
 
 
 def _get_peak_gravity(gravity_path: Path | None, peak_date: date) -> float:
-    """Retourne le gravity_score du jour de pic (0.0 si non disponible)."""
+    """Retourne le gravity_score normalisé [0,1] du jour de pic (0.0 si non disponible).
+
+    La normalisation par le max garantit que gravity_weight × gravity_peak ∈ [0,1]
+    quel que soit l'ordre de grandeur des scores bruts.
+    """
     if gravity_path is None or not Path(gravity_path).exists():
         return 0.0
     try:
-        gdf = pl.read_parquet(gravity_path).sort("date")
+        gdf = pl.read_parquet(gravity_path).with_columns(
+            pl.col("date").cast(pl.Utf8).str.to_date().alias("date")
+        ).sort("date")
+        score_max = float(gdf["gravity_score"].max() or 1.0)
         row = gdf.filter(pl.col("date") == peak_date)
         if len(row) > 0:
-            gs = float(row["gravity_score"][0])
-            log.info("Gravity score au pic (%s) : %.4f", peak_date, gs)
-            return gs
+            gs_raw  = float(row["gravity_score"][0])
+            gs_norm = gs_raw / score_max
+            log.info("Gravity score au pic (%s) : %.0f (normalisé → %.4f)", peak_date, gs_raw, gs_norm)
+            return gs_norm
     except Exception as exc:
         log.warning("Impossible de lire gravity_path : %s", exc)
     return 0.0
 
 
 def compute_time_to_clear(
-    rho_threshold:  float          = RHO_THRESHOLD,
-    n_consecutive:  int            = N_CONSECUTIVE,
-    n_eval_days:    int            = 90,
-    features_path:  Path | str     = Path("data/features/la_daily_features.parquet"),
-    model_path:     Path | str     = Path("outputs/models/la_lwr_pinn.pt"),
-    output_path:    Path | str     = Path("data/features/la_time_to_clear.parquet"),
-    harvey_peak:    date | str     = date(2020, 8, 11),
-    gravity_path:   Path | str | None = None,
-    gravity_weight: float          = 0.3,
-    time_mode:      str            = "train_window",
+    rho_threshold:     float          = RHO_THRESHOLD,
+    n_consecutive:     int            = N_CONSECUTIVE,
+    n_eval_days:       int            = 365,
+    features_path:     Path | str     = Path("data/features/la_daily_features.parquet"),
+    model_path:        Path | str     = Path("outputs/models/la_lwr_pinn.pt"),
+    output_path:       Path | str     = Path("data/features/la_time_to_clear.parquet"),
+    harvey_peak:       date | str     = date(2020, 8, 11),
+    gravity_path:      Path | str | None = None,
+    gravity_weight:    float          = 0.3,
+    time_mode:         str            = "train_window",
+    ttc_mode:          str            = "threshold",
+    relaxation_margin: float          = 0.05,
+    ma_window:         int            = 7,
 ) -> pl.DataFrame:
     """
     Calcule le Time to Clear depuis le jour de pic.
 
-        Seuil adaptatif :
-        rho_threshold_abs = baseline_rho × rho_threshold × (1 + gravity_weight × gravity_peak)
-    Un pic de gravity_score=1.0 avec gravity_weight=0.3 élève le seuil de 30 %.
+    Seuil adaptatif :
+        rho_threshold_abs = baseline_rho × (1 + gravity_weight × gravity_peak)
 
-        time_mode:
-            - "train_window" : normalise et clippe t ∈ [0,1] (comportement historique)
-            - "absolute"     : normalise par la fenêtre d'entraînement sans clip (extrapolation)
+    time_mode:
+        - "train_window" : t ∈ [0,1] clippé (comportement historique)
+        - "absolute"     : t sans clip (extrapolation)
+
+    ttc_mode (critère de clearing) :
+        - "threshold"         : ρ_pred ≤ seuil pour N jours consécutifs
+        - "threshold_relaxed" : ρ_pred ≤ seuil × (1 + relaxation_margin)
+          Utile quand ρ_pred plafonne légèrement au-dessus du seuil.
+        - "ma_threshold"      : moyenne mobile (ma_window jours) de ρ_pred ≤ seuil
+          Plus robuste au bruit ponctuel du modèle.
     """
     if isinstance(harvey_peak, str):
         harvey_peak = date.fromisoformat(harvey_peak)
@@ -100,16 +118,32 @@ def compute_time_to_clear(
     n_train_days = (train_end - train_start).days + 1
 
     df_feat = pl.read_parquet(Path(features_path)).sort("date")
-    crisis_start = harvey_peak - timedelta(days=14)
-    crisis_end   = harvey_peak + timedelta(days=14)
-    df_baseline  = df_feat.filter(~pl.col("date").is_between(crisis_start, crisis_end))
 
-    # ρ normalisée via waiting_capacity (comme dans train.py) ou utilization_rate_rho
+    # Baseline = période train_start → (pic - 15j) = conditions "normales" juste avant l'événement
+    # C'est la fenêtre la plus propre : contemporaine, sans pollution par d'autres crises.
+    baseline_window_end = harvey_peak - timedelta(days=15)
+    df_baseline = df_feat.filter(
+        pl.col("date").is_between(train_start, baseline_window_end)
+    )
+    if len(df_baseline) < 10:
+        # Fallback si pas assez de données pré-événement
+        crisis_start = harvey_peak - timedelta(days=14)
+        crisis_end   = harvey_peak + timedelta(days=14)
+        df_baseline  = df_feat.filter(~pl.col("date").is_between(crisis_start, crisis_end))
+
+    # ρ normalisée via waiting_capacity ou utilization_rate_rho
+    # cap_95 calculé sur la fenêtre de training (±1 an autour du pic) pour cohérence avec train.py
+    train_start = date.fromisoformat(checkpoint["train_start"])
+    train_end   = date.fromisoformat(checkpoint["train_end"])
+    df_train_window = df_feat.filter(pl.col("date").is_between(train_start, train_end))
+
     if "waiting_capacity" in df_feat.columns and df_feat["waiting_capacity"].max() > 0:
-        cap_arr  = df_feat["waiting_capacity"].to_numpy().astype(float)
-        cap_95   = float(np.percentile(cap_arr[cap_arr > 0], 95))
+        cap_arr  = df_train_window["waiting_capacity"].to_numpy().astype(float)
+        if cap_arr.max() == 0:
+            cap_arr = df_feat["waiting_capacity"].to_numpy().astype(float)
+        cap_95   = float(np.percentile(cap_arr[cap_arr > 0], 95)) if cap_arr.max() > 0 else 1.0
         base_cap = df_baseline.filter(pl.col("waiting_capacity") > 0)["waiting_capacity"].to_numpy()
-        baseline_rho = float(np.mean(base_cap) / cap_95)
+        baseline_rho = float(np.mean(base_cap) / cap_95) if len(base_cap) > 0 else 0.3
         # TTC = quand la capacité bloquée REDESCEND sous le seuil (crisis clearing)
         ttc_direction = "below"
         log.info("ρ = waiting_capacity norm. (95p=%.0f) | baseline_ρ=%.4f", cap_95, baseline_rho)
@@ -132,15 +166,35 @@ def compute_time_to_clear(
         # Pour Houston : seuil = baseline × rho_threshold
         rho_threshold_abs = baseline_rho * rho_threshold
 
-    log.info("Baseline ρ=%.4f | gravity_peak=%.4f | seuil TTC=%.4f | direction=%s",
-             baseline_rho, gravity_peak, rho_threshold_abs, ttc_direction)
+    # Compute effective threshold per ttc_mode
+    if ttc_mode == "threshold":
+        rho_thr_eff = rho_threshold_abs
+    elif ttc_mode == "threshold_relaxed":
+        rho_thr_eff = rho_threshold_abs * (1.0 + relaxation_margin)
+        log.info("TTC mode=threshold_relaxed : seuil relaxé=%.4f (margin=%.2f%%)",
+                 rho_thr_eff, relaxation_margin * 100)
+    elif ttc_mode == "ma_threshold":
+        rho_thr_eff = rho_threshold_abs
+        log.info("TTC mode=ma_threshold : fenêtre MA=%d jours, seuil=%.4f", ma_window, rho_thr_eff)
+    elif ttc_mode == "inflection":
+        rho_thr_eff = rho_threshold_abs
+        log.info("TTC mode=inflection : TTC = jour du minimum de ρ_pred (clearing maximal)")
+    else:
+        raise ValueError(f"ttc_mode invalide: {ttc_mode!r} — choisir parmi threshold/threshold_relaxed/ma_threshold/inflection")
+
+    log.info("Baseline ρ=%.4f | gravity_peak=%.4f | seuil TTC=%.4f | direction=%s | mode=%s",
+             baseline_rho, gravity_peak, rho_threshold_abs, ttc_direction, ttc_mode)
 
     eval_dates = [harvey_peak + timedelta(days=i) for i in range(n_eval_days)]
 
     rows = []
-    consecutive_above = 0
-    ttc_found         = False
-    ttc_days          = None
+    consecutive_above  = 0
+    ttc_found          = False
+    ttc_days           = None
+    rho_history: deque[float] = deque(maxlen=ma_window)
+    # Inflection mode: track all (i, rho) to find minimum post-peak
+    inflection_rho_min = float("inf")
+    inflection_day     = 0
 
     with torch.no_grad():
         for i, d in enumerate(eval_dates):
@@ -159,11 +213,25 @@ def compute_time_to_clear(
             v_pred   = model.greenshields_v(rho_pred)
             rho_val = float(rho_pred.cpu().item())
             v_val   = float(v_pred.cpu().item())
+            rho_history.append(rho_val)
 
-            if ttc_direction == "below":
-                is_cleared = rho_val <= rho_threshold_abs
+            # Track inflection (minimum) for inflection mode
+            if rho_val < inflection_rho_min:
+                inflection_rho_min = rho_val
+                inflection_day = i
+
+            # Compute the signal used for threshold comparison
+            if ttc_mode == "ma_threshold":
+                rho_signal = float(np.mean(rho_history))
             else:
-                is_cleared = rho_val >= rho_threshold_abs
+                rho_signal = rho_val
+
+            if ttc_mode == "inflection":
+                is_cleared = False  # evaluated after loop
+            elif ttc_direction == "below":
+                is_cleared = rho_signal <= rho_thr_eff
+            else:
+                is_cleared = rho_signal >= rho_thr_eff
 
             if is_cleared:
                 consecutive_above += 1
@@ -173,12 +241,13 @@ def compute_time_to_clear(
             if consecutive_above >= n_consecutive and not ttc_found:
                 ttc_days  = i - n_consecutive + 1
                 ttc_found = True
-                log.info("TTC détecté : %d jours après le pic (date=%s, ρ=%.4f)",
-                         ttc_days, eval_dates[ttc_days], rho_val)
+                log.info("TTC détecté : %d jours après le pic (date=%s, ρ=%.4f, signal=%.4f)",
+                         ttc_days, eval_dates[ttc_days], rho_val, rho_signal)
 
             rows.append({
                 "date":               d.isoformat(),
                 "rho_pred":           round(rho_val, 6),
+                "rho_signal":         round(rho_signal, 6),
                 "v_pred":             round(v_val,   6),
                 "rho_threshold":      round(rho_threshold_abs, 6),
                 "is_cleared":         is_cleared,
@@ -186,7 +255,20 @@ def compute_time_to_clear(
                 "time_to_clear_days": ttc_days,
             })
 
-    df_out = pl.DataFrame(rows).with_columns(pl.col("date").str.to_date())
+    # Inflection mode: set TTC to the day of minimum rho_pred
+    if ttc_mode == "inflection":
+        ttc_days  = inflection_day
+        ttc_found = True
+        for r in rows:
+            r["is_cleared"]         = False
+            r["time_to_clear_days"] = ttc_days
+        log.info("TTC (inflection) = J+%d — ρ_min=%.4f le %s",
+                 ttc_days, inflection_rho_min, eval_dates[ttc_days])
+
+    df_out = (
+        pl.DataFrame(rows, schema_overrides={"time_to_clear_days": pl.Int64})
+        .with_columns(pl.col("date").str.to_date())
+    )
 
     if ttc_found:
         log.info("Time to Clear = %d jours (depuis le pic %s)", ttc_days, harvey_peak)
@@ -205,11 +287,15 @@ def main() -> None:
     parser.add_argument("--location",       default="la", choices=["houston", "la"])
     parser.add_argument("--rho-threshold",  type=float, default=RHO_THRESHOLD)
     parser.add_argument("--n-consecutive",  type=int,   default=N_CONSECUTIVE)
-    parser.add_argument("--n-eval-days",    type=int,   default=90)
-    parser.add_argument("--peak-date",      default="2020-08-11")
-    parser.add_argument("--gravity-weight", type=float, default=0.3)
-    parser.add_argument("--time-mode",      default="train_window",
+    parser.add_argument("--n-eval-days",         type=int,   default=365)
+    parser.add_argument("--peak-date",           default="2020-08-11")
+    parser.add_argument("--gravity-weight",      type=float, default=0.3)
+    parser.add_argument("--time-mode",           default="train_window",
                         choices=["train_window", "absolute"])
+    parser.add_argument("--ttc-mode",            default="threshold",
+                        choices=["threshold", "threshold_relaxed", "ma_threshold", "inflection"])
+    parser.add_argument("--relaxation-margin",   type=float, default=0.05)
+    parser.add_argument("--ma-window",           type=int,   default=7)
     parser.add_argument("--features-path",  default=None)
     parser.add_argument("--gravity-path",   default=None)
     parser.add_argument("--model-path",     default=None)
@@ -241,6 +327,9 @@ def main() -> None:
         gravity_path=gravity_path,
         gravity_weight=args.gravity_weight,
         time_mode=args.time_mode,
+        ttc_mode=args.ttc_mode,
+        relaxation_margin=args.relaxation_margin,
+        ma_window=args.ma_window,
     )
     print(df.select(["date", "rho_pred", "v_pred", "is_cleared", "time_to_clear_days"]).head(20))
 

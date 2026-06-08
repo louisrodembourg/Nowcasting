@@ -1,7 +1,17 @@
 """
-Phase 2 — Manifold Learning : Laplace-Beltrami Operator (LBO).
+Phase 2 — Manifold TEMPOREL : Laplace-Beltrami Operator sur les JOURS.
 
-Étapes 1→4 du pipeline manifold :
+ATTENTION : Ce module implémente un manifold TEMPOREL (chaque point = 1 jour
+avec 13 features). Il NE correspond PAS au manifold géospatial utilisé dans
+le pipeline Phase 3 (PINNs). Pour le pipeline complet, utiliser :
+    manifold_pipeline.py  — manifold GÉOSPATIAL (chaque point = 1 zone HDBSCAN)
+    run_phase2.py         — orchestrateur du pipeline géospatial
+
+Ce module reste utile pour l'analyse exploratoire (patterns temporels de
+congestion), mais ses sorties ({loc}_manifold.parquet, {loc}_gravity_score.parquet)
+ne sont pas consommées par la Phase 3.
+
+Étapes 1→4 du pipeline manifold temporel :
   1. Normalisation des 13 features (L2 par ligne → variations, pas valeurs absolues)
   2. Graphe KNN + matrice de poids W (décroissance gaussienne sur distance euclidienne)
   3. Construction et décomposition de l'opérateur LBO → vecteurs propres (ϕ, λ)
