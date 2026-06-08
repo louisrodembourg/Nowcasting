@@ -28,9 +28,9 @@ Résultat attendu (Xu et al.) :
   LBO capture la structure non-linéaire de la variété avec moins de zones.
 
 Usage :
-    python src/manifold/approximation_test.py --start 2019-01-01 --end 2019-08-30 --location la
-    python src/manifold/approximation_test.py --start 2017-07-01 --end 2017-09-15 --location houston
-    python src/manifold/approximation_test.py --start 2019-01-01 --end 2019-08-30 --location la --max-zones 30
+    python src/manifold/test_comp.py --start 2019-01-01 --end 2019-06-30 --location la
+    python src/manifold/test_comp.py --start 2017-07-01 --end 2017-09-15 --location houston
+    python src/manifold/test_comp.py --start 2019-01-01 --end 2019-08-30 --location la --max-zones 30
 """
 import argparse
 import logging

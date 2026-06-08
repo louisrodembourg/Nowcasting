@@ -14,7 +14,7 @@ import numpy as np
 import polars as pl
 import torch
 
-from src.clustering.hdbscan_daily import cluster_day
+from src.clustering.hdbscan_daily import cluster_day, ClusteringConfig, load_waiting_zones
 from src.ingestion.download import LOCATIONS
 
 log = logging.getLogger(__name__)
@@ -224,12 +224,21 @@ def build_rho_v_tensors(
     count_rho = np.zeros((n_bins, n_days), dtype=np.int32)
     count_v = np.zeros((n_bins, n_days), dtype=np.int32)
 
+    # Load waiting-zone polygons so that _classify_clusters can correctly
+    # distinguish waiting vessels (anchored, queuing) from docked ones.
+    # Without this, the default ClusteringConfig marks everything as "docked".
+    try:
+        waiting_polygons = load_waiting_zones(location)
+        cluster_config = ClusteringConfig(waiting_allowed_polygons=waiting_polygons)
+    except (FileNotFoundError, Exception):
+        cluster_config = ClusteringConfig()
+
     for j, day in enumerate(dates_list):
         parquet_path = parquet_dir / f"{prefix}_{day.strftime('%Y_%m_%d')}.parquet"
         if not parquet_path.exists():
             continue
 
-        cluster_df, _ = cluster_day(parquet_path)
+        cluster_df, _ = cluster_day(parquet_path, config=cluster_config)
         if cluster_df is None or len(cluster_df) == 0:
             continue
 

@@ -346,19 +346,38 @@ def _classify_clusters(df: pl.DataFrame, config: ClusteringConfig) -> pl.DataFra
 def main() -> None:
     """Point d'entrée pour l'exécution autonome du script."""
     parser = argparse.ArgumentParser(
-        description="Clustering HDBSCAN sur un fichier Parquet quotidien — Houston"
+        description="Clustering HDBSCAN sur un fichier Parquet quotidien"
     )
     parser.add_argument("parquet", help="Chemin vers le fichier Parquet quotidien")
+    parser.add_argument("--preview", type=int, default=10, metavar="N",
+                        help="Nombre de lignes à afficher (défaut: 10)")
+    parser.add_argument("--save-csv", action="store_true",
+                        help="Sauvegarde cluster_df en CSV à côté du parquet d'entrée")
     args = parser.parse_args()
 
     cluster_df, _ = cluster_day(Path(args.parquet))
-    if cluster_df is not None:
-        print(cluster_df)
+    if cluster_df is None:
+        print("Aucun cluster trouvé.")
+        return
 
-        docked = cluster_df.filter(pl.col("cluster_type") == "docked").height
-        waiting = cluster_df.filter(pl.col("cluster_type") == "waiting").height
-        noise = cluster_df.filter(pl.col("cluster_label") == -1).height
-        print(f"\nà_quai={docked}  en_attente={waiting}  bruit={noise}")
+    docked = cluster_df.filter(pl.col("cluster_type") == "docked").height
+    waiting = cluster_df.filter(pl.col("cluster_type") == "waiting").height
+    noise = cluster_df.filter(pl.col("cluster_label") == -1).height
+    print(f"\nTotal episodes : {len(cluster_df)}  |  docked={docked}  waiting={waiting}  noise={noise}")
+
+    cols = ["MMSI", "traj_id", "LAT", "LON", "cluster_label", "cluster_type",
+            "membership_score", "Heading_mean", "Heading_std", "Draft", "Length", "nb_messages"]
+    cols = [c for c in cols if c in cluster_df.columns]
+    preview = cluster_df.select(cols).head(args.preview)
+
+    with pl.Config(tbl_rows=args.preview, tbl_cols=len(cols), tbl_width_chars=120):
+        print(f"\n--- Preview ({args.preview}/{len(cluster_df)} lignes) ---")
+        print(preview)
+
+    if args.save_csv:
+        csv_path = Path(args.parquet).with_suffix(".clusters.csv")
+        cluster_df.write_csv(csv_path)
+        print(f"\nCSV sauvegardé : {csv_path}")
 
 
 if __name__ == "__main__":
