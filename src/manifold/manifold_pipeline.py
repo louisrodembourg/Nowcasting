@@ -28,7 +28,7 @@ MODE RECOMMANDÉ — Baseline fixe + Scoring (2 étapes séparées)
     python src/manifold/manifold_pipeline.py --both `
         --baseline-start 2017-01-01 --baseline-end 2017-12-31 `
         --start 2017-01-01 --end 2017-12-31 `
-        --location houston
+        --location la
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 MODE ROLLING — Fenêtre glissante de 3 mois (expérimental)
