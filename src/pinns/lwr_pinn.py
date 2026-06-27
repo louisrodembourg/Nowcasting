@@ -15,6 +15,7 @@ Kinematic constraints (Alam et al. 2025):
 """
 
 import logging
+import math
 
 import torch
 import torch.nn as nn
@@ -30,17 +31,64 @@ def get_device():
     return torch.device("cpu")
 
 
-class LWRPINN(nn.Module):
-    def __init__(self, hidden_layers=4, hidden_size=64):
+class FourierEmbedding(nn.Module):
+    """
+    Random Fourier Features (Tancik et al. NeurIPS 2020).
+
+    Encodes (x, t) into multi-scale sinusoidal basis to help the MLP
+    represent high-frequency variations (shock fronts) without spectral bias.
+    The random projection matrix B is fixed (not learned), registered as a buffer
+    so it is saved/restored with the model checkpoint.
+
+    Output: [sin(2π·B·z), cos(2π·B·z), z]  — shape (N, 2*n_freqs + input_dim)
+    """
+
+    def __init__(self, input_dim: int = 2, n_freqs: int = 16, sigma: float = 1.0):
         super().__init__()
-        layers = [nn.Linear(2, hidden_size), nn.Tanh()]
+        B = torch.randn(input_dim, n_freqs) * sigma
+        self.register_buffer("B", B)
+        self.out_dim = 2 * n_freqs + input_dim  # sin + cos + identity passthrough
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        proj = 2 * math.pi * x @ self.B  # (N, n_freqs)
+        return torch.cat([torch.sin(proj), torch.cos(proj), x], dim=-1)
+
+
+class LWRPINN(nn.Module):
+    def __init__(
+        self,
+        hidden_layers: int = 4,
+        hidden_size: int = 64,
+        n_freqs: int = 0,
+        fourier_sigma: float = 1.0,
+    ):
+        """
+        Parameters
+        ----------
+        n_freqs      : number of Fourier frequencies (0 = disabled, raw (x,t) input)
+        fourier_sigma: scale of the random frequency matrix (larger = higher frequencies)
+        """
+        super().__init__()
+        self.n_freqs = n_freqs
+        self.fourier_sigma = fourier_sigma
+
+        if n_freqs > 0:
+            self.embedding = FourierEmbedding(input_dim=2, n_freqs=n_freqs, sigma=fourier_sigma)
+            in_size = self.embedding.out_dim
+        else:
+            self.embedding = None
+            in_size = 2
+
+        layers = [nn.Linear(in_size, hidden_size), nn.Tanh()]
         for _ in range(hidden_layers - 1):
             layers += [nn.Linear(hidden_size, hidden_size), nn.Tanh()]
         layers.append(nn.Linear(hidden_size, 2))
         self.net = nn.Sequential(*layers)
 
     def forward(self, x, t):
-        inp = torch.cat([x, t], dim=1)
+        inp = torch.cat([x, t], dim=1)  # (N, 2)
+        if self.embedding is not None:
+            inp = self.embedding(inp)   # (N, 2*n_freqs + 2)
         out = self.net(inp)
         rho = torch.sigmoid(out[:, 0:1])
         v = torch.sigmoid(out[:, 1:2])

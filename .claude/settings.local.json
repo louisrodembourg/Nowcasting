@@ -1,7 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python src/clustering/visualize_clusters.py --start 2017-01-01 --end 2017-01-05 --location la)"
+      "Bash(python src/clustering/visualize_clusters.py --start 2017-01-01 --end 2017-01-05 --location la)",
+      "Bash(python3 *)",
+      "Bash(python *)",
+      "Bash(pip install *)"
     ]
   }
 }

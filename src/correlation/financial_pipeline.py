@@ -182,7 +182,9 @@ def build_events_dataset(
                 "x_km":   ep.x_norm * ep.channel_len_km,
                 "t_days": ep.t_norm * ep.duration_days,
             })
-            t_max = float(episode_data["t_days"].max()) * 1.2 + 1.0
+            # Extrapolate far enough beyond the episode to observe resolution.
+            # Minimum 90 days: typical LA port congestion clears in 2-8 weeks post-episode.
+            t_max = max(float(episode_data["t_days"].max()) * 3.0 + 30.0, 90.0)
 
             try:
                 profiles = extract_physical_profiles(
