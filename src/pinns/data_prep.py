@@ -28,19 +28,50 @@ T_DAYS_MAX = 2000
 # Distance is cumulative along the polyline.
 CHANNEL_AXES = {
     "houston": [
-        (29.350, -94.780),  # Bolivar Roads / Galveston entrance
-        (29.400, -94.850),  # Texas City approach
-        (29.550, -94.950),  # Texas City
-        (29.650, -95.080),  # Bayport / Barbours Cut
-        (29.720, -95.200),  # Greens Bayou
-        (29.750, -95.270),  # Turning Basin
+        (29.7242780, -95.2156546),
+        (29.7443919, -95.1924909),
+        (29.7474086, -95.1646943),
+        (29.7353411, -95.1403723),
+        (29.7433863, -95.1102594),
+        (29.7624910, -95.0859375),
+        (29.7423807, -95.0488754),
+        (29.7172372, -95.0187625),
+        (29.6951056, -94.9967569),
+        (29.6659248, -94.9770677),
+        (29.6236480, -94.9643276),
+        (29.5783316, -94.9342147),
+        (29.5471019, -94.9133673),
+        (29.5229174, -94.8878871),
+        (29.4785641, -94.8705143),
+        (29.4422606, -94.8450341),
+        (29.3928267, -94.8137630),
+        (29.3585114, -94.7894411),
+        (29.3474070, -94.7743846),
+        (29.3463974, -94.7361644),
+        (29.3322626, -94.6944696),
+        (29.3120665, -94.6736222),
+        (29.2969169, -94.6446674),
+        (29.2666108, -94.6052890),
+        (29.2267520, -94.5628413),
     ],
     "la": [
-        (33.710, -118.270),  # Angels Gate / San Pedro Bay entrance
-        (33.740, -118.260),  # Port of LA main channel
-        (33.770, -118.230),  # Cerritos Channel junction
-        (33.790, -118.200),  # Port of Long Beach
-    ],
+        (33.7376958, -118.2255703),
+        (33.7284130, -118.2204418),
+        (33.7161181, -118.2147099),
+        (33.7003077, -118.2074696),
+        (33.6900168, -118.2023410),
+        (33.6764611, -118.1935924),
+        (33.6618988, -118.2008327),
+        (33.6493196, -118.2082597),
+        (33.6390226, -118.2320924),
+        (33.6357575, -118.2625619),
+        (33.6377668, -118.2942382),
+        (33.6493196, -118.3271211),
+        (33.6611219, -118.3651327),
+        (33.6724205, -118.4088761),
+        (33.6854748, -118.4493010),
+        (33.6935073, -118.4710219),
+    ]
 }
 
 
@@ -169,16 +200,11 @@ def compute_raw_sog_per_bin(parquet_path, waypoints, bin_edges, n_bins, channel_
     bin_idxs = np.searchsorted(bin_edges, x_clipped, side="right") - 1
     bin_idxs = np.clip(bin_idxs, 0, n_bins - 1)
 
-    sog_grid = np.zeros(n_bins, dtype=np.float32)
-    sog_count = np.zeros(n_bins, dtype=np.float32)
-    for i in range(n_bins):
-        mask = bin_idxs == i
-        cnt = mask.sum()
-        if cnt > 0:
-            sog_grid[i] = float(sogs[mask].mean())
-            sog_count[i] = float(cnt)
+    sog_sum   = np.bincount(bin_idxs, weights=sogs.astype(np.float64), minlength=n_bins)
+    sog_count = np.bincount(bin_idxs,                                   minlength=n_bins)
+    sog_grid  = np.where(sog_count > 0, sog_sum / sog_count, 0.0).astype(np.float32)
 
-    return sog_grid, sog_count
+    return sog_grid, sog_count.astype(np.float32)
 
 
 def build_rho_v_tensors(

@@ -16,15 +16,15 @@ Structure en 4 étapes:
                                           trous par la physique
 
 Usage:
-    python src/pinns/pinn_pipeline.py --train  --location la --start 2017-01-01 --end 2017-12-31
+    python src/pinns/pinn_pipeline.py --train  --location la --start 2019-01-01 --end 2019-12-31
     python src/pinns/pinn_pipeline.py --train  --location houston --start 2017-01-01 --end 2017-12-31
-    python src/pinns/pinn_pipeline.py --infer  --model outputs/models/pinn_la_episodes.pt --start 2019-06-01 --end 2024-08-01
+    python src/pinns/pinn_pipeline.py --infer  --model outputs/models/pinn_houston_episodes.pt --start 2020-08-02 --end 2020-12-30
     python src/pinns/pinn_pipeline.py --both   --location houston
     python src/pinns/pinn_pipeline.py --data-only --location houston --start 2017-01-01 --end 2017-12-31
 
     python src/pinns/pinn_pipeline.py --infer `
-  --model outputs/models/pinn_houston_episodes.pt `
-  --start 2020-08-01 --end 2020-12-30 `
+  --model outputs/models/pinn_la_episodes.pt `
+  --start 2020-11-01 --end 2021-02-28 `
   --fine-tune `
   --fine-tune-epochs 300 `
   --fine-tune-lr 1e-4
@@ -39,6 +39,15 @@ from pathlib import Path
 from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+
+def _force_unlink(path: Path) -> None:
+    """Supprime un fichier existant avant ecriture pour eviter les verrous Windows."""
+    try:
+        path.unlink(missing_ok=True)
+    except PermissionError:
+        pass
+
 
 import numpy as np
 import pandas as pd
@@ -166,8 +175,8 @@ def _detect_episode_ranges(
 def structure_episodes(
     location: str = "houston",
     gravity_path: Optional[Path] = None,
-    gravity_threshold: float = 0.7,
-    min_episode_days: int = 3,
+    gravity_threshold: Optional[float] = None,
+    min_episode_days: Optional[int] = None,
     dx_km: float = 2.0,
     constituent_path: Optional[Path] = None,
     start_date: Optional[date] = None,
@@ -194,6 +203,13 @@ def structure_episodes(
     episodes    : liste d'objets Episode (coordonnées normalisées pour le PINN)
     global_meta : {'channel_len_km', 'global_rho_max', 'global_v_max', 'dx_km', 'location'}
     """
+    # Appliquer les defaults par localisation si non fournis
+    loc_defaults = LOCATION_DEFAULTS.get(location, {})
+    if gravity_threshold is None:
+        gravity_threshold = float(loc_defaults.get("gravity_threshold", 5_000))
+    if min_episode_days is None:
+        min_episode_days = int(loc_defaults.get("min_episode_days", 3))
+
     if gravity_path is None:
         gravity_path = FEATURES_DIR / f"{location}_gravity_daily.parquet"
     if not gravity_path.exists():
@@ -415,6 +431,16 @@ def train_on_episodes(
         len(x_data), len(episodes),
     )
 
+    # Courant number α = v_max [km/h] · T_ep_mean [h] / L [km]
+    # Ensures the two PDE terms have the same physical scale in normalized space.
+    v_max_kmh = global_meta["global_v_max"] * 1.852  # knots → km/h
+    mean_duration_h = float(np.mean([ep.duration_days for ep in episodes])) * 24.0
+    alpha_courant = v_max_kmh * mean_duration_h / max(global_meta["channel_len_km"], 1e-8)
+    log.info(
+        "Courant alpha = %.2f  (v_max=%.1f km/h  T_mean=%.0f h  L=%.1f km)",
+        alpha_courant, v_max_kmh, mean_duration_h, global_meta["channel_len_km"],
+    )
+
     model = LWRPINN(hidden_layers=4, hidden_size=64).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=200, factor=0.5)
@@ -442,9 +468,15 @@ def train_on_episodes(
             x_col, t_col,
             lambda_pde=lambda_pde,
             lambda_kin=lambda_kin,
+            alpha_courant=alpha_courant,
         )
 
         loss.backward()
+        # Vider les gradients accumulés sur les tenseurs de collocation (non gérés par optimizer)
+        if x_col.grad is not None:
+            x_col.grad = None
+        if t_col.grad is not None:
+            t_col.grad = None
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         scheduler.step(loss)
@@ -471,7 +503,7 @@ def train_on_episodes(
     name = model_name or f"pinn_{location}_episodes"
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     save_path = MODEL_DIR / f"{name}.pt"
-
+    _force_unlink(save_path)
     torch.save(
         {
             "model_state": model.state_dict(),
@@ -550,50 +582,64 @@ def fine_tune_on_episode(
     global_v_max   = global_meta["global_v_max"]
 
     # Normaliser les observations vers l'espace [0, 1]² du PINN
-    x_norm   = np.clip(x_km / max(channel_len_km, 1e-8), 0, 1).astype(np.float32)
-    t_norm   = np.clip(t_days / max(t_max_days, 1e-8), 0, 1).astype(np.float32)
+    x_norm   = np.clip(x_km       / max(channel_len_km, 1e-8), 0, 1).astype(np.float32)
+    t_norm   = np.clip(t_days     / max(t_max_days,     1e-8), 0, 1).astype(np.float32)
     rho_norm = np.clip(rho_physical / max(global_rho_max, 1e-8), 0, 1).astype(np.float32)
-    v_norm   = np.clip(v_physical / max(global_v_max, 1e-8), 0, 1).astype(np.float32)
+    v_norm   = np.clip(v_physical  / max(global_v_max,   1e-8), 0, 1).astype(np.float32)
 
-    x_t   = torch.tensor(x_norm,   device=device).unsqueeze(1)
-    t_t   = torch.tensor(t_norm,   device=device).unsqueeze(1)
-    rho_t = torch.tensor(rho_norm, device=device).unsqueeze(1)
-    v_t   = torch.tensor(v_norm,   device=device).unsqueeze(1)
+    x_t   = torch.tensor(x_norm,    device=device).unsqueeze(1)
+    t_t   = torch.tensor(t_norm,    device=device).unsqueeze(1)
+    rho_t = torch.tensor(rho_norm,  device=device).unsqueeze(1)
+    v_t   = torch.tensor(v_norm,    device=device).unsqueeze(1)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    # Courant number pour ce fine-tuning (basé sur t_max_days de l'épisode courant)
+    v_max_kmh     = global_v_max * 1.852
+    alpha_courant = v_max_kmh * (t_max_days * 24.0) / max(channel_len_km, 1e-8)
+
+    optimizer  = torch.optim.Adam(model.parameters(), lr=lr)
 
     log.info(
-        "Fine-tuning: %d pts AIS | %d epochs | lr=%.0e | device=%s",
-        len(x_km), epochs, lr, device,
+        "Fine-tuning: %d pts AIS | %d epochs | lr=%.0e | alpha=%.2f | device=%s",
+        len(x_km), epochs, lr, alpha_courant, device,
     )
 
-    x_col = t_col = None
-    best_loss = float("inf")
+    x_col: torch.Tensor | None = None
+    t_col: torch.Tensor | None = None
+    best_loss  = float("inf")
+    best_state: dict | None = None
 
     for epoch in range(1, epochs + 1):
-        # Reéchantillonner les collocation points tous les 100 epochs
+        # Rééchantillonner les points de collocation tous les 100 epochs
         if (epoch - 1) % 100 == 0:
-            x_col_np = np.random.rand(n_colloc).astype(np.float32)
-            t_col_np = np.random.rand(n_colloc).astype(np.float32)
-            x_col = torch.tensor(x_col_np, device=device, requires_grad=True).unsqueeze(1)
-            t_col = torch.tensor(t_col_np, device=device, requires_grad=True).unsqueeze(1)
+            x_col = torch.rand(n_colloc, 1, device=device, requires_grad=True)
+            t_col = torch.rand(n_colloc, 1, device=device, requires_grad=True)
 
         optimizer.zero_grad()
         loss, _ = total_loss(
             model, x_t, t_t, rho_t, v_t,
-            x_col, t_col, lambda_pde, lambda_kin,
+            x_col, t_col,
+            lambda_pde=lambda_pde,
+            lambda_kin=lambda_kin,
+            alpha_courant=alpha_courant,
         )
         loss.backward()
+        if x_col.grad is not None:
+            x_col.grad = None
+        if t_col.grad is not None:
+            t_col.grad = None
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
         lv = loss.item()
         if lv < best_loss:
-            best_loss = lv
+            best_loss  = lv
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
 
         if epoch % 100 == 0 or epoch == 1:
             log.info("  FT [%d/%d]  loss=%.6f  best=%.6f", epoch, epochs, lv, best_loss)
 
+    if best_state is not None:
+        model.load_state_dict(best_state)
     model.eval()
     log.info("Fine-tuning termine. best_loss=%.6f sur %d pts AIS", best_loss, len(x_km))
     return model
@@ -801,6 +847,7 @@ def plot_physical_profiles(
         stem = title_suffix.replace(" ", "_").replace("/", "-") or "pinn_profiles"
         output_path = OUTPUT_DIR / f"{stem}_physical_profiles.png"
 
+    _force_unlink(output_path)
     fig.write_image(str(output_path), format="png", scale=2)
     log.info("Visualisation sauvegardee -> %s", output_path)
     return output_path
@@ -818,16 +865,19 @@ def plot_shockwave_heatmap(
     """
     Diagramme spatio-temporel LWR — onde de choc.
 
-    Convention LWR classique:
-      - Axe X : espace x [km] (x=0 = entrée du chenal côté large, x=max = port)
-      - Axe Y : temps t [heures] depuis l'onset (t=0 en haut, croissant vers le bas)
+    Convention des waypoints Houston (CHANNEL_AXES["houston"]) :
+      - x = 0 km  : turning basin / terminaux (intérieur, côté ville)
+      - x = max   : Galveston Bay / entrée Gulf (côté large)
+    L'ordre est défini par l'ordre des waypoints — x=0 correspond au premier.
+
+      - Axe X : espace x [km]
+      - Axe Y : temps t [heures] depuis le début de l'épisode
       - Couleur : densité ρ̂  (bleu=fluide → rouge foncé=saturé)
 
-    L'onde de choc se manifeste comme une bande diagonale rouge partant du port
-    (x élevé) et se propageant vers le large (x faible) au fil du temps.
-    C'est la signature visuelle que le PINN a bien capturé la dynamique LWR.
+    L'onde de choc se manifeste comme une bande diagonale rouge dense
+    côté terminaux (x≈0) se propageant vers l'entrée (x grand) au fil du temps.
 
-    Returns path_html.
+    Returns output path.
     """
     try:
         import plotly.graph_objects as go
@@ -926,6 +976,7 @@ def plot_shockwave_heatmap(
         output_path = OUTPUT_DIR / f"{stem}_shockwave.png"
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    _force_unlink(output_path)
     fig.write_image(str(output_path), format="png", scale=2)
     log.info("Diagramme onde de choc sauvegarde -> %s", output_path)
     return output_path
@@ -1061,6 +1112,7 @@ def plot_ais_vs_pinn(
         output_path = OUTPUT_DIR / f"{stem}_ais_vs_pinn.png"
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    _force_unlink(output_path)
     fig.write_image(str(output_path), format="png", scale=2)
     log.info("Comparaison AIS vs PINN sauvegardee -> %s", output_path)
     return output_path
@@ -1166,6 +1218,7 @@ def plot_density_profiles_1d(
         output_path = OUTPUT_DIR / f"{stem}_profiles_1d.png"
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    _force_unlink(output_path)
     fig.write_image(str(output_path), format="png", scale=2)
     log.info("Profils 1D sauvegardes -> %s", output_path)
     return output_path
@@ -1308,6 +1361,7 @@ def plot_fundamental_diagram(
         output_path = OUTPUT_DIR / f"{stem}_fundamental_diagram.png"
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    _force_unlink(output_path)
     fig.write_image(str(output_path), format="png", scale=2)
     log.info("Diagramme fondamental sauvegarde -> %s", output_path)
     return output_path
@@ -1366,7 +1420,7 @@ def plot_congestion_clearance(
     t_vals_c = t_series["t_days"].values
     rho_max_t = t_series["rho_hat"].values
 
-    rho_peak = float(rho_max_t[0]) if len(rho_max_t) > 0 else 1.0
+    rho_peak = float(rho_max_t.max()) if len(rho_max_t) > 0 else 1.0
     threshold = rho_threshold_frac * rho_peak
 
     # TTC = premier t où max ρ < seuil
@@ -1526,12 +1580,249 @@ def plot_congestion_clearance(
         stem = title_suffix.replace(" ", "_").replace("/", "-") or "pinn"
         output_path = OUTPUT_DIR / f"{stem}_clearance.png"
 
+    _force_unlink(output_path)
     fig.write_image(str(output_path), format="png", scale=2)
     log.info(
         "Clearance plot sauvegardes -> %s  (TTC=%s)",
         output_path, f"{ttc_days:.1f}j" if ttc_days is not None else "n/a",
     )
     return output_path, ttc_days
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# NOWCAST VALIDATION — Comparaison TTC prédit vs réel
+# ════════════════════════════════════════════════════════════════════════════
+
+def _compute_gt_ttc(
+    gt_t_days: np.ndarray,
+    gt_rho_physical: np.ndarray,
+    threshold: float,
+) -> Optional[float]:
+    """
+    Calcule le TTC réel depuis les données AIS ground truth.
+
+    Regroupe les observations AIS par journée et calcule max_x(ρ) à chaque
+    pas de temps discret. Le TTC réel est le premier jour où max_x(ρ) < threshold.
+
+    Parameters
+    ----------
+    gt_t_days       : temps [jours] épisode-relatifs des observations GT
+                      (t=0 = début de l'épisode, fenêtre GT commence à obs_end_days)
+    gt_rho_physical : densité [vessels/km] correspondante
+    threshold       : seuil de retour à la normale [vessels/km] — même valeur
+                      que celle utilisée pour le TTC prédit par le PINN
+
+    Returns
+    -------
+    ttc_days (float) ou None si non atteint dans la fenêtre GT
+    """
+    if len(gt_t_days) == 0 or threshold <= 0:
+        return None
+
+    day_bins = np.floor(gt_t_days).astype(int)
+    unique_days = np.unique(day_bins)
+
+    for d in unique_days:
+        mask = day_bins == d
+        if float(gt_rho_physical[mask].max()) < threshold:
+            return float(d) + 0.5   # centre du jour
+
+    return None
+
+
+def plot_nowcast_validation(
+    profiles: pd.DataFrame,
+    gt_t_days: np.ndarray,
+    gt_rho_physical: np.ndarray,
+    obs_end_days: float,
+    ttc_predicted: Optional[float],
+    ttc_actual: Optional[float],
+    rho_threshold: float,
+    title_suffix: str = "",
+    output_path: Optional[Path] = None,
+) -> Path:
+    """
+    Validation du nowcasting : courbe prédite (PINN) vs courbe réelle (AIS).
+
+    Affiche sur un même graphe :
+      - Zone grisée  : fenêtre d'observation [0, obs_end_days]
+      - Zone bleutée : horizon de prédiction [obs_end_days, t_max]
+      - Ligne grise verticale : séparation observation / prédiction (--nowcast-end)
+      - Trait rouge pointillé : max_x ρ̂(x,t) prédit par le PINN
+      - Trait bleu plein      : max_x ρ(x,t) réel depuis les AIS ground truth
+      - Ligne rouge horizontale : seuil TTC
+      - Trait vert  : TTC prédit (quand la courbe PINN passe sous le seuil)
+      - Trait orange : TTC réel   (quand la courbe GT passe sous le seuil)
+
+    Principe : le PINN ne voit QUE la fenêtre d'observation lors du fine-tuning.
+    Ce graphe évalue si son extrapolation au-delà correspond à la réalité.
+
+    Parameters
+    ----------
+    profiles        : DataFrame de extract_physical_profiles (prédictions PINN)
+    gt_t_days       : temps [jours] épisode-relatifs des observations GT
+    gt_rho_physical : densité [vessels/km] des observations GT
+    obs_end_days    : durée de la fenêtre d'observation en jours
+    ttc_predicted   : TTC prédit par le PINN (jours depuis onset), ou None
+    ttc_actual      : TTC réel calculé depuis GT, ou None
+    rho_threshold   : seuil [vessels/km] définissant le retour à la normale
+    """
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        raise ImportError("plotly requis: pip install plotly")
+
+    # Courbe PINN: max_x ρ̂(x,t) à chaque pas de temps
+    t_series = (
+        profiles.groupby("t_days")["rho_hat"]
+        .max()
+        .reset_index()
+        .sort_values("t_days")
+    )
+    t_pinn   = t_series["t_days"].values
+    rho_pinn = t_series["rho_hat"].values
+
+    # Courbe GT: max_x ρ(x,t) par journée
+    gt_curve_t: np.ndarray = np.array([])
+    gt_curve_rho: np.ndarray = np.array([])
+    if len(gt_t_days) > 0:
+        day_bins = np.floor(gt_t_days).astype(int)
+        days_sorted = np.unique(day_bins)
+        gt_curve_t   = np.array([float(d) + 0.5 for d in days_sorted])
+        gt_curve_rho = np.array([float(gt_rho_physical[day_bins == d].max()) for d in days_sorted])
+
+    t_max_plot = float(t_pinn[-1]) if len(t_pinn) > 0 else obs_end_days * 2
+    if len(gt_curve_t) > 0:
+        t_max_plot = max(t_max_plot, float(gt_curve_t[-1]))
+
+    fig = go.Figure()
+
+    # Zones colorées : observation (gris) / prédiction (bleu pale)
+    fig.add_vrect(
+        x0=0, x1=obs_end_days,
+        fillcolor="rgba(120,120,120,0.10)", line_width=0,
+        layer="below",
+        annotation_text="<b>Observation</b>", annotation_position="top left",
+        annotation_font=dict(size=12, color="gray"),
+    )
+    fig.add_vrect(
+        x0=obs_end_days, x1=t_max_plot * 1.02,
+        fillcolor="rgba(21,101,192,0.04)", line_width=0,
+        layer="below",
+        annotation_text="<b>Prédiction PINN</b>", annotation_position="top left",
+        annotation_font=dict(size=12, color="#1565C0"),
+    )
+
+    # Ligne verticale de coupure observation / prédiction
+    fig.add_vline(
+        x=obs_end_days,
+        line_dash="dashdot", line_color="#555555", line_width=2,
+        annotation_text=f"Fin obs. (j{obs_end_days:.0f})",
+        annotation_position="top right",
+        annotation_font=dict(size=11, color="#555555"),
+    )
+
+    # Seuil TTC (ligne rouge horizontale)
+    fig.add_hline(
+        y=rho_threshold,
+        line_dash="dash", line_color="#C62828", line_width=1.2,
+        annotation_text=f"Seuil TTC = {rho_threshold:.1f} v/km",
+        annotation_position="bottom right",
+        annotation_font=dict(size=10, color="#C62828"),
+    )
+
+    # Courbe ground truth AIS (bleu plein)
+    if len(gt_curve_t) > 0:
+        fig.add_trace(go.Scatter(
+            x=gt_curve_t, y=gt_curve_rho,
+            mode="lines+markers",
+            line=dict(color="#1565C0", width=2.5),
+            marker=dict(size=6, color="#1565C0"),
+            name="Ground truth AIS (réel)",
+        ))
+
+    # Courbe PINN (rouge pointillé)
+    fig.add_trace(go.Scatter(
+        x=t_pinn, y=rho_pinn,
+        mode="lines",
+        line=dict(color="#E53935", width=2.2, dash="dot"),
+        name="Prédiction PINN",
+    ))
+
+    # TTC prédit (vert)
+    if ttc_predicted is not None:
+        fig.add_vline(
+            x=ttc_predicted, line_dash="dot", line_color="#2E7D32", line_width=2,
+        )
+        fig.add_annotation(
+            x=ttc_predicted, y=rho_threshold * 1.25,
+            text=f"<b>TTC prédit = {ttc_predicted:.1f}j</b>",
+            font=dict(color="#2E7D32", size=12),
+            showarrow=True, arrowcolor="#2E7D32", arrowhead=2, ax=35, ay=-30,
+        )
+
+    # TTC réel (orange)
+    if ttc_actual is not None:
+        fig.add_vline(
+            x=ttc_actual, line_dash="dot", line_color="#E65100", line_width=2,
+        )
+        fig.add_annotation(
+            x=ttc_actual, y=rho_threshold * 1.55,
+            text=f"<b>TTC réel = {ttc_actual:.1f}j</b>",
+            font=dict(color="#E65100", size=12),
+            showarrow=True, arrowcolor="#E65100", arrowhead=2, ax=-35, ay=-30,
+        )
+
+    # Titre avec erreur
+    if ttc_predicted is not None and ttc_actual is not None:
+        err = abs(ttc_predicted - ttc_actual)
+        err_str = f"  |  Erreur = {err:.1f}j"
+    elif ttc_predicted is None and ttc_actual is None:
+        err_str = "  |  TTC non atteint (prédit + réel)"
+    elif ttc_predicted is None:
+        err_str = "  |  TTC prédit : non atteint dans l'horizon"
+    else:
+        err_str = "  |  TTC réel : non atteint dans la fenêtre GT"
+
+    title = f"PINN LWR — Validation Nowcast{err_str}"
+    if title_suffix:
+        title += f"  |  {title_suffix}"
+
+    fig.update_layout(
+        title=dict(text=title, x=0.5, font=dict(size=14)),
+        xaxis=dict(
+            title="Temps depuis l'onset [jours]",
+            showgrid=True, gridcolor="#e8e8e8",
+        ),
+        yaxis=dict(
+            title="max ρ(x,t) [vessels/km]",
+            showgrid=True, gridcolor="#e8e8e8", rangemode="tozero",
+        ),
+        height=520,
+        template="plotly_white",
+        legend=dict(x=1.02, y=0.75),
+        annotations=[
+            dict(
+                x=0.50, y=-0.14, xref="paper", yref="paper",
+                text=(
+                    "<i>Ligne rouge pointillée = prédiction PINN (sans voir le futur). "
+                    "Trait bleu = données AIS réelles. "
+                    "Zone grise = fenêtre d'observation utilisée pour le fine-tuning.</i>"
+                ),
+                showarrow=False, font=dict(color="gray", size=10), align="center",
+            )
+        ],
+    )
+
+    if output_path is None:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        stem = title_suffix.replace(" ", "_").replace("/", "-") or "pinn"
+        output_path = OUTPUT_DIR / f"{stem}_nowcast_validation.png"
+
+    _force_unlink(output_path)
+    fig.write_image(str(output_path), format="png", scale=2)
+    log.info("Validation nowcast sauvegardee -> %s", output_path)
+    return output_path
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1557,6 +1848,16 @@ def main():
     # Données
     parser.add_argument("--start", help="Début de la fenêtre d'inférence (YYYY-MM-DD)")
     parser.add_argument("--end",   help="Fin de la fenêtre d'inférence   (YYYY-MM-DD)")
+    parser.add_argument(
+        "--nowcast-end", default=None,
+        help=(
+            "Date de fin de la fenêtre d'observation stricte (YYYY-MM-DD). "
+            "Active le mode nowcast sans data leakage : "
+            "  --start → --nowcast-end : fenêtre d'observation (fine-tuning + normalisation) "
+            "  --nowcast-end → --end   : ground truth chargé APRÈS inférence pour évaluation. "
+            "Assertion : --nowcast-end doit être strictement antérieur à --end."
+        ),
+    )
     parser.add_argument("--gravity-path", type=Path, default=None,
                         help="Chemin vers gravity_daily.parquet")
     parser.add_argument("--gravity-threshold", type=float, default=None,
@@ -1589,11 +1890,22 @@ def main():
 
     # Fine-tuning
     parser.add_argument("--fine-tune", action="store_true",
-                        help="Adapter le PINN aux données AIS de la fenêtre --start/--end avant inférence")
+                        help="Adapter le PINN aux donnees AIS de la fenetre --start/--end avant inference")
     parser.add_argument("--fine-tune-epochs", type=int, default=300,
-                        help="Nombre d'epochs de fine-tuning (défaut: 300)")
+                        help="Nombre d'epochs de fine-tuning (defaut: 300)")
     parser.add_argument("--fine-tune-lr", type=float, default=1e-4,
-                        help="Learning rate du fine-tuning (défaut: 1e-4)")
+                        help="Learning rate du fine-tuning (defaut: 1e-4)")
+
+    # Nowcasting : fenetre d'observation + horizon de prediction
+    parser.add_argument(
+        "--obs-days", type=int, default=None,
+        help=(
+            "Nombre de jours depuis --start utilises comme fenetre d'observation "
+            "pour calibrer le PINN (fine-tuning automatique). "
+            "Le modele predit ensuite la resorption jusqu'a --t-max-days. "
+            "Ex: --obs-days 7 calibre sur les 7 premiers jours, predit sur 60j par defaut."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1673,6 +1985,7 @@ def main():
 
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         loss_path = OUTPUT_DIR / f"{args.location}_pinn_episode_loss.npy"
+        _force_unlink(loss_path)
         np.save(loss_path, np.array(history))
         log.info("Courbe de loss sauvegardée → %s", loss_path)
 
@@ -1710,39 +2023,131 @@ def main():
         raw_rho_arr:  np.ndarray = np.array([], dtype=np.float32)
         raw_v_arr:    np.ndarray = np.array([], dtype=np.float32)
 
-        # Construire episode_data depuis la fenêtre --start / --end si fournie
+        # ── Chargement AIS : mode classique vs mode nowcast ──────────────────
+        #
+        # Mode classique  (sans --nowcast-end) :
+        #   build_rho_v_tensors(start, end) → une seule fenêtre
+        #
+        # Mode nowcast (avec --nowcast-end) — SANS DATA LEAKAGE :
+        #   Appel 1 (observation) : build_rho_v_tensors(start, nowcast_end)
+        #     → sert au fine-tuning ET définit la normalisation (rho_min/max, v_max)
+        #   Appel 2 (ground truth): build_rho_v_tensors(nowcast_end+1j, end)
+        #     → chargé APRÈS inférence, uniquement pour évaluation post-hoc du TTC réel
+        #
+        # Invariant : global_rho_max/global_v_max (du checkpoint) et meta_obs
+        # (de la fenêtre d'observation) ne voient JAMAIS les données futures.
+
+        # Tableaux ground truth (vides si mode classique)
+        gt_x_km_arr: np.ndarray = np.array([], dtype=np.float32)
+        gt_t_arr:    np.ndarray = np.array([], dtype=np.float32)
+        gt_rho_arr:  np.ndarray = np.array([], dtype=np.float32)
+        nowcast_end_d: Optional[date] = None
+        obs_end_days: float = 0.0
+
         if args.start and args.end:
             start_d = date.fromisoformat(args.start)
-            end_d = date.fromisoformat(args.end)
+            end_d   = date.fromisoformat(args.end)
+            if end_d < start_d:
+                log.error(
+                    "Dates inversées : --start %s est postérieur à --end %s. "
+                    "Vérifiez vos arguments (ex: --end %s).",
+                    args.start, args.end,
+                    (start_d + timedelta(days=120)).isoformat()[:7] + "-28",
+                )
+                raise SystemExit(1)
+
+            # Résolution du mode nowcast
+            if args.nowcast_end is not None:
+                nowcast_end_d = date.fromisoformat(args.nowcast_end)
+                if nowcast_end_d >= end_d:
+                    log.error(
+                        "--nowcast-end (%s) doit être strictement antérieur à --end (%s) "
+                        "— il faut une fenêtre ground truth non vide.",
+                        nowcast_end_d, end_d,
+                    )
+                    raise SystemExit(1)
+                if nowcast_end_d <= start_d:
+                    log.error(
+                        "--nowcast-end (%s) doit être postérieur à --start (%s).",
+                        nowcast_end_d, start_d,
+                    )
+                    raise SystemExit(1)
+                obs_load_end = nowcast_end_d
+                obs_end_days = float((nowcast_end_d - start_d).days)
+                log.info(
+                    "Mode nowcast STRICT — observation [%s, %s] (%d j) | "
+                    "ground truth [%s, %s] (%d j)",
+                    start_d, nowcast_end_d, (nowcast_end_d - start_d).days,
+                    nowcast_end_d + timedelta(1), end_d,
+                    (end_d - nowcast_end_d - timedelta(1)).days + 1,
+                )
+            else:
+                obs_load_end = end_d
+
+            # Offset temps absolu (commun aux deux appels)
+            t_start_g = (start_d - EPOCH_DATE).days / T_DAYS_MAX
+
+            # ── Appel 1 : fenêtre d'observation ──────────────────────────────
             try:
-                X_raw, y_raw, meta_ep = build_rho_v_tensors(
-                    start_d, end_d, infer_meta["location"],
+                X_obs, y_obs, meta_obs = build_rho_v_tensors(
+                    start_d, obs_load_end, infer_meta["location"],
                     dx_km=infer_meta["dx_km"],
                     use_raw_velocity=True,
                 )
-                if len(X_raw) > 0:
-                    x_km = X_raw[:, 0] * infer_meta["channel_len_km"]
-                    t_start_g = (start_d - EPOCH_DATE).days / T_DAYS_MAX
-                    t_days = (X_raw[:, 1] - t_start_g) * T_DAYS_MAX
-                    episode_data = pd.DataFrame({"x_km": x_km, "t_days": t_days})
-                    # Denormaliser rho et v vers les unités physiques
-                    rho_range    = meta_ep["rho_max"] - meta_ep.get("rho_min", 0.0)
-                    raw_rho_arr  = (y_raw[:, 0] * rho_range + meta_ep.get("rho_min", 0.0)).astype(np.float32)
-                    raw_v_arr    = (y_raw[:, 1] * meta_ep["v_max"]).astype(np.float32)
-                    raw_x_km_arr = x_km.astype(np.float32)
-                    raw_t_arr    = t_days.astype(np.float32)
+                if len(X_obs) > 0:
+                    x_km_obs    = X_obs[:, 0] * infer_meta["channel_len_km"]
+                    t_days_obs  = (X_obs[:, 1] - t_start_g) * T_DAYS_MAX
+                    episode_data = pd.DataFrame({"x_km": x_km_obs, "t_days": t_days_obs})
+                    # Dénormalisation avec meta_obs uniquement (pas de leakage futur)
+                    rho_range_obs = meta_obs["rho_max"] - meta_obs.get("rho_min", 0.0)
+                    raw_rho_arr   = (y_obs[:, 0] * rho_range_obs + meta_obs.get("rho_min", 0.0)).astype(np.float32)
+                    raw_v_arr     = (y_obs[:, 1] * max(meta_obs["v_max"], 1e-8)).astype(np.float32)
+                    raw_x_km_arr  = x_km_obs.astype(np.float32)
+                    raw_t_arr     = t_days_obs.astype(np.float32)
+                    log.info(
+                        "Observation chargee: %d pts AIS | rho_max_obs=%.2f v/km | v_max_obs=%.2f kn",
+                        len(X_obs), meta_obs["rho_max"], meta_obs["v_max"],
+                    )
                 else:
-                    log.warning("Aucune donnée AIS dans la fenêtre d'inférence. Grille par défaut.")
+                    log.warning("Aucune donnée AIS dans la fenêtre d'observation. Grille par défaut.")
                     episode_data = pd.DataFrame({
                         "x_km": [0.0, infer_meta["channel_len_km"]],
-                        "t_days": [0.0, float((end_d - start_d).days)],
+                        "t_days": [0.0, float((obs_load_end - start_d).days)],
                     })
             except Exception as exc:
-                log.warning("Chargement des données d'inférence impossible (%s). Grille par défaut.", exc)
+                log.warning("Chargement AIS observation impossible (%s). Grille par défaut.", exc)
                 episode_data = pd.DataFrame({
                     "x_km": [0.0, infer_meta["channel_len_km"]],
                     "t_days": [0.0, 30.0],
                 })
+
+            # ── Appel 2 : ground truth (uniquement en mode nowcast) ───────────
+            # Chargé ICI mais utilisé uniquement APRÈS l'inférence pour évaluation.
+            # global_rho_max / fine-tuning ne touchent pas à ces données.
+            if nowcast_end_d is not None:
+                gt_start_d = nowcast_end_d + timedelta(days=1)
+                if gt_start_d <= end_d:
+                    try:
+                        X_gt, y_gt, meta_gt = build_rho_v_tensors(
+                            gt_start_d, end_d, infer_meta["location"],
+                            dx_km=infer_meta["dx_km"],
+                            use_raw_velocity=True,
+                        )
+                        if len(X_gt) > 0:
+                            x_km_gt   = X_gt[:, 0] * infer_meta["channel_len_km"]
+                            t_days_gt = (X_gt[:, 1] - t_start_g) * T_DAYS_MAX
+                            rho_range_gt = meta_gt["rho_max"] - meta_gt.get("rho_min", 0.0)
+                            gt_rho_arr   = (y_gt[:, 0] * rho_range_gt + meta_gt.get("rho_min", 0.0)).astype(np.float32)
+                            gt_x_km_arr  = x_km_gt.astype(np.float32)
+                            gt_t_arr     = t_days_gt.astype(np.float32)
+                            log.info(
+                                "Ground truth charge (evaluation post-hoc): %d pts AIS | [%s, %s]",
+                                len(X_gt), gt_start_d, end_d,
+                            )
+                        else:
+                            log.warning("Aucune donnée AIS dans la fenêtre ground truth.")
+                    except Exception as exc:
+                        log.warning("Chargement AIS ground truth impossible (%s).", exc)
         else:
             # Grille par défaut: chenal complet sur 30 jours
             episode_data = pd.DataFrame({
@@ -1750,27 +2155,64 @@ def main():
                 "t_days": [0.0, 30.0],
             })
 
-        # ── Fine-tuning optionnel ────────────────────────────────────────────
-        # Calcule t_max_days ici pour le passer aussi au fine-tuning
+        # ── Fenetre d'observation (--obs-days) + horizon de prediction ──────
+        #
+        # Workflow nowcasting :
+        #   1. Charger les N premiers jours de l'episode (--obs-days N)
+        #   2. Fine-tuner le PINN sur ces N jours (calibration)
+        #   3. Predire rho(x,t) jusqu'a --t-max-days (horizon futur)
+        #   4. Extraire le TTC depuis la courbe de resorption predite
+        #
+        # Sans --obs-days, tout le range --start/--end est utilise (mode classique).
+
+        ft_x_km  = raw_x_km_arr.copy()
+        ft_t_arr = raw_t_arr.copy()
+        ft_rho   = raw_rho_arr.copy()
+        ft_v     = raw_v_arr.copy()
+
+        if args.obs_days is not None and len(raw_t_arr) > 0:
+            obs_mask = raw_t_arr <= float(args.obs_days)
+            ft_x_km  = raw_x_km_arr[obs_mask]
+            ft_t_arr = raw_t_arr[obs_mask]
+            ft_rho   = raw_rho_arr[obs_mask]
+            ft_v     = raw_v_arr[obs_mask]
+            log.info(
+                "Fenetre d'observation : %d premiers jours | %d/%d points AIS retenus pour fine-tuning",
+                args.obs_days, int(obs_mask.sum()), len(raw_t_arr),
+            )
+
+        # Horizon de prediction
         t_max_days_infer = args.t_max_days
         if t_max_days_infer is None:
-            ep_t_max = float(episode_data["t_days"].max()) if len(episode_data) > 0 else 0.0
-            t_max_days_infer = ep_t_max * 1.2 + 1.0
+            if args.obs_days is not None:
+                # Nowcasting : predire sur 4x la fenetre d'observation (min 30 jours)
+                t_max_days_infer = max(float(args.obs_days) * 4.0, 30.0)
+                log.info(
+                    "Horizon de prediction : %.0f jours (4x fenetre obs. de %d j) "
+                    "— override avec --t-max-days",
+                    t_max_days_infer, args.obs_days,
+                )
+            else:
+                # Mode classique : legere extension au-dela des donnees observees
+                ep_t_max = float(episode_data["t_days"].max()) if len(episode_data) > 0 else 0.0
+                t_max_days_infer = ep_t_max * 1.2 + 1.0
 
-        if args.fine_tune:
-            if len(raw_x_km_arr) == 0:
+        # Fine-tuning : active par --fine-tune OU automatiquement si --obs-days
+        do_fine_tune = args.fine_tune or (args.obs_days is not None) or (nowcast_end_d is not None)
+        if do_fine_tune:
+            if len(ft_x_km) == 0:
                 log.warning(
-                    "Fine-tuning demande (--fine-tune) mais aucune donnee AIS disponible "
-                    "dans la fenetre --start/--end. Donnez --start et --end pour charger les donnees."
+                    "Fine-tuning demande mais aucune donnee AIS disponible "
+                    "(verifiez --start/--end et que les parquets AIS existent)."
                 )
             else:
                 log.info("=== FINE-TUNING sur l'evenement courant ===")
                 infer_model = fine_tune_on_episode(
                     model=infer_model,
-                    x_km=raw_x_km_arr,
-                    t_days=raw_t_arr,
-                    rho_physical=raw_rho_arr,
-                    v_physical=raw_v_arr,
+                    x_km=ft_x_km,
+                    t_days=ft_t_arr,
+                    rho_physical=ft_rho,
+                    v_physical=ft_v,
                     global_meta=infer_meta,
                     t_max_days=t_max_days_infer,
                     epochs=args.fine_tune_epochs,
@@ -1789,6 +2231,7 @@ def main():
         FEATURES_DIR.mkdir(parents=True, exist_ok=True)
         model_stem = Path(args.model).stem
         out_path = FEATURES_DIR / f"{model_stem}_profiles.parquet"
+        _force_unlink(out_path)
         profiles.to_parquet(out_path, index=False)
         log.info("Profils physiques sauvegardes -> %s", out_path)
 
@@ -1848,21 +2291,91 @@ def main():
             output_path=png_dir / "06_fundamental_diagram.png",
         )
 
-        ttc_str = f"{ttc_days:.1f} jours" if ttc_days is not None else "non atteint dans la fenetre"
-        print(f"\n=== Profils physiques (Etape 4b) ===")
-        print(f"  Grille:  {args.x_grid} x {args.t_grid} = {len(profiles)} points")
-        print(f"  Chenal:  {infer_meta['channel_len_km']:.1f} km")
-        print(f"  rho_hat: [{profiles['rho_hat'].min():.2f}, {profiles['rho_hat'].max():.2f}] vessels/km")
-        print(f"  v_hat:   [{profiles['v_hat'].min():.2f}, {profiles['v_hat'].max():.2f}] knots")
-        print(f"  TTC:     {ttc_str}")
-        print(f"  Parquet: {out_path}")
-        print(f"\n  Figures -> {png_dir}/")
-        print(f"    01_profiles_rho_v_q.png      (3 heatmaps rho / v / q)")
-        print(f"    02_clearance_ttc.png          (courbe resorption + TTC)")
-        print(f"    03_shockwave_lwr.png          (onde de choc LWR)")
-        print(f"    04_ais_vs_pinn.png            (AIS brut vs PINN lisse)")
-        print(f"    05_profiles_1d_slices.png     (coupes rho(x) a 6 instants)")
-        print(f"    06_fundamental_diagram.png    (diagramme fondamental Greenshields)")
+        # ── Plot 07 : validation nowcast (uniquement en mode --nowcast-end) ──
+        # Calcul du seuil TTC en unités physiques (coherent avec plot_congestion_clearance)
+        _rho_peak_pinn = float(
+            profiles.groupby("t_days")["rho_hat"].max().values.max()
+        ) if len(profiles) > 0 else 1.0
+        ttc_threshold_val = args.rho_threshold_frac * _rho_peak_pinn
+
+        ttc_actual: Optional[float] = None
+        if nowcast_end_d is not None:
+            ttc_actual = _compute_gt_ttc(gt_t_arr, gt_rho_arr, ttc_threshold_val)
+            plot_nowcast_validation(
+                profiles=profiles,
+                gt_t_days=gt_t_arr,
+                gt_rho_physical=gt_rho_arr,
+                obs_end_days=obs_end_days,
+                ttc_predicted=ttc_days,
+                ttc_actual=ttc_actual,
+                rho_threshold=ttc_threshold_val,
+                title_suffix=title_tag,
+                output_path=png_dir / "07_nowcast_validation.png",
+            )
+
+        # ── Résumé de prédiction ─────────────────────────────────────────────
+        sep = "=" * 62
+        print(f"\n{sep}")
+        print(f"  PINN LWR — PREDICTION DE RESORPTION | {location_label.upper()}")
+        print(sep)
+
+        if args.start and args.end:
+            print(f"  Periode          : {args.start}  ->  {args.end}")
+
+        if nowcast_end_d is not None:
+            print(f"  Mode             : NOWCAST STRICT (sans data leakage)")
+            print(f"  Observation      : {args.start}  ->  {nowcast_end_d}  ({obs_end_days:.0f} j)")
+            print(f"  Ground truth     : {nowcast_end_d + timedelta(1)}  ->  {args.end}")
+        elif args.obs_days is not None:
+            obs_end_d_disp = date.fromisoformat(args.start) + timedelta(days=args.obs_days)
+            print(f"  Mode             : nowcasting (--obs-days={args.obs_days})")
+            print(f"  Observation      : {args.start}  ->  {obs_end_d_disp}  ({args.obs_days} j)")
+        else:
+            print(f"  Mode             : reconstruction (periode complete observee)")
+        print(f"  Horizon          : {t_max_days_infer:.0f} jours depuis le debut")
+
+        print(f"\n  --- Diagnostic physique ---")
+        print(f"  Chenal     : {infer_meta['channel_len_km']:.1f} km")
+        print(f"  rho_hat    : [{profiles['rho_hat'].min():.2f}, {profiles['rho_hat'].max():.2f}] vessels/km")
+        print(f"  v_hat      : [{profiles['v_hat'].min():.2f}, {profiles['v_hat'].max():.2f}] knots")
+        print(f"  Seuil TTC  : {ttc_threshold_val:.2f} v/km  ({args.rho_threshold_frac*100:.0f}% du pic)")
+
+        print(f"\n  --- Time to Clear (TTC) ---")
+        if ttc_days is not None:
+            ttc_abs = ""
+            if args.start:
+                ttc_date = date.fromisoformat(args.start) + timedelta(days=int(ttc_days))
+                ttc_abs  = f"  (date estimee : {ttc_date})"
+            print(f"  TTC predit  = {ttc_days:.1f} j depuis l'onset{ttc_abs}")
+        else:
+            print(f"  TTC predit  = non atteint dans l'horizon de {t_max_days_infer:.0f} j")
+            print(f"               Relancer avec --t-max-days {int(t_max_days_infer * 2)}")
+
+        if nowcast_end_d is not None:
+            if ttc_actual is not None:
+                ttc_actual_date = date.fromisoformat(args.start) + timedelta(days=int(ttc_actual))
+                print(f"  TTC reel    = {ttc_actual:.1f} j depuis l'onset  (date : {ttc_actual_date})")
+            else:
+                print(f"  TTC reel    = non atteint dans la fenetre ground truth")
+            if ttc_days is not None and ttc_actual is not None:
+                err = abs(ttc_days - ttc_actual)
+                sign = "+" if ttc_days > ttc_actual else "-"
+                print(f"  Erreur      = {sign}{err:.1f} j  ({'sur-estime' if ttc_days > ttc_actual else 'sous-estime'})")
+            elif ttc_days is None and ttc_actual is not None:
+                remaining_horizon = ttc_actual - t_max_days_infer
+                print(f"  (horizon trop court : TTC reel a {ttc_actual:.1f}j, horizon={t_max_days_infer:.0f}j)")
+
+        print(f"\n  Parquet : {out_path}")
+        print(f"  Figures : {png_dir}/")
+        print(f"    01_profiles_rho_v_q.png       heatmaps rho / v / debit")
+        print(f"    02_clearance_ttc.png           courbe de resorption + TTC")
+        print(f"    03_shockwave_lwr.png           onde de choc LWR")
+        print(f"    04_ais_vs_pinn.png             AIS brut vs PINN lisse")
+        print(f"    05_profiles_1d_slices.png      coupes rho(x) a 6 instants")
+        print(f"    06_fundamental_diagram.png     diagramme fondamental")
+        if nowcast_end_d is not None:
+            print(f"    07_nowcast_validation.png     predit vs reel + erreur TTC")
+        print(sep)
 
 
 if __name__ == "__main__":
