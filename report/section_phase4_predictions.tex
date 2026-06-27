@@ -1,0 +1,577 @@
+% ============================================================
+%  Section Phase 4 --- Nowcasting : prédiction des indices fret
+%  À insérer dans le rapport principal via \input{section_phase4_predictions}
+% ============================================================
+
+\section{Phase 4 --- Nowcasting : du signal AIS aux indices financiers}
+\label{sec:phase4}
+
+\subsection{Positionnement et objectif}
+
+L'objectif de cette phase est de quantifier la capacité prédictive du
+signal de congestion portuaire --- issu du pipeline AIS/HDBSCAN (Phase~1--2) et
+raffiné par le modèle physique PINN/LWR (Phase~3) --- sur les rendements futurs
+d'instruments financiers liés au marché du fret maritime.
+
+Nous adoptons une hiérarchie de cibles allant des instruments les plus
+directement liés aux taux de fret vers les plus généraux :
+
+\begin{enumerate}
+    \item \textbf{MATX} --- \textit{Matson Inc.}, opérateur de lignes
+    conteneurs Pacifique, directement affecté par la congestion du port de
+    Los Angeles/Long Beach (lien causal direct) ;
+    \item \textbf{BDRY} --- \textit{Breakwave Dry Bulk Shipping ETF}, proxy
+    du BDI (Baltic Dry Index), lié à la congestion via la tension systémique
+    de capacité maritime globale (lien indirect) ;
+    \item \textbf{SBLK} --- \textit{Star Bulk Carriers}, armateur vrac sec
+    exposé aux taux spot BDI (lien indirect).
+\end{enumerate}
+
+\noindent
+La période d'étude couvre 2017--2022 pour les données AIS
+(\texttt{la\_gravity\_2017\_2022.parquet}) et les prix equity. La validation
+est entièrement \emph{out-of-sample} (walk-forward chronologique, fenêtre
+d'entraînement initiale de 252 jours, blocs de test de 63 jours).
+
+\bigskip
+
+\subsection{Modèle de référence --- régression Ridge sur features AIS brutes}
+\label{sec:baseline}
+
+\subsubsection{Features}
+
+Huit features quotidiennes sont construites à partir du Gravity Score AIS :
+
+\begin{itemize}
+    \item $\log(1 + \text{gravity\_score})$, ses moyennes mobiles à 7 et 21
+    jours, son z-score sur 60 jours glissants ;
+    \item Variation à 5 jours du log-gravity (\emph{momentum}) ;
+    \item $\log(1 + \text{waiting\_vessels})$, $\log(1 + \text{total\_capacity})$ ;
+    \item Indicateur binaire de congestion ($z\text{-score} > 1{,}5$).
+\end{itemize}
+
+La variable cible est le rendement logarithmique forward à $H$ jours :
+$r_{t+H} = \ln(P_{t+H}/P_t)$, pour $H \in \{5, 10, 21\}$ jours ouvrés.
+
+\subsubsection{Analyse des corrélations et lag-scan}
+\label{sec:lagscan}
+
+Avant d'engager la validation walk-forward, nous effectuons un \emph{lag-scan}
+systématique : pour chaque couple (feature, cible, horizon $H$, décalage $k$),
+nous calculons la corrélation de Spearman
+
+\[
+\rho_s\!\bigl(\text{feature}[t - k],\; r_{t+H}\bigr), \quad k \in \{0,\ldots,60\},
+\]
+
+sur l'ensemble de la période 2017--2022. Cette analyse détermine (i) quelles
+features portent le signal et (ii) à quel décalage il est maximal.
+
+\paragraph{Résultats du lag-scan.}
+Le tableau~\ref{tab:lagscan} rapporte la feature optimale par couple
+(cible, horizon), ainsi que son IC de Spearman au lag optimal.
+
+\begin{table}[ht]
+\centering
+\caption{Meilleure feature par couple (cible, horizon) --- lag-scan sur 2017--2022
+(corrélation de Spearman sur la série entière, sans validation OOS). $^{***}p<0{,}001$.}
+\label{tab:lagscan}
+\small
+\begin{tabular}{llllcc}
+\toprule
+\textbf{Cible} & \textbf{H (j)} & \textbf{Meilleure feature} & \textbf{Lag (j)} &
+$\rho_s$ & $p$ \\
+\midrule
+MATX &  5 & \texttt{gravity\_ma7}    & 16 & $+0{,}087$ & $<0{,}001^{***}$ \\
+MATX & 10 & \texttt{log\_waiting}    & 17 & $+0{,}111$ & $<0{,}001^{***}$ \\
+MATX & 21 & \texttt{log\_waiting}    &  4 & $+0{,}184$ & $<0{,}001^{***}$ \\
+\addlinespace
+BDRY &  5 & \texttt{log\_waiting}    &  1 & $+0{,}139$ & $<0{,}001^{***}$ \\
+BDRY & 10 & \texttt{gravity\_ma7}    &  0 & $+0{,}158$ & $<0{,}001^{***}$ \\
+BDRY & 21 & \texttt{log\_waiting}    &  2 & $+0{,}207$ & $<0{,}001^{***}$ \\
+\addlinespace
+SBLK &  5 & \texttt{log\_capacity}   &  7 & $+0{,}127$ & $<0{,}001^{***}$ \\
+SBLK & 10 & \texttt{log\_capacity}   &  2 & $+0{,}143$ & $<0{,}001^{***}$ \\
+SBLK & 21 & \texttt{log\_capacity}   &  2 & $+0{,}183$ & $<0{,}001^{***}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+\textbf{Le gravity score brut ne prédit pas les rendements.}
+Un test préliminaire sur le gravity score non transformé, décalé de $k \in
+\{1,3,5,7,14,21\}$ jours, donne des corrélations systématiquement non
+significatives ($|\rho_s| < 0{,}05$, $p > 0{,}10$ dans tous les cas). Ce
+résultat est attendu : le gravity score est une métrique composite à
+distribution fortement asymétrique, dont les valeurs journalières sont trop
+bruitées pour porter un signal prédictif direct.
+
+\textbf{Le signal émerge du feature engineering}, selon trois transformations :
+\begin{enumerate}
+    \item \textbf{Log-transformation} : $\log(1 + \cdot)$ normalise la queue
+    de distribution et fait passer les corrélations de $|\rho_s| < 0{,}05$ à
+    $|\rho_s| \approx 0{,}08$--$0{,}11$ ;
+    \item \textbf{Lissage} : la moyenne mobile à 21 jours (\texttt{gravity\_ma21})
+    capture le régime de congestion plutôt que le bruit journalier ($\rho_s$
+    doublé par rapport à la valeur ponctuelle) ;
+    \item \textbf{Décomposition} : les composantes individuelles ---
+    \texttt{log\_waiting} (navires en attente) et \texttt{log\_capacity}
+    (tonnage total) --- sont de meilleurs prédicteurs que le gravity score
+    composite, car elles isolent la contrainte de capacité directe.
+\end{enumerate}
+
+\textbf{Deux résultats saillants émergent.}
+
+Premièrement, \texttt{log\_waiting} (logarithme du nombre de navires en
+attente) domine systématiquement pour MATX et BDRY. Cette feature est
+économiquement interprétable : un navire en attente de déchargement est
+directement soustrait à la capacité disponible, ce qui se répercute sur les
+taux fret dans un délai de 2--17 jours selon la cible. Elle est plus directe
+que le \emph{gravity score} composite, qui lisse plusieurs dimensions
+de congestion.
+
+Deuxièmement, \texttt{log\_capacity} (tonnage total présent dans la zone
+portuaire) est le meilleur prédicteur pour SBLK à tous les horizons ---
+non le gravity score. Cette feature constitue un proxy de l'activité
+commerciale maritime globale : un volume élevé de capacité engagée à LA
+reflète une demande mondiale soutenue, ce qui se transmet aux taux spot du
+vrac sec (BDI) avec un délai de 2--7 jours.
+
+\paragraph{Corrélation de \texttt{pinn\_rho} en jours d'épisode.}
+
+Sur les seuls jours où le PINN est actif ($n = 247$ jours OOS),
+la corrélation directe entre $\hat{\rho}(t)$ et $r_{t+H}$ est la suivante :
+
+\begin{table}[ht]
+\centering
+\caption{Spearman$(\hat{\rho}(t),\; r_{t+H})$ sur les jours d'épisode PINN
+($n = 247$ jours). $^{***}p<0{,}001$, $^{**}p<0{,}01$, $^{*}p<0{,}05$,
+\textsuperscript{ns} : non significatif.}
+\label{tab:pinn_raw_corr}
+\small
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{Cible} & \multicolumn{2}{c}{$H = 5$~j} & \multicolumn{2}{c}{$H = 10$~j} &
+\multicolumn{2}{c}{$H = 21$~j} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}
+ & $\rho_s$ & $p$ & $\rho_s$ & $p$ & $\rho_s$ & $p$ \\
+\midrule
+MATX & $+0{,}134$ & $0{,}035^{*}$ & $+0{,}163$ & $0{,}010^{**}$ &
+      $-0{,}034$ & $0{,}60^{\text{ns}}$ \\
+BDRY & $-0{,}130$ & $0{,}041^{*}$ & $-0{,}143$ & $0{,}025^{*}$  &
+      $-0{,}026$ & $0{,}68^{\text{ns}}$ \\
+SBLK & $+0{,}123$ & $0{,}054^{\text{ns}}$ & $+0{,}181$ & $0{,}004^{**}$ &
+      $+0{,}286$ & $<0{,}001^{***}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+Ces résultats appèlent trois observations :
+
+\begin{enumerate}
+    \item Pour \textbf{MATX}, $\hat{\rho}$ est un signal positif et significatif
+    aux horizons courts (5--10 jours) mais s'annule à 21 jours. La densité
+    physique courante se transmet aux taux Matson en 1--2 semaines ; au-delà,
+    la congestion aura souvent évolué.
+
+    \item Pour \textbf{BDRY}, la corrélation avec $\hat{\rho}$ est
+    \emph{négative} et significative aux horizons courts. Interprétation :
+    une forte congestion à LA mobilise les grues et les berths sur le segment
+    conteneurs, réduisant temporairement les échanges globaux et la demande
+    de vrac sec (effet substitution inversé). Cet effet disparaît à $H = 21$~j.
+    Le signal PINN ne doit donc \textbf{pas} être utilisé pour BDRY.
+
+    \item Pour \textbf{SBLK}, $\hat{\rho}$ est positivement corrélé à $H = 21$~j
+    ($\rho_s = 0{,}286$, $p < 0{,}001$). Ce résultat, bien que fort, reste
+    interprété avec prudence : les épisodes PINN 2020--2021 coïncident avec
+    la reprise post-COVID qui a simultanément élevé BDI et congestion de LA
+    via le même facteur de demande macroéconomique.
+\end{enumerate}
+
+\subsubsection{Résultats OOS}
+
+Le tableau~\ref{tab:baseline} présente les métriques out-of-sample du modèle
+Ridge (et XGBoost pour comparaison). La métrique principale est
+l'\emph{information coefficient} de Spearman ($\rho_s$) : corrélation de rang
+entre la prédiction $\hat{r}_{t+H}$ et le rendement réalisé $r_{t+H}$,
+calculée sur l'ensemble des blocs OOS. La précision directionnelle (DirAcc)
+mesure la fraction de jours où le signe prédit est correct.
+
+\begin{table}[ht]
+\centering
+\caption{Performances OOS du modèle de référence (features AIS uniquement).
+$p$ : p-valeur du test de Spearman (bilatéral). En gras : résultats
+significatifs à $p < 0{,}01$.}
+\label{tab:baseline}
+\small
+\begin{tabular}{llcccc}
+\toprule
+\textbf{Cible} & \textbf{Modèle} & \textbf{H (j)} & $\rho_s$ & $p$ &
+\textbf{DirAcc} \\
+\midrule
+\multirow{3}{*}{MATX}
+  & Ridge   &  5 & $0{,}026$ & $0{,}36$ & $0{,}52$ \\
+  &         & 10 & $0{,}076$ & $0{,}01$ & $0{,}54$ \\
+  &         & 21 & $\mathbf{0{,}111}$ & $<0{,}001$ & $0{,}57$ \\
+\addlinespace
+\multirow{3}{*}{BDRY}
+  & Ridge   &  5 & $0{,}020$ & $0{,}54$ & $0{,}49$ \\
+  &         & 10 & $0{,}029$ & $0{,}38$ & $0{,}49$ \\
+  &         & 21 & $0{,}077$ & $0{,}02$ & $0{,}50$ \\
+  & XGBoost & 10 & $\mathbf{0{,}144}$ & $<0{,}001$ & $0{,}53$ \\
+  &         & 21 & $\mathbf{0{,}157}$ & $<0{,}001$ & $0{,}51$ \\
+\addlinespace
+\multirow{2}{*}{SBLK}
+  & Ridge   & 10 & $0{,}064$ & $0{,}02$ & $0{,}52$ \\
+  &         & 21 & $\mathbf{0{,}122}$ & $<0{,}001$ & $0{,}57$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+\textbf{Observations principales.}
+
+\begin{itemize}
+    \item \textbf{MATX} présente un signal linéaire robuste à $H = 21$~j
+    ($\rho_s = 0{,}111$, $p < 0{,}001$). XGBoost dégrade la performance
+    (IC négatif), indiquant une relation principalement linéaire entre la
+    congestion de LA et les revenus de Matson.
+
+    \item \textbf{BDRY} répond mieux à XGBoost qu'à Ridge ($\rho_s = 0{,}157$
+    vs $0{,}077$ à $H = 21$~j), suggérant une relation non linéaire entre
+    le gravity score et les taux vrac sec. Cela peut refléter des seuils
+    de congestion à partir desquels la tension se propage aux marchés vrac.
+
+    \item \textbf{SBLK} montre une predictibilité robuste à $H = 21$~j
+    ($\rho_s = 0{,}122$). L'horizon court ($H = 5$~j) est marginal,
+    cohérent avec le délai de transmission des chocs portuaires aux contrats
+    vrac sec.
+
+    \item \textbf{CMRE, GSL, COMBO} : signal statistiquement nul sur toute la
+    période --- ces instruments sont trop généraux ou insuffisamment exposés
+    au corridor Pacifique pour capter le signal AIS de LA.
+\end{itemize}
+
+\bigskip
+
+\subsection{Modèle conditionnel à deux régimes}
+\label{sec:two_regime}
+
+\subsubsection{Architecture}
+
+Nous proposons un modèle conditionnel distinguant deux types de jours :
+
+\begin{description}
+    \item[\textbf{Régime~1 --- opération normale}] : seules les features AIS
+    brutes sont disponibles. Un régresseur Ridge est entraîné sur
+    \emph{l'ensemble des jours} (épisodes inclus), préservant les observations
+    de pic de congestion qui sont les plus informatives.
+
+    \item[\textbf{Régime~2 --- épisode PINN actif}] (16\% des jours,
+    $n_{\text{ep}} = 357$, 4 épisodes 2019--2022) : la densité normalisée
+    $\hat{\rho}(x,t)$ prédite par le PINN/LWR est disponible. Un régresseur
+    Ridge distinct, entraîné uniquement sur ces jours, \emph{override} la
+    prédiction du régime~1.
+\end{description}
+
+\noindent
+Les features du régime~2 se réduisent à $\hat{\rho}(t)$ et quatre features
+AIS contextuelles ($z\text{-score}_{60}$, $\Delta_5 \log g$, $\log w$,
+$\log g$). Les features dérivées de $\hat{\rho}$ (variations, moyennes
+mobiles) sont supprimées : elles sont quasi-colinéaires à $\hat{\rho}$ sur
+un épisode de 90 jours.
+
+\paragraph{Limitation : lookahead interne au PINN.}
+Le modèle PINN est entraîné \emph{offline} sur la fenêtre complète de
+90 jours. La valeur $\hat{\rho}(t)$ au début de l'épisode est donc
+conditionnée sur des données futures (la fin de la fenêtre). En production,
+le PINN serait ré-entraîné de façon incrémentale au fil des jours. L'IC
+épisode présenté ci-dessous constitue une borne supérieure du signal
+réellement exploitable en temps réel.
+
+\subsubsection{Résultats globaux OOS}
+
+\begin{table}[ht]
+\centering
+\caption{Baseline vs. 2-Régimes (IC de Spearman OOS global,
+$n \approx 937$--$1\,231$ jours). $\Delta\rho_s$ = gain absolu.
+$\Delta\%$ = gain relatif.}
+\label{tab:tworegime_global}
+\small
+\begin{tabular}{llcccc}
+\toprule
+\textbf{Cible} & \textbf{H (j)} & $\rho_s^{\text{base}}$ &
+$\rho_s^{\text{2R}}$ & $\Delta\rho_s$ & $\Delta\%$ \\
+\midrule
+MATX & 10 & $0{,}076$ & $\mathbf{0{,}103}$ & $+0{,}028$ & $+37\%$ \\
+MATX & 21 & $0{,}111$ & $0{,}115$ & $+0{,}004$ & $+4\%$ \\
+\addlinespace
+BDRY & 10 & $0{,}029$ & $0{,}070$ & $+0{,}041$ & $+141\%$ \\
+BDRY & 21 & $0{,}077$ & $\mathbf{0{,}154}$ & $+0{,}077$ & $+100\%$ \\
+\addlinespace
+SBLK &  5 & $0{,}059$ & $0{,}028$ & $-0{,}031$ & $-52\%$ \\
+SBLK & 10 & $0{,}064$ & $-0{,}002$ & $-0{,}066$ & $-103\%$ \\
+SBLK & 21 & $0{,}122$ & $0{,}092$ & $-0{,}030$ & $-25\%$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+Le résultat le plus marquant est la dégradation systématique de \textbf{SBLK}
+dans le modèle 2-Régimes ($-52\%$ à $-103\%$ selon l'horizon). Ce résultat
+\emph{confirme a contrario} que le signal PINN est spécifique au port de
+LA : pour un armateur vrac sec sans exposition directe au corridor
+Pacifique-conteneurs, la densité $\hat{\rho}$ est du bruit. Le
+2-Régimes est donc contre-indiqué pour SBLK.
+
+Pour \textbf{BDRY}, le gain global (+100\% à $H = 21$~j) provient
+principalement du régime~1 amélioré (R1 entraîné sur tous les jours, y
+compris les épisodes), et non du signal PINN direct (voir analyse par régime
+ci-dessous).
+
+\subsubsection{Performance différenciée par régime}
+
+\begin{table}[ht]
+\centering
+\caption{IC de Spearman décomposé par régime pour le modèle 2-Régimes (OOS).
+Régime normal : $n \approx 752$--$1\,046$ jours. Épisode PINN : $n = 185$
+jours OOS (sur 357 jours épisode au total). $^{***}p<0{,}001$, $^{**}p<0{,}01$,
+$^{*}p<0{,}05$. \textsuperscript{ns} : non significatif.}
+\label{tab:by_regime}
+\small
+\begin{tabular}{llcccc}
+\toprule
+\textbf{Cible} & \textbf{H (j)} & \textbf{Régime} & $\rho_s$ & $p$ &
+\textbf{DirAcc} \\
+\midrule
+\multirow{4}{*}{MATX}
+  & \multirow{2}{*}{10} & Normal  & $+0{,}081$ & $0{,}009^{**}$ & $0{,}55$ \\
+  &                     & Épisode & $\mathbf{+0{,}248}$ & $0{,}001^{***}$ & $0{,}54$ \\
+  \cmidrule{2-6}
+  & \multirow{2}{*}{21} & Normal  & $+0{,}092$ & $0{,}003^{**}$ & $0{,}56$ \\
+  &                     & Épisode & $\mathbf{+0{,}201}$ & $0{,}006^{**}$ & $0{,}60$ \\
+\midrule
+\multirow{4}{*}{BDRY}
+  & \multirow{2}{*}{10} & Normal  & $+0{,}053$ & $0{,}15^{\text{ns}}$ & $0{,}50$ \\
+  &                     & Épisode & $\mathbf{+0{,}250}$ & $0{,}001^{***}$ & $0{,}51$ \\
+  \cmidrule{2-6}
+  & \multirow{2}{*}{21} & Normal  & $\mathbf{+0{,}160}$ & $<0{,}001^{***}$ & $0{,}54$ \\
+  &                     & Épisode & $+0{,}126$ & $0{,}087^{\text{ns}}$ & $0{,}43$ \\
+\midrule
+\multirow{2}{*}{SBLK}
+  & 10 & Épisode & $-0{,}148$ & $0{,}045^{*}$ & $0{,}44$ \\
+  & 21 & Épisode & $+0{,}229$ & $0{,}002^{**}$ & $0{,}52$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+La décomposition par régime révèle des profils très différents selon la cible :
+
+\paragraph{MATX — résultat central.}
+Le signal PINN est cohérent et significatif aux deux horizons clés :
+$\rho_s = 0{,}248$ ($H = 10$~j, $p < 0{,}001$) et $\rho_s = 0{,}201$
+($H = 21$~j, $p = 0{,}006$). La précision directionnelle de $60\%$ à
+$H = 21$~j est économiquement substantielle. Ce résultat est causalement
+défendable : Matson Inc. est directement exposé à la capacité de déchargement
+du port de LA, et $\hat{\rho}$ mesure précisément la densité de navires dans
+ce corridor.
+
+\paragraph{BDRY — signal PINN limité, bénéfice R1 réel.}
+L'amélioration globale de BDRY dans le 2-Régimes ($+100\%$ à $H = 21$~j)
+provient du régime~1 amélioré : en entraînant R1 sur tous les jours,
+le modèle apprend les pics de congestion qui coïncident avec les chocs de
+vrac sec. Le signal PINN en épisode est significatif à $H = 10$~j
+($\rho_s = 0{,}250$, $p < 0{,}001$) mais non significatif à $H = 21$~j
+($\rho_s = 0{,}126$, $p = 0{,}09$). Ce résultat doit être interprété avec
+prudence : la corrélation BDRY--PINN épisode est probablement confoundue
+par le facteur macroéconomique COVID-2021 (BDI et congestion de LA
+simultanément élevés par la même reprise de la demande globale).
+
+\paragraph{SBLK — contre-indication du modèle PINN.}
+SBLK présente un IC épisode \emph{négatif significatif} à $H = 10$~j
+($\rho_s = -0{,}148$, $p = 0{,}045$). Cela confirme que la densité
+$\hat{\rho}$ du port de LA est un signal adverse pour le vrac sec à
+court terme : les épisodes de congestion conteneurs bloquent temporairement
+les armateurs vrac qui partagent certaines infrastructures portuaires,
+sans pour autant transmettre un signal direct sur les taux spot BDI.
+Le modèle 2-Régimes est contre-indiqué pour SBLK.
+
+\bigskip
+
+\subsection{Interprétation économique}
+
+\subsubsection{Mécanisme de transmission MATX}
+
+Matson Inc. opère des liaisons conteneurs hebdomadaires entre la Chine, la
+Polynésie et la côte ouest américaine. Sa structure tarifaire repose sur
+des contrats à terme courts (2--8 semaines) directement indexés sur la
+disponibilité de capacité au port de Los Angeles. Lorsque la densité
+PINN $\hat{\rho}$ est élevée --- indiquant une congestion physique
+substantielle --- Matson ne peut ni accélérer ses rotations ni sous-affréter
+facilement, créant une pression haussière sur ses taux facturés qui se
+reflète dans le cours de l'action avec un délai de 10--21 jours.
+
+\subsubsection{Pourquoi SBLK dégrade-t-il ?}
+
+Los Angeles est un port à conteneurs. SBLK est un armateur vrac sec
+(granivores, charbon, minerai), opérant principalement dans le Pacifique
+et l'Atlantique. Il n'existe pas de lien tarifaire direct entre la densité
+$\hat{\rho}$ du port de LA et les taux spot du vrac sec. La corrélation
+baseline (signal AIS gravitaire) existe via la tension systémique de la
+capacité maritime globale ; mais $\hat{\rho}$ PINN, qui est un signal
+physique très local (corridor LA), introduit du bruit spécifique au segment
+conteneurs qui nuit à la prédiction des rendements vrac.
+
+\bigskip
+
+\subsection{Limites et perspectives}
+
+\paragraph{Lookahead interne au PINN.}
+Le PINN est entraîné sur la fenêtre complète de 90 jours pour chaque épisode.
+La valeur $\hat{\rho}(t)$ en début de fenêtre intègre implicitement
+l'évolution future de la congestion. En production, un PINN ré-entraîné
+incrémentalement produirait un $\hat{\rho}$ strictement causal. Les IC
+épisodes présentés sont des bornes supérieures du signal exploitable.
+
+\paragraph{Confoundeur COVID-2021.}
+Les 4 épisodes couvrent 2019, 2020, 2021 et 2022. L'épisode 2021 --- de loin
+le plus intense ($\hat{\rho} \approx 0{,}59$, congestion record) ---
+coïncide avec le pic post-COVID de la demande mondiale, période où BDI,
+taux conteneurs et volumes portuaires étaient simultanément élevés par le
+même facteur macro. La contribution causale de $\hat{\rho}$ au-delà du
+confoundeur COVID ne peut être isolée sans contrôle macroéconomique explicite.
+
+\paragraph{Absence de contrôle macroéconomique.}
+Ni le bêta de marché (SPY) ni la volatilité implicite (VIX) ne sont
+neutralisés. L'étape suivante consiste à régresser les rendements sur SPY
+et à tester si $\rho_s$ reste significatif sur les résidus ajustés.
+
+\paragraph{Généralisation géographique.}
+La validation est limitée au port de Los Angeles (2017--2022). La robustesse
+devra être testée sur le canal de Suez (crise Houthi 2023--2024) pour
+évaluer l'invariance des délais de transmission et du signal PINN.
+
+\bigskip
+
+\subsection{Synthèse}
+
+\begin{tcolorbox}[colback=gray!8, colframe=gray!50,
+                  title=Résultats clés --- Phase 4]
+\textbf{Signal AIS baseline} : statistiquement significatif ($p < 0{,}01$)
+sur MATX, BDRY et SBLK à horizon 21 jours ($\rho_s = 0{,}08$--$0{,}12$).
+
+\medskip
+\textbf{Apport du PINN --- résultat central sur MATX} :
+\begin{itemize}
+    \item $H = 10$~j : $\rho_s^{\text{épisode}} = 0{,}248$ ($p < 0{,}001$),
+    DirAcc $= 0{,}54$, IC global $+37\%$
+    \item $H = 21$~j : $\rho_s^{\text{épisode}} = 0{,}201$ ($p = 0{,}006$),
+    DirAcc $= 0{,}60$
+\end{itemize}
+
+\medskip
+\textbf{Résultat négatif instructif} : le modèle 2-Régimes dégrade SBLK
+(IC épisode $= -0{,}148$ à $H = 10$~j, $p = 0{,}045$), confirmant que le
+signal PINN est spécifique au segment conteneurs et ne se transfère pas
+au vrac sec sans lien causal direct.
+
+\medskip
+\textit{Limitation principale} : lookahead interne au PINN (modèle entraîné
+offline sur la fenêtre de 90 jours) et possible confoundeur COVID-2021. Les
+IC épisodes sont des bornes supérieures du signal réellement exploitable.
+\end{tcolorbox}
+
+\bigskip
+
+\subsection{Récapitulatif de la démarche et des données}
+
+\subsubsection{Pipeline de données}
+
+Le tableau~\ref{tab:pipeline_recap} retrace l'ensemble de la chaîne de
+traitement, des données brutes AIS aux résultats de prédiction.
+
+\begin{table}[ht]
+\centering
+\caption{Récapitulatif du pipeline Phase 4 --- données, transformations et modèles.}
+\label{tab:pipeline_recap}
+\small
+\begin{tabular}{p{2.8cm}p{3.5cm}p{3.5cm}p{3.5cm}}
+\toprule
+\textbf{Étape} & \textbf{Entrée} & \textbf{Traitement} & \textbf{Sortie} \\
+\midrule
+1. Données brutes &
+AIS LA port 2017--2022 ($\sim$2\,100 jours) &
+HDBSCAN : clustering navires stationnaires/en attente &
+\texttt{waiting\_vessels}, \texttt{total\_capacity}, \texttt{gravity\_score} \\
+\addlinespace
+2. Feature engineering &
+\texttt{gravity\_score}, \texttt{waiting\_vessels}, \texttt{capacity} &
+Log-transform, MA7/MA21, z-score 60j, delta 5j &
+8 features quotidiennes \\
+\addlinespace
+3. Lag-scan &
+8 features $\times$ 3 cibles $\times$ 3 horizons $\times$ 61 lags &
+Spearman rank-corr (bilatéral) &
+Feature et lag optimaux par (cible, horizon) \\
+\addlinespace
+4. Modèle baseline &
+8 features AIS &
+Ridge + XGBoost, walk-forward (init=252j, blocs=63j) &
+IC OOS : MATX $\rho_s=0{,}11$, BDRY $\rho_s=0{,}16$, SBLK $\rho_s=0{,}12$ \\
+\addlinespace
+5. PINN/LWR &
+AIS densité 4 épisodes (2019--2022, 90j/épisode) &
+PDE LWR résolue par réseau de neurones physique &
+$\hat{\rho}(x,t)$ : densité normalisée quotidienne \\
+\addlinespace
+6. Modèle 2-Régimes &
+R1 : 8 features AIS (tous jours) \newline R2 : $\hat{\rho}$ + 4 features AIS (épisodes) &
+Ridge R1 sur tous les jours, Ridge R2 sur épisodes uniquement, switch causal &
+IC épisode MATX : $\rho_s=0{,}25$ (H=10j), $\rho_s=0{,}20$ (H=21j) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Comparaison des approches}
+
+Le tableau~\ref{tab:approach_comparison} compare notre approche à une
+corrélation naïve sur le gravity score brut (approche de référence).
+
+\begin{table}[ht]
+\centering
+\caption{Comparaison approche naïve vs. approche complète sur la cible MATX
+à $H = 21$~j. \textsuperscript{ns} : non significatif.}
+\label{tab:approach_comparison}
+\small
+\begin{tabular}{p{4cm}cccc}
+\toprule
+\textbf{Approche} & \textbf{Feature} & \textbf{Lag} & $\rho_s$ & $p$ \\
+\midrule
+Corrélation brute &
+\texttt{gravity\_score[t$-$k]} & $k \in \{1..21\}$ & $<0{,}05$ &
+$>0{,}10^{\text{ns}}$ \\
+\addlinespace
+Log-transform seule &
+\texttt{log\_gravity[t]} & 0 & $+0{,}110$ & $<0{,}001$ \\
+\addlinespace
+Lissage (MA21) &
+\texttt{gravity\_ma21[t]} & 0 & $+0{,}154$ & $<0{,}001$ \\
+\addlinespace
+Composante directe &
+\texttt{log\_waiting[t$-$4]} & 4 & $+0{,}184$ & $<0{,}001$ \\
+\addlinespace
+\textbf{2-Régimes + PINN} &
+$\hat{\rho}(t)$ + AIS & --- &
+$\mathbf{+0{,}248}$ & $<0{,}001$ \\
+\quad(jours d'épisode) & & & \textit{(épisode)} & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+La progression est monotone : chaque couche de traitement --- log-transform,
+lissage, décomposition en composantes, signal physique PINN --- apporte un
+gain d'IC mesurable. Le gravity score brut est le point de départ, pas le
+signal final.

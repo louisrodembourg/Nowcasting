@@ -124,6 +124,7 @@ def _detect_episode_ranges(
     gravity_df: pl.DataFrame,
     threshold: float,
     min_days: int,
+    pad_days: int = 0,
 ) -> list[tuple[date, date, float]]:
     """
     Parcourt la série de gravity score et retourne les plages
@@ -131,18 +132,26 @@ def _detect_episode_ranges(
 
     Un épisode est une suite continue de jours où gravity_score >= threshold,
     d'une durée d'au moins min_days jours.
+
+    pad_days > 0 étend chaque épisode au-delà du seuil de déclenchement pour
+    inclure la phase de récupération — indispensable pour que le PINN apprenne
+    la décroissance de densité et puisse estimer un TTC réaliste.
     """
     sorted_df = gravity_df.sort("date")
+    all_dates = [
+        date.fromisoformat(row["date"]) if isinstance(row["date"], str) else row["date"]
+        for row in sorted_df.iter_rows(named=True)
+    ]
+    last_date = all_dates[-1] if all_dates else None
+
     episodes: list[tuple[date, date, float]] = []
     in_run = False
     run_start: Optional[date] = None
     trigger_score = 0.0
-    last_date: Optional[date] = None
 
     for row in sorted_df.iter_rows(named=True):
         d = date.fromisoformat(row["date"]) if isinstance(row["date"], str) else row["date"]
         score = float(row["gravity_score"])
-        last_date = d
 
         if not in_run and score >= threshold:
             in_run = True
@@ -150,9 +159,14 @@ def _detect_episode_ranges(
             trigger_score = score
 
         elif in_run and score < threshold:
-            run_end = d - timedelta(days=1)
-            if (run_end - run_start).days + 1 >= min_days:
-                episodes.append((run_start, run_end, trigger_score))
+            congestion_end = d - timedelta(days=1)
+            if (congestion_end - run_start).days + 1 >= min_days:
+                # Extend episode to include recovery tail
+                if pad_days > 0 and last_date is not None:
+                    padded_end = min(congestion_end + timedelta(days=pad_days), last_date)
+                else:
+                    padded_end = congestion_end
+                episodes.append((run_start, padded_end, trigger_score))
             in_run = False
 
     # Fermer un épisode qui s'étend jusqu'à la fin de la série
@@ -172,6 +186,7 @@ def structure_episodes(
     constituent_path: Optional[Path] = None,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    pad_days: int = 0,
 ) -> tuple[list[Episode], dict]:
     """
     Étape 1 — Découpe les données en épisodes de disruption et extrait
@@ -217,7 +232,7 @@ def structure_episodes(
         len(gravity_df), period_str, gravity_path,
     )
 
-    date_ranges = _detect_episode_ranges(gravity_df, gravity_threshold, min_episode_days)
+    date_ranges = _detect_episode_ranges(gravity_df, gravity_threshold, min_episode_days, pad_days=pad_days)
     if not date_ranges:
         log.warning(
             "Aucun épisode trouvé (threshold=%.2f, min_days=%d). Essayez un seuil plus bas.",
@@ -370,7 +385,10 @@ def train_on_episodes(
     n_colloc: int = N_COLLOC,
     colloc_refresh: int = COLLOC_REFRESH,
     model_name: Optional[str] = None,
-) -> tuple[LWRPINN, list[float]]:
+    warmup_epochs: int = 0,
+    n_freqs: int = 0,
+    fourier_sigma: float = 1.0,
+) -> tuple[LWRPINN, dict]:
     """
     Étape 4a — Entraîne le PINN conjointement sur tous les épisodes historiques.
 
@@ -415,13 +433,20 @@ def train_on_episodes(
         len(x_data), len(episodes),
     )
 
-    model = LWRPINN(hidden_layers=4, hidden_size=64).to(device)
+    model = LWRPINN(
+        hidden_layers=4, hidden_size=64, n_freqs=n_freqs, fourier_sigma=fourier_sigma
+    ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=200, factor=0.5)
 
+    if n_freqs > 0:
+        log.info("Fourier embedding actif: n_freqs=%d, sigma=%.2f", n_freqs, fourier_sigma)
+    if warmup_epochs > 0:
+        log.info("Curriculum learning: warmup sur %d époques", warmup_epochs)
+
     best_loss = float("inf")
     best_state = None
-    history: list[float] = []
+    history: dict = {"total": [], "data": [], "pde": [], "kin": []}
 
     # Tirage initial des points de collocation (feuilles requises pour autograd)
     x_col = torch.rand(n_colloc, 1, device=device, requires_grad=True)
@@ -434,14 +459,23 @@ def train_on_episodes(
             x_col = torch.rand(n_colloc, 1, device=device, requires_grad=True)
             t_col = torch.rand(n_colloc, 1, device=device, requires_grad=True)
 
+        # Curriculum learning: ramp physics weights from 0 to lambda over warmup_epochs
+        if warmup_epochs > 0:
+            ramp = min(1.0, epoch / warmup_epochs)
+            lambda_pde_eff = lambda_pde * ramp
+            lambda_kin_eff = lambda_kin * ramp
+        else:
+            lambda_pde_eff = lambda_pde
+            lambda_kin_eff = lambda_kin
+
         optimizer.zero_grad()
 
         loss, comps = total_loss(
             model,
             x_data, t_data, rho_obs, v_obs,
             x_col, t_col,
-            lambda_pde=lambda_pde,
-            lambda_kin=lambda_kin,
+            lambda_pde=lambda_pde_eff,
+            lambda_kin=lambda_kin_eff,
         )
 
         loss.backward()
@@ -449,7 +483,10 @@ def train_on_episodes(
         optimizer.step()
         scheduler.step(loss)
 
-        history.append(comps["total"])
+        history["total"].append(comps["total"])
+        history["data"].append(comps["data"])
+        history["pde"].append(comps["pde"])
+        history["kin"].append(comps["kin"])
 
         if comps["total"] < best_loss:
             best_loss = comps["total"]
@@ -480,6 +517,8 @@ def train_on_episodes(
             "epochs": epochs,
             "n_episodes": len(episodes),
             "episode_ids": [ep.episode_id for ep in episodes],
+            "n_freqs": n_freqs,
+            "fourier_sigma": fourier_sigma,
         },
         save_path,
     )
@@ -1315,7 +1354,8 @@ def plot_fundamental_diagram(
 
 def plot_congestion_clearance(
     profiles: pd.DataFrame,
-    rho_threshold_frac: float = 0.3,
+    rho_threshold_frac: float = 0.7,
+    ttc_metric: str = "mean",
     title_suffix: str = "",
     output_path: Optional[Path] = None,
 ) -> tuple[Path, Optional[float]]:
@@ -1341,14 +1381,18 @@ def plot_congestion_clearance(
     Parameters
     ----------
     profiles            : DataFrame issu de extract_physical_profiles
-    rho_threshold_frac  : fraction du pic initial définissant le seuil de
-                          retour à la normale (défaut 0.3 = 30%)
+    rho_threshold_frac  : fraction du niveau initial définissant le retour à la normale.
+                          Avec ttc_metric="mean" (défaut), 0.7 = congestion réduite à 70%
+                          de son niveau initial en densité moyenne.
+    ttc_metric          : 'mean' (défaut) ou 'max'.
+                          'mean' = moyenne spatiale — charge globale du canal (recommandé).
+                          'max'  = maximum spatial — correspond à la queue côté port (toujours élevé).
     title_suffix        : texte ajouté au titre
-    output_path         : chemin HTML de sortie
+    output_path         : chemin de sortie
 
     Returns
     -------
-    (path_html, ttc_days)  — ttc_days est None si non atteint dans la fenêtre
+    (path_png, ttc_days)  — ttc_days est None si non atteint dans la fenêtre
     """
     try:
         import plotly.graph_objects as go
@@ -1356,22 +1400,30 @@ def plot_congestion_clearance(
     except ImportError:
         raise ImportError("plotly requis: pip install plotly")
 
-    # ── Courbe de résorption: max_x ρ(x,t) ──────────────────────────────────
-    t_series = (
-        profiles.groupby("t_days")["rho_hat"]
-        .max()
-        .reset_index()
-        .sort_values("t_days")
-    )
-    t_vals_c = t_series["t_days"].values
-    rho_max_t = t_series["rho_hat"].values
+    # ── Courbe de résorption ─────────────────────────────────────────────────
+    # Compute both max and mean across x at each t
+    t_grp = profiles.groupby("t_days")["rho_hat"]
+    t_max_series  = t_grp.max().reset_index().sort_values("t_days")
+    t_mean_series = t_grp.mean().reset_index().sort_values("t_days")
 
-    rho_peak = float(rho_max_t[0]) if len(rho_max_t) > 0 else 1.0
+    t_vals_c  = t_max_series["t_days"].values
+    rho_max_t = t_max_series["rho_hat"].values
+    rho_mean_t= t_mean_series["rho_hat"].values
+
+    # Select the primary metric for TTC
+    if ttc_metric == "mean":
+        rho_primary = rho_mean_t
+        metric_label = "mean_x ρ(x,t)"
+    else:
+        rho_primary = rho_max_t
+        metric_label = "max_x ρ(x,t)"
+
+    rho_peak = float(rho_primary[0]) if len(rho_primary) > 0 else 1.0
     threshold = rho_threshold_frac * rho_peak
 
-    # TTC = premier t où max ρ < seuil
+    # TTC = first t where primary metric < threshold
     ttc_days: Optional[float] = None
-    below = np.where(rho_max_t < threshold)[0]
+    below = np.where(rho_primary < threshold)[0]
     if len(below) > 0:
         ttc_days = float(t_vals_c[below[0]])
 
@@ -1389,15 +1441,15 @@ def plot_congestion_clearance(
         rows=2, cols=1,
         row_heights=[0.42, 0.58],
         subplot_titles=(
-            "Courbe de resorption: max(rho(x,t)) le long du chenal",
-            "Champ de densite rho(x,t)  [vessels/km]  avec isoline de seuil",
+            f"Courbe de résorption — {metric_label}",
+            "Champ de densité ρ(x,t)  [vessels/km]  avec isoline de seuil",
         ),
         vertical_spacing=0.12,
     )
 
     # — Panel 1 : courbe de résorption ————————————————————————————————
     # Zone grisée "congestion active" (rho > seuil)
-    rho_clipped = np.where(rho_max_t > threshold, rho_max_t, threshold)
+    rho_clipped = np.where(rho_primary > threshold, rho_primary, threshold)
     fig.add_trace(
         go.Scatter(
             x=np.concatenate([t_vals_c, t_vals_c[::-1]]),
@@ -1405,19 +1457,33 @@ def plot_congestion_clearance(
             fill="toself",
             fillcolor="rgba(200, 50, 50, 0.15)",
             line=dict(width=0),
-            name="Zone congestionnee",
+            name="Zone congestionnée",
             showlegend=True,
         ),
         row=1, col=1,
     )
-    # Courbe principale
+    # Courbe principale (metric sélectionnée)
     fig.add_trace(
         go.Scatter(
             x=t_vals_c,
-            y=rho_max_t,
+            y=rho_primary,
             mode="lines",
             line=dict(color="#1565C0", width=2.5),
-            name="max rho(x,t)",
+            name=metric_label,
+        ),
+        row=1, col=1,
+    )
+    # Courbe secondaire (l'autre metric, en fond)
+    secondary_y = rho_mean_t if ttc_metric == "max" else rho_max_t
+    secondary_label = "mean_x ρ" if ttc_metric == "max" else "max_x ρ (contextuel)"
+    fig.add_trace(
+        go.Scatter(
+            x=t_vals_c,
+            y=secondary_y,
+            mode="lines",
+            line=dict(color="#90A4AE", width=1.2, dash="dot"),
+            name=secondary_label,
+            opacity=0.6,
         ),
         row=1, col=1,
     )
@@ -1427,7 +1493,7 @@ def plot_congestion_clearance(
         line_dash="dash",
         line_color="red",
         line_width=1.5,
-        annotation_text=f"Seuil ({rho_threshold_frac*100:.0f}% du pic = {threshold:.1f} v/km)",
+        annotation_text=f"Seuil ({rho_threshold_frac*100:.0f}% niveau initial = {threshold:.1f} v/km)",
         annotation_position="top right",
         row=1, col=1,
     )
@@ -1461,7 +1527,7 @@ def plot_congestion_clearance(
             row=1, col=1,
         )
 
-    fig.update_yaxes(title_text="max rho [vessels/km]", row=1, col=1)
+    fig.update_yaxes(title_text=f"{metric_label}  [vessels/km]", row=1, col=1)
     fig.update_xaxes(title_text="", row=1, col=1)
 
     # — Panel 2 : heatmap + isoline ──────────────────────────────────────────
@@ -1510,7 +1576,7 @@ def plot_congestion_clearance(
 
     # ── Mise en page ─────────────────────────────────────────────────────────
     ttc_label = f"{ttc_days:.1f}j" if ttc_days is not None else "non atteint"
-    title = f"PINN LWR — Resorption de la congestion  |  TTC = {ttc_label}"
+    title = f"PINN LWR — Résorption congestion ({metric_label})  |  TTC = {ttc_label}"
     if title_suffix:
         title += f"  |  {title_suffix}"
 
@@ -1532,6 +1598,503 @@ def plot_congestion_clearance(
         output_path, f"{ttc_days:.1f}j" if ttc_days is not None else "n/a",
     )
     return output_path, ttc_days
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# NOUVELLES VISUALISATIONS — OPTIMISATION PHASE 3
+# ════════════════════════════════════════════════════════════════════════════
+
+def plot_loss_decomposition(
+    loss_path: Path,
+    warmup_epochs: int = 0,
+    colloc_refresh: int = COLLOC_REFRESH,
+    output_path: Optional[Path] = None,
+) -> Optional[Path]:
+    """
+    Semi-log plot of training loss components (total, data, pde, kin) vs epochs.
+
+    Requires the loss history saved as .npz (multi-component format from updated
+    train_on_episodes). Falls back gracefully if only a legacy .npy (total only) exists.
+
+    Marks collocation refresh epochs and curriculum warmup end on the plot.
+    """
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        raise ImportError("plotly requis: pip install plotly")
+
+    loss_path = Path(loss_path)
+    # Try npz first, then npy legacy
+    if not loss_path.exists():
+        alt = loss_path.with_suffix(".npz" if loss_path.suffix == ".npy" else ".npy")
+        if alt.exists():
+            loss_path = alt
+        else:
+            log.warning("Fichier de loss introuvable: %s", loss_path)
+            return None
+
+    if loss_path.suffix == ".npz":
+        data = np.load(str(loss_path))
+        history = {k: data[k].tolist() for k in data.files}
+    else:
+        total = np.load(str(loss_path)).tolist()
+        history = {"total": total}
+
+    epochs = len(history["total"])
+    epoch_arr = np.arange(1, epochs + 1)
+
+    colors = {"total": "#1A237E", "data": "#1565C0", "pde": "#E65100", "kin": "#2E7D32"}
+    labels = {"total": "L total", "data": "L data (MSE)", "pde": "L LWR (PDE)", "kin": "L cinématique"}
+
+    fig = go.Figure()
+    for key in ["total", "data", "pde", "kin"]:
+        if key not in history:
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=epoch_arr,
+                y=history[key],
+                mode="lines",
+                name=labels[key],
+                line=dict(color=colors[key], width=2 if key == "total" else 1.5,
+                          dash="solid" if key == "total" else "dot" if key != "data" else "solid"),
+                opacity=1.0 if key == "total" else 0.75,
+            )
+        )
+
+    # Vertical markers: collocation refresh epochs
+    for ep in range(colloc_refresh, epochs, colloc_refresh):
+        fig.add_vline(x=ep, line_dash="dot", line_color="gray", line_width=0.8, opacity=0.5)
+
+    # Curriculum warmup end
+    if warmup_epochs > 0 and warmup_epochs < epochs:
+        fig.add_vline(
+            x=warmup_epochs, line_dash="dash", line_color="purple", line_width=1.5,
+            annotation_text=f"fin warmup ({warmup_epochs})",
+            annotation_position="top right",
+            annotation_font=dict(color="purple", size=10),
+        )
+
+    fig.update_layout(
+        title=dict(text="PINN — Décomposition de la loss par composante", x=0.5, font=dict(size=14)),
+        xaxis=dict(title="Époques", showgrid=True, gridcolor="#e0e0e0"),
+        yaxis=dict(title="Loss (échelle log)", type="log", showgrid=True, gridcolor="#e0e0e0"),
+        height=480,
+        template="plotly_white",
+        legend=dict(x=1.02, y=0.85),
+        annotations=[
+            dict(
+                x=0.5, y=-0.14, xref="paper", yref="paper",
+                text="<i>Lignes grises verticales = reéchantillonnage collocation. "
+                     "La L_data doit dominer en début d'entraînement.</i>",
+                showarrow=False, font=dict(color="gray", size=10), align="center",
+            )
+        ],
+    )
+
+    if output_path is None:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        output_path = OUTPUT_DIR / "pinn_loss_decomposition.png"
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    fig.write_image(str(output_path), format="png", scale=2)
+    log.info("Loss decomposition sauvegardee -> %s", output_path)
+    return output_path
+
+
+def plot_lwr_residual_field(
+    model: LWRPINN,
+    global_meta: dict,
+    t_max_days: float,
+    n_grid: int = 60,
+    title_suffix: str = "",
+    output_path: Optional[Path] = None,
+) -> Path:
+    """
+    Heatmap of the LWR PDE residual |∂ρ/∂t + ∂(ρv)/∂x| across the x-t domain.
+
+    This is the canonical PINN validation figure (Raissi et al. 2019 JCCP).
+    A low residual everywhere proves mass conservation is enforced, not just fitted.
+    White = perfect conservation, red = physics violation.
+    """
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        raise ImportError("plotly requis: pip install plotly")
+
+    device = get_device()
+    model = model.to(device)
+    model.train()  # enable grad tracking through the network
+
+    channel_len_km = global_meta["channel_len_km"]
+
+    x_arr = np.linspace(0.0, 1.0, n_grid, dtype=np.float32)
+    t_arr = np.linspace(0.0, 1.0, n_grid, dtype=np.float32)
+    xx, tt = np.meshgrid(x_arr, t_arr)  # (n_grid, n_grid), t on rows, x on cols
+
+    x_flat = xx.ravel()
+    t_flat = tt.ravel()
+
+    x_tensor = torch.tensor(x_flat[:, None], dtype=torch.float32, device=device, requires_grad=True)
+    t_tensor = torch.tensor(t_flat[:, None], dtype=torch.float32, device=device, requires_grad=True)
+
+    rho, v = model(x_tensor, t_tensor)
+    flux = rho * v
+
+    drho_dt = torch.autograd.grad(
+        rho, t_tensor,
+        grad_outputs=torch.ones_like(rho),
+        create_graph=False, retain_graph=True,
+    )[0]
+    dflux_dx = torch.autograd.grad(
+        flux, x_tensor,
+        grad_outputs=torch.ones_like(flux),
+        create_graph=False,
+    )[0]
+
+    residual = (drho_dt + dflux_dx).abs().detach().cpu().numpy().ravel()
+    model.eval()
+
+    residual_grid = residual.reshape(n_grid, n_grid)  # (t_rows, x_cols)
+    t_vals_phys = np.linspace(0.0, t_max_days, n_grid)
+    x_vals_phys = np.linspace(0.0, channel_len_km, n_grid)
+
+    res_mean = float(np.mean(residual))
+    res_max  = float(np.max(residual))
+    res_p95  = float(np.percentile(residual, 95))
+
+    fig = go.Figure(
+        go.Heatmap(
+            z=residual_grid,
+            x=x_vals_phys,
+            y=t_vals_phys,
+            colorscale=[
+                [0.00, "white"],
+                [0.05, "#AED6F1"],
+                [0.25, "#F39C12"],
+                [0.60, "#E74C3C"],
+                [1.00, "#7B241C"],
+            ],
+            zmax=res_p95,
+            zmin=0.0,
+            zsmooth="best",
+            colorbar=dict(title=dict(text="|∂ρ/∂t +<br>∂q/∂x|", side="right"), thickness=16),
+            hovertemplate="x=%{x:.1f}km  t=%{y:.1f}j<br>résidu=%{z:.5f}<extra></extra>",
+        )
+    )
+
+    title = "PINN — Champ résiduel LWR  |∂ρ/∂t + ∂(ρv)/∂x|"
+    if title_suffix:
+        title += f"  |  {title_suffix}"
+
+    fig.update_layout(
+        title=dict(text=title, x=0.5, font=dict(size=14)),
+        xaxis=dict(title="Distance le long du chenal [km]", showgrid=False),
+        yaxis=dict(title="Temps depuis l'onset [jours]", autorange="reversed", showgrid=False),
+        height=560,
+        template="plotly_white",
+        annotations=[
+            dict(
+                x=0.01, y=0.03, xref="paper", yref="paper",
+                text=(
+                    f"<b>Résidu moyen: {res_mean:.5f}   |   max: {res_max:.4f}</b><br>"
+                    "<i>Blanc = conservation parfaite  |  Rouge = violation LWR</i>"
+                ),
+                showarrow=False, font=dict(color="black", size=11), align="left",
+                bgcolor="rgba(255,255,255,0.85)", bordercolor="gray", borderwidth=1,
+            )
+        ],
+    )
+
+    if output_path is None:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        stem = title_suffix.replace(" ", "_").replace("/", "-") or "pinn"
+        output_path = OUTPUT_DIR / f"{stem}_lwr_residual.png"
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    fig.write_image(str(output_path), format="png", scale=2)
+    log.info(
+        "Champ residuel LWR sauvegarde -> %s  (mean=%.5f, max=%.4f)",
+        output_path, res_mean, res_max,
+    )
+    return output_path
+
+
+def plot_characteristic_lines(
+    model: LWRPINN,
+    global_meta: dict,
+    t_max_days: float,
+    n_chars: int = 12,
+    dt_days: float = 0.1,
+    title_suffix: str = "",
+    output_path: Optional[Path] = None,
+) -> Path:
+    """
+    Method of Characteristics: integrate dx/dt = v(x,t) from n_chars starting positions.
+
+    Each line shows how a fluid parcel propagates through the channel.
+    Converging lines signal shock wave formation (LWR signature).
+    Superimposed on the density ρ(x,t) heatmap for context.
+
+    Reference: Daganzo 1994, Newell 2002.
+    """
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        raise ImportError("plotly requis: pip install plotly")
+
+    device = get_device()
+    model = model.eval().to(device)
+
+    channel_len_km = global_meta["channel_len_km"]
+    global_v_max   = global_meta["global_v_max"]
+    global_rho_max = global_meta["global_rho_max"]
+
+    # Build density heatmap (background)
+    n_bg = 60
+    x_bg = np.linspace(0.0, 1.0, n_bg, dtype=np.float32)
+    t_bg = np.linspace(0.0, 1.0, n_bg, dtype=np.float32)
+    xx_bg, tt_bg = np.meshgrid(x_bg, t_bg)
+    with torch.no_grad():
+        x_t_bg = torch.tensor(xx_bg.ravel()[:, None], dtype=torch.float32, device=device)
+        t_t_bg = torch.tensor(tt_bg.ravel()[:, None], dtype=torch.float32, device=device)
+        rho_bg, _ = model(x_t_bg, t_t_bg)
+    rho_grid = rho_bg.cpu().numpy().ravel().reshape(n_bg, n_bg) * global_rho_max
+    x_phys_bg = np.linspace(0.0, channel_len_km, n_bg)
+    t_phys_bg = np.linspace(0.0, t_max_days, n_bg)
+
+    # RK4 integration of dx/dt = v_physical [km/day]
+    KM_PER_KNOT_PER_DAY = 1.852 * 24.0
+    n_steps = max(1, int(t_max_days / dt_days))
+    x_starts = np.linspace(0.0, channel_len_km, n_chars, dtype=np.float32)
+
+    # Batch-integrate all characteristics simultaneously (one model call per step)
+    trajectories_x = [x_starts.copy()]  # list of (n_chars,) arrays
+    t_steps = [0.0]
+
+    for step in range(n_steps):
+        t_cur = step * dt_days
+        x_cur = trajectories_x[-1].copy()
+
+        x_norm = np.clip(x_cur / max(channel_len_km, 1e-8), 0.0, 1.0).astype(np.float32)
+        t_norm_cur = float(np.clip(t_cur / max(t_max_days, 1e-8), 0.0, 1.0))
+
+        x_t_cur = torch.tensor(x_norm[:, None], dtype=torch.float32, device=device)
+        t_t_cur = torch.full((n_chars, 1), t_norm_cur, dtype=torch.float32, device=device)
+
+        with torch.no_grad():
+            _, v_norm = model(x_t_cur, t_t_cur)
+
+        v_phys = v_norm.cpu().numpy().ravel() * global_v_max  # knots
+        dx = v_phys * KM_PER_KNOT_PER_DAY * dt_days
+        x_new = np.clip(x_cur + dx, 0.0, channel_len_km)
+
+        trajectories_x.append(x_new)
+        t_steps.append(t_cur + dt_days)
+
+    t_arr_chars = np.array(t_steps)
+    traj_arr = np.array(trajectories_x)  # (n_steps+1, n_chars)
+
+    # Plot
+    # Convention: x on x-axis [km], t on y-axis [hours] reversed (like shockwave diagram)
+    t_hours_bg = t_phys_bg * 24.0
+    t_hours_chars = t_arr_chars * 24.0
+
+    colorscale_bg = [
+        [0.00, "#0a1628"], [0.25, "#1565C0"],
+        [0.50, "#FFD600"], [0.75, "#E65100"], [1.00, "#7B0000"],
+    ]
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Heatmap(
+            z=rho_grid,
+            x=x_phys_bg,
+            y=t_hours_bg,
+            colorscale=colorscale_bg,
+            zsmooth="best",
+            colorbar=dict(title=dict(text="ρ<br>[v/km]", side="right"), thickness=14),
+            hovertemplate="x=%{x:.1f}km  t=%{y:.1f}h  ρ=%{z:.2f}<extra></extra>",
+            name="Densité ρ(x,t)",
+        )
+    )
+
+    # Draw characteristic lines
+    palette = [f"hsl({int(240 * i / max(n_chars - 1, 1))}, 90%, 70%)" for i in range(n_chars)]
+    for i in range(n_chars):
+        fig.add_trace(
+            go.Scatter(
+                x=traj_arr[:, i],
+                y=t_hours_chars,
+                mode="lines",
+                line=dict(color=palette[i], width=1.5),
+                showlegend=(i == 0),
+                name="Caractéristiques dx/dt=v",
+                opacity=0.85,
+                hovertemplate=f"Char {i+1}: x=%{{x:.1f}}km  t=%{{y:.1f}}h<extra></extra>",
+            )
+        )
+
+    title = "PINN LWR — Lignes caractéristiques dx/dt = v(x,t)"
+    if title_suffix:
+        title += f"  |  {title_suffix}"
+
+    fig.update_layout(
+        title=dict(text=title, x=0.5, font=dict(size=14)),
+        xaxis=dict(title="Distance le long du chenal [km]", showgrid=False),
+        yaxis=dict(
+            title="Temps depuis l'onset [heures]",
+            autorange="reversed", showgrid=False,
+        ),
+        height=620,
+        template="plotly_dark",
+        annotations=[
+            dict(
+                x=0.02, y=0.97, xref="paper", yref="paper",
+                text="<b>Lignes colorées = trajectoires dx/dt = v</b><br>"
+                     "<i>Convergence → formation d'un choc LWR</i>",
+                showarrow=False, font=dict(color="white", size=11), align="left",
+                bgcolor="rgba(0,0,0,0.5)", bordercolor="white", borderwidth=1,
+            )
+        ],
+    )
+
+    if output_path is None:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        stem = title_suffix.replace(" ", "_").replace("/", "-") or "pinn"
+        output_path = OUTPUT_DIR / f"{stem}_characteristic_lines.png"
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    fig.write_image(str(output_path), format="png", scale=2)
+    log.info("Lignes caracteristiques sauvegardees -> %s", output_path)
+    return output_path
+
+
+def plot_episode_gallery(
+    model: LWRPINN,
+    episodes: list[Episode],
+    global_meta: dict,
+    n_show: int = 6,
+    output_path: Optional[Path] = None,
+) -> Path:
+    """
+    Gallery of ρ(x,t) heatmaps for the N largest episodes by trigger score.
+
+    Shows that the PINN generalizes consistently across diverse congestion events
+    (different durations, intensities, seasonal patterns).
+    All episodes use t_norm ∈ [0,1] (episode-relative time), so shorter episodes
+    appear compressed compared to longer ones.
+    """
+    try:
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+    except ImportError:
+        raise ImportError("plotly requis: pip install plotly")
+
+    device = get_device()
+    model = model.eval().to(device)
+
+    channel_len_km = global_meta["channel_len_km"]
+    global_rho_max = global_meta["global_rho_max"]
+
+    # Select top episodes by trigger score
+    sorted_eps = sorted(episodes, key=lambda ep: ep.trigger_score, reverse=True)
+    top_eps = sorted_eps[:min(n_show, len(sorted_eps))]
+    n_actual = len(top_eps)
+
+    n_cols = min(3, n_actual)
+    n_rows = (n_actual + n_cols - 1) // n_cols
+
+    n_x, n_t = 20, 30
+    x_norm_grid = np.linspace(0.0, 1.0, n_x, dtype=np.float32)
+    t_norm_grid = np.linspace(0.0, 1.0, n_t, dtype=np.float32)
+    xx, tt = np.meshgrid(x_norm_grid, t_norm_grid)
+    x_flat_norm = xx.ravel()
+    t_flat_norm = tt.ravel()
+
+    # Batch all episodes in one model call
+    x_batch = np.tile(x_flat_norm, n_actual)
+    t_batch = np.tile(t_flat_norm, n_actual)
+    x_t = torch.tensor(x_batch[:, None], dtype=torch.float32, device=device)
+    t_t = torch.tensor(t_batch[:, None], dtype=torch.float32, device=device)
+    with torch.no_grad():
+        rho_norm_all, _ = model(x_t, t_t)
+    rho_phys_all = rho_norm_all.cpu().numpy().ravel() * global_rho_max
+
+    pts_per_ep = n_x * n_t
+
+    subplot_titles = []
+    for ep in top_eps:
+        subplot_titles.append(
+            f"{ep.start_date.strftime('%Y-%m')}  {ep.duration_days}j  "
+            f"score={ep.trigger_score/1e3:.0f}k"
+        )
+
+    fig = make_subplots(
+        rows=n_rows, cols=n_cols,
+        subplot_titles=subplot_titles,
+        horizontal_spacing=0.08,
+        vertical_spacing=0.12,
+    )
+
+    colorscale = [
+        [0.00, "#0a1628"], [0.25, "#1565C0"],
+        [0.50, "#FFD600"], [0.75, "#E65100"], [1.00, "#7B0000"],
+    ]
+    zmax_global = float(np.max(rho_phys_all)) if len(rho_phys_all) > 0 else 1.0
+
+    x_phys_grid = np.linspace(0.0, channel_len_km, n_x)
+
+    for i, ep in enumerate(top_eps):
+        row = i // n_cols + 1
+        col = i % n_cols + 1
+
+        rho_ep = rho_phys_all[i * pts_per_ep: (i + 1) * pts_per_ep]
+        rho_grid = rho_ep.reshape(n_t, n_x)  # (t_rows, x_cols)
+        t_phys_ep = t_norm_grid * ep.duration_days  # episode-relative days
+
+        fig.add_trace(
+            go.Heatmap(
+                z=rho_grid,
+                x=x_phys_grid,
+                y=t_phys_ep,
+                colorscale=colorscale,
+                zmin=0, zmax=zmax_global,
+                zsmooth="best",
+                showscale=(i == n_actual - 1),
+                colorbar=dict(title="ρ<br>[v/km]", len=0.5, y=0.25, thickness=12),
+                hovertemplate=(
+                    "x=%{x:.1f}km  t=%{y:.1f}j<br>ρ=%{z:.1f}<extra>"
+                    + ep.episode_id + "</extra>"
+                ),
+            ),
+            row=row, col=col,
+        )
+        if col == 1:
+            fig.update_yaxes(title_text="t [j]", row=row, col=col)
+        if row == n_rows:
+            fig.update_xaxes(title_text="x [km]", row=row, col=col)
+
+    location_label = global_meta.get("location", "").upper()
+    fig.update_layout(
+        title=dict(
+            text=f"PINN — Galerie multi-épisodes {location_label}  "
+                 f"(Top {n_actual} par gravity score)",
+            x=0.5, font=dict(size=14),
+        ),
+        height=300 * n_rows + 100,
+        template="plotly_dark",
+    )
+
+    if output_path is None:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        loc = global_meta.get("location", "pinn")
+        output_path = OUTPUT_DIR / f"{loc}_pinn_episode_gallery.png"
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    fig.write_image(str(output_path), format="png", scale=2)
+    log.info("Galerie multi-episodes sauvegardee -> %s  (%d episodes)", output_path, n_actual)
+    return output_path
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1578,14 +2141,25 @@ def main():
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--lambda-pde", type=float, default=0.1)
     parser.add_argument("--lambda-kin", type=float, default=0.05)
+    parser.add_argument("--warmup-epochs", type=int, default=0,
+                        help="Curriculum learning: ramper les poids physiques de 0 à λ sur N époques (0=désactivé)")
+    parser.add_argument("--n-freqs", type=int, default=0,
+                        help="Fourier Feature Embedding: nombre de fréquences (0=désactivé, rec: 16)")
+    parser.add_argument("--fourier-sigma", type=float, default=1.0,
+                        help="Echelle de la matrice de fréquences aléatoires (défaut: 1.0)")
+    parser.add_argument("--pad-days", type=int, default=0,
+                        help="Jours de récupération ajoutés après la fin de chaque épisode (rec: 30)")
 
     # Résolution de la grille d'inférence
     parser.add_argument("--x-grid", type=int, default=100)
     parser.add_argument("--t-grid", type=int, default=100)
     parser.add_argument("--t-max-days", type=float, default=None,
                         help="Horizon de prédiction en jours")
-    parser.add_argument("--rho-threshold-frac", type=float, default=0.3,
-                        help="Fraction du pic initial définissant le retour à la normale (défaut: 0.3)")
+    parser.add_argument("--rho-threshold-frac", type=float, default=0.7,
+                        help="Fraction du niveau initial définissant le retour à la normale "
+                             "(défaut: 0.7 avec metric=mean, soit 70%% du niveau de départ)")
+    parser.add_argument("--ttc-metric", default="mean", choices=["mean", "max"],
+                        help="Métrique spatiale pour TTC: 'mean' (charge globale, défaut) ou 'max' (queue port)")
 
     # Fine-tuning
     parser.add_argument("--fine-tune", action="store_true",
@@ -1634,6 +2208,7 @@ def main():
             constituent_path=args.constituent_path,
             start_date=train_start,
             end_date=train_end,
+            pad_days=args.pad_days,
         )
 
         if args.data_only:
@@ -1669,12 +2244,36 @@ def main():
             lambda_pde=args.lambda_pde,
             lambda_kin=args.lambda_kin,
             model_name=args.model_name or f"pinn_{args.location}_episodes",
+            warmup_epochs=args.warmup_epochs,
+            n_freqs=args.n_freqs,
+            fourier_sigma=args.fourier_sigma,
         )
 
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        loss_path = OUTPUT_DIR / f"{args.location}_pinn_episode_loss.npy"
-        np.save(loss_path, np.array(history))
-        log.info("Courbe de loss sauvegardée → %s", loss_path)
+        loss_path = OUTPUT_DIR / f"{args.location}_pinn_episode_loss.npz"
+        np.savez(str(loss_path), **{k: np.array(v) for k, v in history.items()})
+        log.info("Courbe de loss sauvegardee -> %s", loss_path)
+
+        # Loss decomposition plot
+        loss_decomp_path = plot_loss_decomposition(
+            loss_path=loss_path,
+            warmup_epochs=args.warmup_epochs,
+            colloc_refresh=COLLOC_REFRESH,
+            output_path=OUTPUT_DIR / f"{args.location}_pinn_loss_decomposition.png",
+        )
+        if loss_decomp_path:
+            log.info("Loss decomposition -> %s", loss_decomp_path)
+
+        # Episode gallery (requires model + episodes)
+        if trained_model is not None and episodes:
+            gallery_path = plot_episode_gallery(
+                model=trained_model,
+                episodes=episodes,
+                global_meta=global_meta,
+                n_show=6,
+                output_path=OUTPUT_DIR / f"{args.location}_pinn_episode_gallery.png",
+            )
+            log.info("Episode gallery -> %s", gallery_path)
 
         if args.both:
             args.model = MODEL_DIR / f"{args.model_name or f'pinn_{args.location}_episodes'}.pt"
@@ -1697,7 +2296,12 @@ def main():
         else:
             ckpt = torch.load(args.model, map_location="cpu", weights_only=False)
             infer_meta = ckpt["global_meta"]
-            infer_model = LWRPINN(hidden_layers=4, hidden_size=64)
+            ckpt_n_freqs = int(ckpt.get("n_freqs", 0))
+            ckpt_sigma   = float(ckpt.get("fourier_sigma", 1.0))
+            infer_model  = LWRPINN(
+                hidden_layers=4, hidden_size=64,
+                n_freqs=ckpt_n_freqs, fourier_sigma=ckpt_sigma,
+            )
             infer_model.load_state_dict(ckpt["model_state"])
             log.info(
                 "Checkpoint chargé: %s (best_loss=%.6f, %d épisode(s))",
@@ -1816,6 +2420,7 @@ def main():
         clearance_path, ttc_days = plot_congestion_clearance(
             profiles=profiles,
             rho_threshold_frac=args.rho_threshold_frac,
+            ttc_metric=args.ttc_metric,
             title_suffix=title_tag,
             output_path=png_dir / "02_clearance_ttc.png",
         )
@@ -1848,6 +2453,24 @@ def main():
             output_path=png_dir / "06_fundamental_diagram.png",
         )
 
+        # New figure 07 — LWR residual field
+        residual_path = plot_lwr_residual_field(
+            model=infer_model,
+            global_meta=infer_meta,
+            t_max_days=t_max_days_infer,
+            title_suffix=title_tag,
+            output_path=png_dir / "07_lwr_residual.png",
+        )
+
+        # New figure 08 — Characteristic lines
+        chars_path = plot_characteristic_lines(
+            model=infer_model,
+            global_meta=infer_meta,
+            t_max_days=t_max_days_infer,
+            title_suffix=title_tag,
+            output_path=png_dir / "08_characteristic_lines.png",
+        )
+
         ttc_str = f"{ttc_days:.1f} jours" if ttc_days is not None else "non atteint dans la fenetre"
         print(f"\n=== Profils physiques (Etape 4b) ===")
         print(f"  Grille:  {args.x_grid} x {args.t_grid} = {len(profiles)} points")
@@ -1863,6 +2486,8 @@ def main():
         print(f"    04_ais_vs_pinn.png            (AIS brut vs PINN lisse)")
         print(f"    05_profiles_1d_slices.png     (coupes rho(x) a 6 instants)")
         print(f"    06_fundamental_diagram.png    (diagramme fondamental Greenshields)")
+        print(f"    07_lwr_residual.png           (champ residuel LWR — validation physique)")
+        print(f"    08_characteristic_lines.png  (lignes caracteristiques dx/dt=v)")
 
 
 if __name__ == "__main__":
