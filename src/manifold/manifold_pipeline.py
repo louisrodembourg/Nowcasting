@@ -7,17 +7,17 @@ RECOMMENDED MODE — Fixed baseline + scoring (2 separate steps)
 
   Step 1 — Learn the topology on a calm reference period:
 
-    python src/manifold/manifold_pipeline.py --identify `
-        --baseline-start 2017-01-01 --baseline-end 2017-01-30 `
-        --start 2017-01-01 --end 2017-01-30 `
+    python src/manifold/manifold_pipeline.py --identify \\
+        --baseline-start 2017-01-01 --baseline-end 2017-01-30 \\
+        --start 2017-01-01 --end 2017-01-30 \\
         --location houston
 
     → Saves data/features/houston_constituent_zones.parquet
 
   Step 2 — Score the crisis period with the frozen topology:
 
-    python src/manifold/manifold_pipeline.py --score `
-        --start 2020-01-01 --end 2020-12-31 `
+    python src/manifold/manifold_pipeline.py --score \\
+        --start 2020-01-01 --end 2020-12-31 \\
         --location la
 
     → Saves data/features/<location>_gravity_daily.parquet
@@ -25,9 +25,9 @@ RECOMMENDED MODE — Fixed baseline + scoring (2 separate steps)
 
   Shortcut (steps 1+2 in a single command):
 
-    python src/manifold/manifold_pipeline.py --both `
-        --baseline-start 2017-01-01 --baseline-end 2017-12-31 `
-        --start 2017-01-01 --end 2017-12-31 `
+    python src/manifold/manifold_pipeline.py --both \\
+        --baseline-start 2017-01-01 --baseline-end 2017-12-31 \\
+        --start 2017-01-01 --end 2017-12-31 \\
         --location la
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -36,15 +36,15 @@ ROLLING MODE — 3-month sliding window (experimental)
 
   Without baseline normalisation (per-window dynamics):
 
-    python src/manifold/manifold_pipeline.py --rolling `
-        --start 2017-01-01 --end 2017-12-31 `
+    python src/manifold/manifold_pipeline.py --rolling \\
+        --start 2017-01-01 --end 2017-12-31 \\
         --location houston
 
   With baseline normalisation (values > 1.0 = disruption):
 
-    python src/manifold/manifold_pipeline.py --rolling `
-        --start 2017-01-01 --end 2017-12-31 `
-        --baseline-start 2015-01-01 --baseline-end 2016-12-31 `
+    python src/manifold/manifold_pipeline.py --rolling \\
+        --start 2017-01-01 --end 2017-12-31 \\
+        --baseline-start 2015-01-01 --baseline-end 2016-12-31 \\
         --location houston
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

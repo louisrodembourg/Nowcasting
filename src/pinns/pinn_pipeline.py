@@ -22,11 +22,11 @@ Usage:
     python src/pinns/pinn_pipeline.py --both   --location houston
     python src/pinns/pinn_pipeline.py --data-only --location houston --start 2017-01-01 --end 2017-12-31
 
-    python src/pinns/pinn_pipeline.py --infer `
-  --model outputs/models/pinn_la_episodes.pt `
-  --start 2020-11-01 --end 2021-02-28 `
-  --fine-tune `
-  --fine-tune-epochs 300 `
+    python src/pinns/pinn_pipeline.py --infer \\
+  --model outputs/models/pinn_la_episodes.pt \\
+  --start 2020-11-01 --end 2021-02-28 \\
+  --fine-tune \\
+  --fine-tune-epochs 300 \\
   --fine-tune-lr 1e-4
 """
 
