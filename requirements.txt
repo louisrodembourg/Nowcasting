@@ -13,8 +13,10 @@ shap
 
 # Data sources
 yfinance
+pyarrow
 
 # Visualization
 folium
 matplotlib
 ipykernel
+plotly
