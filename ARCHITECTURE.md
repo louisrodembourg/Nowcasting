@@ -31,7 +31,7 @@ outputs/financial/*.csv, figures
 | `ingestion/kinematic_filter.py` | Recomputes speed from consecutive positions (haversine), corrects aberrant SOG, assigns a `traj_id` at each gap longer than 30 min. |
 | `ingestion/trajectory.py` | Linear / cubic Hermite interpolation (Hermite when the heading changes by more than 30°) and Douglas–Peucker compression. |
 | `clustering/hdbscan_daily.py` | Daily HDBSCAN (haversine metric) on stationary episodes (SOG < 1 kt). Labels clusters as *docked* or *waiting* using heading dispersion and geographic zones. |
-| `clustering/features_daily.py` | 13 daily features: vessel count, SOG statistics, utilisation rate, cluster/noise statistics, membership scores, draft, waiting capacity, tanker ratio. |
+| `clustering/features_daily.py` | 13 daily features: vessel count, SOG statistics, utilisation rate, cluster/noise statistics, membership scores, draft, blocked capacity, tanker ratio. |
 | `clustering/visualize_clusters.py`, `utils/visualize.py` | Folium / Plotly maps of the clusters (single day or animated period). |
 | `scripts/run_phase1.py` | Orchestrator: download → clustering → features over a date range. |
 

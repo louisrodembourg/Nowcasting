@@ -806,7 +806,8 @@ def extract_pinn_summaries(profiles: pd.DataFrame) -> dict:
     peak_rho  = float(rho_max_t[peak_idx])
     t_to_peak = float(t_vals[peak_idx])
 
-    area_under_rho = float(np.trapz(rho_max_t, t_vals)) if len(t_vals) > 1 else 0.0
+    trapezoid = getattr(np, "trapezoid", None) or np.trapz  # np.trapz was removed in NumPy 2
+    area_under_rho = float(trapezoid(rho_max_t, t_vals)) if len(t_vals) > 1 else 0.0
 
     post_t   = t_vals[peak_idx:]
     post_rho = rho_max_t[peak_idx:]
