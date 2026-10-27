@@ -332,8 +332,8 @@ def train_xgboost_continuous(
         "date":       pd.to_datetime(dates[mask]),
         "gravity":    np.round(gravities[mask], 1),
         f"pred_{target_col}": np.round(oof_preds[mask], 3),
-        f"reel_{target_col}": np.round(y[mask], 3),
-        "erreur_%":   np.round(oof_preds[mask] - y[mask], 3),
+        f"actual_{target_col}": np.round(y[mask], 3),
+        "error_%":   np.round(oof_preds[mask] - y[mask], 3),
     })
 
     log.info(
@@ -456,7 +456,7 @@ def main() -> None:
             print(f"    {row['feature']:25s} {row['importance']:.4f}  {bar}")
 
         # Statistiques OOF
-        errs = oof_df["erreur_%"].dropna()
+        errs = oof_df["error_%"].dropna()
         mae_oof  = float(errs.abs().mean())
         rmse_oof = float(np.sqrt((errs**2).mean()))
         n_ok     = int((errs.abs() < 1.5).sum())
@@ -486,7 +486,7 @@ def main() -> None:
     except ValueError as exc:
         log.error("XGBoost impossible : %s", exc)
 
-    print(f"\nResultats -> {args.output_dir}/")
+    print(f"\nResults -> {args.output_dir}/")
 
 
 if __name__ == "__main__":

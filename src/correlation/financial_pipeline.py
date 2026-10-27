@@ -1115,13 +1115,13 @@ def main() -> None:
             ep_rows.append({
                 "episode_id":           row["episode_id"],
                 "start_date":           str(row["start_date"]),
-                "dur_j":                int(row["duration_days"]),
+                "dur_d":                int(row["duration_days"]),
                 "gravity":              int(row["gravity_score"]),
-                "ttc_j":                f"{ttc_val:.0f}" if pd.notna(ttc_val) else "N/A",
+                "ttc_d":                f"{ttc_val:.0f}" if pd.notna(ttc_val) else "N/A",
                 "ttc_src":              "PINN" if ttc_src == "pinn" else "obs",
                 f"pred_{asset_short}%": f"{pred:+.2f}%" if not np.isnan(pred) else "N/A",
-                f"reel_{asset_short}%": f"{actual:+.2f}%" if not np.isnan(actual) else "N/A",
-                "erreur_%":             f"{error:+.2f}%" if not np.isnan(error) else "N/A",
+                f"actual_{asset_short}%": f"{actual:+.2f}%" if not np.isnan(actual) else "N/A",
+                "error_%":             f"{error:+.2f}%" if not np.isnan(error) else "N/A",
                 "sig":                  sig,
                 "ok":                   ok,
             })
@@ -1129,15 +1129,15 @@ def main() -> None:
         ep_df = pd.DataFrame(ep_rows)
 
         # Global backtest metrics
-        errs = [float(r["erreur_%"].replace("%","")) for r in ep_rows if r["erreur_%"] != "N/A"]
+        errs = [float(r["error_%"].replace("%","")) for r in ep_rows if r["error_%"] != "N/A"]
         mae_bt  = float(np.mean(np.abs(errs))) if errs else np.nan
         rmse_bt = float(np.sqrt(np.mean(np.array(errs)**2))) if errs else np.nan
         n_ok    = sum(1 for r in ep_rows if r["ok"] == "OK")
 
         print(f"\n{'='*80}")
         print(f"  NOWCASTING PER EPISODE — {args.location.upper()} | target: {asset_short} | horizon: {n_target}d")
-        print(f"  ttc_j : estimated clearing time (obs=observed duration, PINN=physical model)")
-        print(f"  pred  : change expected by XGBoost | reel : realised change")
+        print(f"  ttc_d : estimated clearing time (obs=observed duration, PINN=physical model)")
+        print(f"  pred  : change expected by XGBoost | actual : realised change")
         print(f"  ok    : |error| < 1.5% (indicative threshold)")
         print(f"{'='*80}")
         print(ep_df.to_string(index=False))
@@ -1154,7 +1154,7 @@ def main() -> None:
     except ValueError as exc:
         log.warning("XGBoost ignore: %s", exc)
 
-    print(f"\nResultats -> {args.output_dir}/")
+    print(f"\nResults -> {args.output_dir}/")
 
 
 if __name__ == "__main__":

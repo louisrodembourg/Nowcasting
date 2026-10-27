@@ -303,10 +303,10 @@ def evaluate_model(
     # Per-episode table (useful for the report)
     pred_df = df_test[["episode_id", "start_date", target_col]].copy() if "episode_id" in df_test.columns \
         else df_test[[target_col]].copy()
-    pred_df["ttc_predit_j"] = np.round(y_pred, 2)
-    pred_df["ttc_reel_j"]   = np.round(y_test,  2)
-    pred_df["erreur_j"]     = np.round(y_pred - y_test, 2)
-    pred_df["abs_erreur_j"] = np.round(np.abs(y_pred - y_test), 2)
+    pred_df["ttc_predicted_d"] = np.round(y_pred, 2)
+    pred_df["ttc_actual_d"]   = np.round(y_test,  2)
+    pred_df["error_d"]     = np.round(y_pred - y_test, 2)
+    pred_df["abs_error_d"] = np.round(np.abs(y_pred - y_test), 2)
 
     return {
         "rmse":           rmse,
@@ -470,8 +470,8 @@ def plot_predictions_vs_actual(
     """
     fig, ax = plt.subplots(figsize=(7, 6))
 
-    x = predictions_df["ttc_reel_j"]
-    y = predictions_df["ttc_predit_j"]
+    x = predictions_df["ttc_actual_d"]
+    y = predictions_df["ttc_predicted_d"]
 
     ax.scatter(x, y, alpha=0.7, edgecolors="k", linewidths=0.5, s=60, color="steelblue")
 
@@ -619,44 +619,52 @@ def run_full_pipeline(
 
 def _make_synthetic_dataset(n_episodes: int = 60, seed: int = 42) -> pd.DataFrame:
     """
-    Generate a realistic synthetic DataFrame to test the pipeline without AIS data.
+    Generate a realistic synthetic episode dataset to test the pipeline without AIS data.
 
-    Simulated relationships (inspired by the literature):
-      - high anchorage_queue → long TTC (queues extend the clearing)
-      - high gravity_score   → long TTC (disruption magnitude)
-      - low approach_speed   → long TTC (pre-congestion, slowing vessels)
-      - high complexity_p    → slightly longer TTC (dense traffic clears slowly)
+    Columns match FEATURE_COLS + TARGET_COL (the output format of build_events_dataset).
+    Simulated relationships:
+      - higher gravity_score / peak_rho   → longer episodes (disruption magnitude)
+      - larger area_under_rho             → longer episodes (total congestion load)
+      - steeper (more negative) decay_rate → shorter episodes (fast clearing)
+      - higher entry flux                  → slightly shorter episodes (channel still flowing)
 
     Does NOT replace real AIS data — test use only.
     """
     rng = np.random.default_rng(seed)
 
     n = n_episodes
-    approach_speed  = rng.uniform(3.0, 15.0, n)     # knots
-    anchorage_queue = rng.integers(20, 200, n)       # vessels
-    complexity_p    = rng.uniform(0.1, 0.9,  n)     # [0,1]
-    gravity_score   = rng.uniform(5_000, 400_000, n) # a.u.
+    gravity_score   = rng.uniform(5_000, 400_000, n)   # a.u.
+    n_ais_points    = rng.integers(200, 5_000, n)      # AIS coverage
+    peak_rho        = rng.uniform(2.0, 30.0, n)        # vessels/km
+    t_to_peak_days  = rng.uniform(1.0, 20.0, n)        # days
+    decay_rate      = -rng.uniform(0.01, 0.5, n)       # vessels/km/day
+    flux_entry_mean = rng.uniform(2.0, 20.0, n)        # vessels·kn/km
+    area_under_rho  = peak_rho * rng.uniform(5.0, 40.0, n)
 
-    # TTC = realistic signal (non-linear relationship + noise)
-    time_to_clear = (
-        5.0
-        + 0.05  * anchorage_queue
+    # Episode duration = realistic signal (non-linear relationship + noise)
+    duration_days = (
+        3.0
         + 0.000015 * gravity_score
-        + 3.0 * complexity_p
-        - 0.2 * approach_speed
+        + 0.02 * area_under_rho
+        + 0.3 * t_to_peak_days
+        + 8.0 * decay_rate
+        - 0.1 * flux_entry_mean
         + rng.normal(0, 1.5, n)
     ).clip(min=1.0)
 
     dates = pd.date_range("2017-01-01", periods=n, freq="5D")
 
     return pd.DataFrame({
-        "episode_id":     [f"ep_{i:03d}" for i in range(n)],
-        "start_date":     dates,
-        "approach_speed":  np.round(approach_speed, 2),
-        "anchorage_queue": anchorage_queue.astype(int),
-        "complexity_p":    np.round(complexity_p, 3),
+        "episode_id":      [f"ep_{i:03d}" for i in range(n)],
+        "start_date":      dates,
         "gravity_score":   np.round(gravity_score, 1),
-        "time_to_clear":   np.round(time_to_clear, 1),
+        "n_ais_points":    n_ais_points.astype(int),
+        "peak_rho":        np.round(peak_rho, 3),
+        "t_to_peak_days":  np.round(t_to_peak_days, 2),
+        "area_under_rho":  np.round(area_under_rho, 2),
+        "decay_rate":      np.round(decay_rate, 4),
+        "flux_entry_mean": np.round(flux_entry_mean, 3),
+        TARGET_COL:        np.round(duration_days, 1),
     })
 
 
@@ -784,7 +792,7 @@ Examples:
     # Display the test-set prediction table
     print("\n── Test-set predictions ──")
     print(results["predictions_df"].to_string(index=False))
-    print(f"\nResultats → {args.output_dir}/")
+    print(f"\nResults → {args.output_dir}/")
 
 
 if __name__ == "__main__":

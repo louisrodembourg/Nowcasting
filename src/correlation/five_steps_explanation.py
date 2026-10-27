@@ -3,11 +3,14 @@ Phase 4 — The 5 transformation steps of the AIS signal.
 
 This script reproduces and explains each step of the progression:
 
-  Step 1: Raw gravity score (lag=7d)               → ρs ≈ +0.069
-  Step 2: Log transform                            → ρs ≈ +0.110
-  Step 3: MA21 smoothing                           → ρs ≈ +0.154
-  Step 4: Direct log_waiting component (lag=4d)    → ρs ≈ +0.184
-  Step 5: Two-regime model + PINN                  → ρs ≈ +0.248
+  Step 1: Raw gravity score (lag=7d)
+  Step 2: Log transform
+  Step 3: MA21 smoothing
+  Step 4: Direct log_waiting component (lag=4d)
+  Step 5: Two-regime model + PINN
+
+The Spearman IC of each step is written to
+outputs/financial/five_steps_<target>_<horizon>d.csv.
 
 Usage:
     python src/correlation/five_steps_explanation.py
@@ -159,7 +162,7 @@ def run(ticker: str = "SBLK", horizon: int = 10) -> None:
     signal1 = gravity["gravity_score"].shift(7)
     r, p, n = spearman(signal1, fwd_ret)
     results.append({
-        "etape": "01",
+        "step": "01",
         "label": "Gravity score brut (lag=7j)",
         "transformation": "gravity_score[t-7]  ←  aucune transformation",
         "rho_s": r, "p_value": p, "n_obs": n,
@@ -176,7 +179,7 @@ def run(ticker: str = "SBLK", horizon: int = 10) -> None:
     signal2 = log_gravity
     r, p, n = spearman(signal2, fwd_ret)
     results.append({
-        "etape": "02",
+        "step": "02",
         "label": "Log-transformation",
         "transformation": "log1p(gravity_score)",
         "rho_s": r, "p_value": p, "n_obs": n,
@@ -192,7 +195,7 @@ def run(ticker: str = "SBLK", horizon: int = 10) -> None:
     signal3 = log_gravity.rolling(21, min_periods=7).mean()
     r, p, n = spearman(signal3, fwd_ret)
     results.append({
-        "etape": "03",
+        "step": "03",
         "label": "Lissage MA21",
         "transformation": "rolling(log_gravity, 21j).mean()",
         "rho_s": r, "p_value": p, "n_obs": n,
@@ -208,7 +211,7 @@ def run(ticker: str = "SBLK", horizon: int = 10) -> None:
     signal4 = np.log1p(gravity["waiting_vessels"]).shift(4)
     r, p, n = spearman(signal4, fwd_ret)
     results.append({
-        "etape": "04",
+        "step": "04",
         "label": "Direct log_waiting component (lag=4d)",
         "transformation": "log1p(waiting_vessels)[t-4]",
         "rho_s": r, "p_value": p, "n_obs": n,
@@ -301,7 +304,7 @@ def run(ticker: str = "SBLK", horizon: int = 10) -> None:
     n5 = valid.sum()
 
     results.append({
-        "etape": "05",
+        "step": "05",
         "label": "Two-regime model + PINN",
         "transformation": (
             "Regime 1 (normal days)  : Ridge on 8 AIS features\n"
@@ -326,7 +329,7 @@ def run(ticker: str = "SBLK", horizon: int = 10) -> None:
         gain_str = f"  (+{res['gain']:.3f})" if res["gain"] is not None else ""
         sig = "★" if res["p_value"] < 0.05 else " "
         print(f"\n{'─'*80}")
-        print(f"  STEP {res['etape']} — {res['label']}")
+        print(f"  STEP {res['step']} — {res['label']}")
         print(f"  Transformation : {res['transformation']}")
         print(f"  ρs = {res['rho_s']:+.4f}{gain_str}   p={res['p_value']:.4f}  n={res['n_obs']} {sig}")
         print(f"\n  → {res['interpretation']}")
@@ -343,14 +346,14 @@ def run(ticker: str = "SBLK", horizon: int = 10) -> None:
     for res in results:
         gain = f"+{res['gain']:.3f}" if res["gain"] is not None else "—"
         sig  = " ★" if res["p_value"] < 0.05 else ""
-        print(f"  {res['etape']:<6} {res['label']:<42} {res['rho_s']:>+7.4f}  {gain:>7}  "
+        print(f"  {res['step']:<6} {res['label']:<42} {res['rho_s']:>+7.4f}  {gain:>7}  "
               f"{res['p_value']:>8.4f}  {res['n_obs']:>6}{sig}")
 
     print(f"\n  ★ = p < 0.05\n")
 
     # ── Save CSV ─────────────────────────────────────────────────────────────
     out = pd.DataFrame([{
-        "etape": r["etape"], "label": r["label"],
+        "step": r["step"], "label": r["label"],
         "rho_s": r["rho_s"], "gain": r["gain"],
         "p_value": r["p_value"], "n_obs": r["n_obs"],
     } for r in results])
