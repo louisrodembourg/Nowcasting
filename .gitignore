@@ -44,4 +44,3 @@ notebooks/*.jpeg
 !.env.example
 PROGRESS.md
 
-# Local tool settings
