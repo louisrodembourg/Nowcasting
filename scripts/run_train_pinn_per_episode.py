@@ -1,6 +1,6 @@
 """
-Entraîne un PINN (rho + v, architecture actuelle) par épisode,
-extrait les résumés physiques sur grille dense, sauvegarde en Parquet.
+Train one PINN (rho + v, current architecture) per episode,
+extract the physical summaries on a dense grid and save them to Parquet.
 
 Usage:
     python scripts/run_train_pinn_per_episode.py [--epochs 500] [--max-duration 30]
@@ -35,7 +35,7 @@ from src.pinns.pinn_pipeline import structure_episodes
 parser = argparse.ArgumentParser()
 parser.add_argument("--epochs",       type=int,   default=500)
 parser.add_argument("--max-duration", type=int,   default=30,
-                    help="Exclure les épisodes > N jours (outliers pandémie)")
+                    help="Exclude episodes longer than N days (pandemic outliers)")
 parser.add_argument("--n-colloc",     type=int,   default=800)
 parser.add_argument("--lr",           type=float, default=5e-4)
 parser.add_argument("--lambda-pde",   type=float, default=0.1)
@@ -50,8 +50,8 @@ MIN_EP_DAYS    = 3
 X_GRID         = 60
 T_GRID         = 60
 
-# ── Détection épisodes ────────────────────────────────────────────────────────
-log.info("Détection épisodes 2017-2024...")
+# ── Episode detection ─────────────────────────────────────────────────────────
+log.info("Detecting episodes 2017-2024...")
 episodes, global_meta = structure_episodes(
     location=LOCATION,
     gravity_path=GRAVITY_PATH,
@@ -61,11 +61,11 @@ episodes, global_meta = structure_episodes(
     end_date=date(2024, 10, 31),
 )
 
-# Filtrer méga-épisodes (outliers pandémie/crise congestion)
+# Drop mega-episodes (pandemic / congestion-crisis outliers)
 n_raw = len(episodes)
 episodes = [ep for ep in episodes if ep.duration_days <= args.max_duration]
 log.info(
-    "%d épisodes retenus sur %d (filtre max_duration=%dj)",
+    "%d episodes kept out of %d (max_duration filter=%dd)",
     len(episodes), n_raw, args.max_duration,
 )
 
@@ -78,7 +78,7 @@ v_max       = global_meta["global_v_max"]
 
 
 def train_episode_pinn(ep) -> LWRPINN:
-    """Entraîne un PINN from scratch sur les observations d'un seul épisode."""
+    """Train a PINN from scratch on the observations of a single episode."""
     model = LWRPINN(hidden_layers=4, hidden_size=64).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
@@ -125,7 +125,7 @@ def train_episode_pinn(ep) -> LWRPINN:
 
 
 def extract_summaries(model: LWRPINN, ep) -> dict:
-    """Extrait les résumés scalaires depuis les champs PINN sur grille dense."""
+    """Extract scalar summaries from the PINN fields on a dense grid."""
     model.eval().to(device)
 
     t_max_days = float(ep.duration_days) * 2.0 + 1.0
@@ -149,7 +149,7 @@ def extract_summaries(model: LWRPINN, ep) -> dict:
     rho_grid  = rho_field.reshape(T_GRID, X_GRID)   # (t, x)
     v_grid    = v_field.reshape(T_GRID, X_GRID)
 
-    rho_max_t = rho_grid.max(axis=1)           # profil temporel de densité max
+    rho_max_t = rho_grid.max(axis=1)           # temporal profile of max density
 
     peak_idx       = int(np.argmax(rho_max_t))
     peak_rho       = float(rho_max_t[peak_idx])
@@ -160,7 +160,7 @@ def extract_summaries(model: LWRPINN, ep) -> dict:
     post_rho = rho_max_t[peak_idx:]
     decay_rate = float(np.polyfit(post_t, post_rho, 1)[0]) if len(post_t) >= 2 else 0.0
 
-    # Flux à l'entrée du chenal (x ≤ 10% du chenal)
+    # Flux at the channel entrance (x ≤ 10% of the channel)
     entry_mask = (xx.ravel() / channel_len) <= 0.10
     flux_entry = float((rho_field * v_field)[entry_mask].mean()) if entry_mask.any() else 0.0
 
@@ -176,7 +176,7 @@ def extract_summaries(model: LWRPINN, ep) -> dict:
     }
 
 
-# ── Boucle principale ─────────────────────────────────────────────────────────
+# ── Main loop ─────────────────────────────────────────────────────────────────
 records = []
 t_start_total = time.time()
 
@@ -184,7 +184,7 @@ for i, ep in enumerate(episodes):
     t0 = time.time()
 
     if ep.n_points < 2:
-        log.warning("[%d/%d] %s — trop peu de points (%d), skipped",
+        log.warning("[%d/%d] %s — too few points (%d), skipped",
                     i+1, len(episodes), ep.episode_id, ep.n_points)
         continue
 
@@ -194,7 +194,7 @@ for i, ep in enumerate(episodes):
     try:
         pinn   = train_episode_pinn(ep)
         summ   = extract_summaries(pinn, ep)
-        del pinn  # libérer la mémoire GPU/MPS
+        del pinn  # free GPU/MPS memory
         torch.mps.empty_cache() if device.type == "mps" else None
 
         elapsed = time.time() - t0
@@ -212,14 +212,14 @@ for i, ep in enumerate(episodes):
         })
 
     except Exception as exc:
-        log.error("  ÉCHEC %s: %s", ep.episode_id, exc)
+        log.error("  FAILED %s: %s", ep.episode_id, exc)
 
     # Estimation ETA
     done = i + 1
     elapsed_total = time.time() - t_start_total
     eta = elapsed_total / done * (len(episodes) - done)
     if done % 10 == 0 or done <= 3:
-        log.info("  ETA: %dm%02ds restants (%d/%d épisodes)",
+        log.info("  ETA: %dm%02ds remaining (%d/%d episodes)",
                  int(eta)//60, int(eta)%60, done, len(episodes))
 
 df = pd.DataFrame(records)
@@ -227,10 +227,10 @@ OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
 df.to_parquet(OUT_PATH, index=False)
 
 total_elapsed = time.time() - t_start_total
-log.info("=== TERMINÉ ===")
-log.info("%d épisodes traités en %dm%02ds", len(df), int(total_elapsed)//60, int(total_elapsed)%60)
-log.info("Sauvegardé → %s", OUT_PATH)
-log.info("Durées : min=%dj  median=%.0fj  max=%dj",
+log.info("=== DONE ===")
+log.info("%d episodes processed in %dm%02ds", len(df), int(total_elapsed)//60, int(total_elapsed)%60)
+log.info("Saved → %s", OUT_PATH)
+log.info("Durations: min=%dd  median=%.0fd  max=%dd",
          int(df["duration_days"].min()),
          df["duration_days"].median(),
          int(df["duration_days"].max()))

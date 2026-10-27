@@ -1,29 +1,29 @@
 """
-Phase 2 — Manifold géospatial + Gravity Score.
+Phase 2 — Geospatial manifold + gravity score.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-MODE RECOMMANDÉ — Baseline fixe + Scoring (2 étapes séparées)
+RECOMMENDED MODE — Fixed baseline + scoring (2 separate steps)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  Étape 1 — Apprendre la topologie sur une période de référence calme :
+  Step 1 — Learn the topology on a calm reference period:
 
     python src/manifold/manifold_pipeline.py --identify `
         --baseline-start 2017-01-01 --baseline-end 2017-01-30 `
         --start 2017-01-01 --end 2017-01-30 `
         --location houston
 
-    → Sauvegarde data/features/houston_constituent_zones.parquet
+    → Saves data/features/houston_constituent_zones.parquet
 
-  Étape 2 — Scorer la période de crise avec la topologie figée :
+  Step 2 — Score the crisis period with the frozen topology:
 
     python src/manifold/manifold_pipeline.py --score `
         --start 2020-01-01 --end 2020-12-31 `
         --location la
 
-    → Sauvegarde data/features/houston_gravity_daily.parquet
-      + outputs/figures/houston_gravity_score.html
+    → Saves data/features/<location>_gravity_daily.parquet
+      + outputs/figures/<location>_gravity_score.html
 
-  Raccourci (étapes 1+2 en une seule commande) :
+  Shortcut (steps 1+2 in a single command):
 
     python src/manifold/manifold_pipeline.py --both `
         --baseline-start 2017-01-01 --baseline-end 2017-12-31 `
@@ -31,16 +31,16 @@ MODE RECOMMANDÉ — Baseline fixe + Scoring (2 étapes séparées)
         --location la
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-MODE ROLLING — Fenêtre glissante de 3 mois (expérimental)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━═════════════════════════════════════
+ROLLING MODE — 3-month sliding window (experimental)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  Sans normalisation baseline (dynamique par fenêtre) :
+  Without baseline normalisation (per-window dynamics):
 
     python src/manifold/manifold_pipeline.py --rolling `
         --start 2017-01-01 --end 2017-12-31 `
         --location houston
 
-  Avec normalisation baseline (valeurs > 1.0 = disruption) :
+  With baseline normalisation (values > 1.0 = disruption):
 
     python src/manifold/manifold_pipeline.py --rolling `
         --start 2017-01-01 --end 2017-12-31 `
@@ -48,12 +48,12 @@ MODE ROLLING — Fenêtre glissante de 3 mois (expérimental)
         --location houston
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-OPTIONS COMMUNES
+COMMON OPTIONS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  --location   houston | la | suez   (défaut : la)
-  --k          voisins KNN pour le graphe LBO     (défaut : 5)
-  --n-eigenvectors  vecteurs propres à conserver  (défaut : 5)
+  --location   houston | la | suez   (default: la)
+  --k          KNN neighbours for the LBO graph    (default: 5)
+  --n-eigenvectors  eigenvectors to keep           (default: 5)
 """
 
 import argparse
@@ -113,15 +113,15 @@ def build_weight_matrix(X_norm, k):
     distances = distances[:, 1:]
     indices = indices[:, 1:]
     
-    # Sigma local adaptatif (Zelnik-Manor & Perona) :
-    # Pour chaque point i, sigma_local[i] = distance au k-ème voisin
-    sigma_local = distances[:, -1]  # Dernière colonne = distance au k-ème voisin
-    sigma_local = np.maximum(sigma_local, 1e-10)  # Éviter les zéros
+    # Adaptive local sigma (Zelnik-Manor & Perona):
+    # For each point i, sigma_local[i] = distance to its k-th neighbour
+    sigma_local = distances[:, -1]  # Last column = distance to the k-th neighbour
+    sigma_local = np.maximum(sigma_local, 1e-10)  # Avoid zeros
     
     rows = np.repeat(np.arange(n), k_safe)
     cols = indices.ravel()
     
-    # Noyau Gaussien avec sigmas locaux : exp(-(d^2) / (sigma_i * sigma_j))
+    # Gaussian kernel with local sigmas: exp(-(d^2) / (sigma_i * sigma_j))
     sigma_product = sigma_local[rows] * sigma_local[cols]
     vals = np.exp(-(distances.ravel() ** 2) / sigma_product)
     
@@ -370,7 +370,7 @@ def identify_constituent_zones(
 def compute_daily_gravity(d, location, constituent_zones, config=None, spatial_tol_deg=0.005):
     '''
     For a given day, compute gravity score based on vessels in constituent zones.
-    Formula: gravity_score = sum(capacity * temps_attente * manifold_deviation)
+    Formula: gravity_score = sum(capacity * waiting_time * manifold_deviation)
 
     Zone matching uses NearestNeighbors with spatial_tol_deg tolerance (~500 m at 0.005°)
     to handle centroid drift from tides and wind rather than requiring exact key matches.
@@ -593,7 +593,7 @@ def compute_day_manifold(
 
 
 def get_month_range(year, month):
-    """Retourne le premier et dernier jour d'un mois donné."""
+    """Return the first and last day of a given month."""
     start = date(year, month, 1)
     if month == 12:
         end = date(year + 1, 1, 1) - timedelta(days=1)
@@ -612,20 +612,20 @@ def rolling_manifold_pipeline(
     baseline_end=None,
 ):
     """
-    Rolling Manifold avec fenêtre glissante de 3 mois.
-    Pour chaque mois M, identifie les zones constituantes sur M-3 à M-1,
-    puis évalue le gravity_score quotidien sur M.
+    Rolling manifold with a 3-month sliding window.
+    For each month M, identify the constituent zones on M-3 to M-1,
+    then evaluate the daily gravity_score on M.
 
-    baseline_start / baseline_end : période de référence (ex. 2018) utilisée
-    pour calculer les maxima d'occupation par zone. La normalisation de chaque
-    fenêtre glissante est alors faite contre ce référentiel statique, de sorte
-    qu'une valeur > 1.0 dans X signale une congestion au-dessus de la baseline.
-    Si non fournis, normalisation dynamique par fenêtre (comportement par défaut).
+    baseline_start / baseline_end: reference period (e.g. 2018) used to
+    compute the per-zone occupancy maxima. Each sliding window is then
+    normalised against this static reference, so that a value > 1.0 in X
+    signals congestion above the baseline.
+    If not provided, normalisation is dynamic per window (default behaviour).
     """
     log.info(f"Rolling Manifold pipeline: {start} -> {end}")
     config = _load_config(location)
 
-    # --- Normalisation baseline (optionnelle) --------------------------------
+    # --- Baseline normalisation (optional) -----------------------------------
     zone_max_baseline = None
     if baseline_start is not None and baseline_end is not None:
         log.info(f"Computing baseline maxima: {baseline_start} -> {baseline_end}")
@@ -635,7 +635,7 @@ def rolling_manifold_pipeline(
     
     all_scores = []
     
-    # Déterminer tous les mois de calcul entre start et end
+    # All computation months between start and end
     current = date(start.year, start.month, 1)
     end_month = date(end.year, end.month, 1)
     
@@ -650,10 +650,10 @@ def rolling_manifold_pipeline(
     for year, month in months:
         log.info(f"\n=== Processing month {year}-{month:02d} ===")
         
-        # Mois de calcul M
+        # Computation month M
         month_start, month_end = get_month_range(year, month)
         
-        # Fenêtre historique : M-3 à M-1 (3 mois précédents)
+        # History window: M-3 to M-1 (previous 3 months)
         if month <= 3:
             hist_start_year = year - 1
             hist_start_month = 12 + month - 3
@@ -672,7 +672,7 @@ def rolling_manifold_pipeline(
         
         _, hist_end = get_month_range(hist_end_year, hist_end_month)
         
-        # S'assurer que la fenêtre historique est disponible
+        # Make sure the history window is available
         if hist_start < start:
             log.warning(f"Insufficient historical data for {year}-{month:02d}, skipping")
             continue
@@ -680,7 +680,7 @@ def rolling_manifold_pipeline(
         log.info(f"  Historical window: {hist_start} -> {hist_end}")
         log.info(f"  Scoring period: {month_start} -> {month_end}")
         
-        # Calculer les zones constituantes sur la fenêtre historique
+        # Constituent zones on the history window
         try:
             constituent_zones = identify_constituent_zones(
                 hist_start, hist_end, location, k, n_eigenvectors,
@@ -690,7 +690,7 @@ def rolling_manifold_pipeline(
             log.warning(f"Could not identify constituent zones for {year}-{month:02d}: {e}")
             continue
 
-        # Calculer les scores quotidiens pour le mois M
+        # Daily scores for month M
         d = max(month_start, start)
         month_end_bounded = min(month_end, end)
 

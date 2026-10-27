@@ -1,23 +1,23 @@
 """
-Phase 4-5 — Pipeline Financier: nowcasting maritime → signal de marché.
+Phase 4 — Financial pipeline: maritime nowcasting → market signal.
 
-Variable cible (Y) : variation d'un indice financier sur N jours.
+Target variable (Y): change of a financial index over N days.
 
-Actifs financiers cibles — routage automatique par port :
-  - Houston → WTI Crude Oil (quotidien) : port pétrolier (~70% trafic energy)
-              Source CSV : stooq.com/q/d/l/?s=cl.f&i=d  (col=Close)
-  - LA      → S&P 500     (quotidien) : porte d'entrée biens de consommation US
-              Source CSV : stooq.com/q/d/l/?s=%5Espx&i=d  (col=Close)
-  - Override manuel possible via --financial pour tout autre indice (BDI, FBX, GSCSI…)
+Target financial assets — automatic routing per port:
+  - Houston → WTI crude oil (daily): oil port (~70% energy traffic)
+              CSV source: stooq.com/q/d/l/?s=cl.f&i=d  (col=Close)
+  - LA      → S&P 500     (daily): US consumer-goods gateway
+              CSV source: stooq.com/q/d/l/?s=%5Espx&i=d  (col=Close)
+  - Manual override via --financial for any other index (BDI, FBX, GSCSI…)
 
-Variables explicatives (X) : Gravity Score + Time to Clear (TTC) issus du PINN.
+Explanatory variables (X): gravity score + PINN time-to-clear (TTC) and field summaries.
 
-Étape 1 : build_events_dataset()      → Gravity Score + TTC via PINN pour chaque épisode
-Étape 2 : align_with_financials()     → fusion avec l'actif cible, rendement N-jours forward
-Étape 3 : run_correlation_analysis()  → Pearson / Spearman + XGBRegressor (TimeSeriesSplit)
-Étape 4 : generate_trading_signal()   → alerte structurée adaptée au port (WTI ou S&P 500)
+Step 1: build_events_dataset()      → gravity score + PINN TTC for each episode
+Step 2: align_with_financials()     → merge with the target asset, N-day forward return
+Step 3: run_correlation_analysis()  → Pearson / Spearman + XGBRegressor (TimeSeriesSplit)
+Step 4: generate_trading_signal()   → structured alert adapted to the port (WTI or S&P 500)
 
-Commandes de lancement (PowerShell — tout sur une ligne) :
+Commands (single line each):
 
   Houston → WTI :
     python src/correlation/financial_pipeline.py --model outputs/models/pinn_houston_episodes.pt --location houston --wti data/financial/WTI.csv --start 2017-01-01 --end 2017-12-31 --n-days 5 10 15 30 --target return_10d
@@ -25,16 +25,16 @@ Commandes de lancement (PowerShell — tout sur une ligne) :
   LA → S&P 500 :
     python src/correlation/financial_pipeline.py --model outputs/models/pinn_la_episodes.pt --location la --sp500 data/financial/SP500.csv --start 2017-01-01 --end 2017-12-31 --gravity-threshold 1000 --n-days 5 10 15 30 --target return_10d
 
-  Override manuel (ex. BDI) :
+  Manual override (e.g. BDI):
     python src/correlation/financial_pipeline.py --model outputs/models/pinn_houston_episodes.pt --location houston --financial data/financial/BDI.csv --price-col Close --start 2017-01-01 --end 2017-12-31 --n-days 5 10 15 30 --target return_10d
 
-Notes :
-  - Données LA disponibles : 2017 uniquement (gravity_daily.parquet 2017-01-01→2017-12-31)
-  - Données Houston disponibles : 2017 uniquement (idem)
-  - Seuil gravity LA : 1000 (distribution bimodale basse, défaut=5000 trop restrictif)
-  - Seuil gravity Houston : 50000 (défaut LOCATION_DEFAULTS, adapté à Harvey)
-  - WTI CSV source : stooq.com  ticker cl.f  (col Close, quotidien)
-  - SP500 CSV fourni : data/financial/SP500.csv  (converti depuis Investing.com)
+Notes:
+  - LA gravity threshold     : 1000 (low bimodal distribution, default=5000 too strict)
+  - Houston gravity threshold: 50000 (LOCATION_DEFAULTS, tuned for Harvey)
+  - WTI CSV source: stooq.com ticker cl.f (Close column, daily)
+  - SP500 CSV: data/financial/SP500.csv (converted from Investing.com)
+  - Gravity data: data/features/<location>_gravity_daily.parquet
+  - Use --gravity-only for long periods without AIS parquets
 """
 
 import argparse
@@ -66,25 +66,25 @@ OUTPUT_DIR = Path("outputs/financial")
 DEFAULT_N_DAYS = [5, 10, 15, 30]
 DEFAULT_RHO_THRESHOLD_FRAC = 0.3
 
-# Mapping port → actif financier cible
-# Justification économique :
-#   Houston : ~70% trafic pétrolier/gazier  → WTI est l'actif le plus directement impacté
-#   LA      : porte d'entrée biens conso US → S&P 500 capte l'impact sur la chaîne retail
+# Port → target financial asset
+# Economic rationale:
+#   Houston: ~70% oil/gas traffic       → WTI is the most directly affected asset
+#   LA     : US consumer-goods gateway  → the S&P 500 captures the retail supply-chain impact
 LOCATION_ASSET_MAP: dict[str, dict] = {
     "houston": {
-        "asset_name":  "PETROLE BRUT (WTI)",
+        "asset_name":  "CRUDE OIL (WTI)",
         "asset_short": "WTI",
         "consequence": (
-            "traduisant un choc d'offre energetique "
-            "(Houston : ~70% de trafic petrolier et gazier)."
+            "reflecting an energy supply shock "
+            "(Houston: ~70% oil and gas traffic)."
         ),
     },
     "la": {
         "asset_name":  "S&P 500",
         "asset_short": "SP500",
         "consequence": (
-            "traduisant un impact sur la chaine d'approvisionnement "
-            "des biens de consommation americains."
+            "reflecting an impact on the supply chain "
+            "of US consumer goods."
         ),
     },
 }
@@ -100,15 +100,15 @@ def _compute_ttc(
     fallback_days: Optional[float] = None,
 ) -> tuple[Optional[float], str]:
     """
-    Calcule le Time to Clear depuis un DataFrame de profils PINN.
-    TTC = premier jour où max_x ρ(x,t) < rho_threshold_frac × pic initial.
+    Compute the time-to-clear from a DataFrame of PINN profiles.
+    TTC = first day where max_x ρ(x,t) < rho_threshold_frac × initial peak.
 
-    Si le seuil n'est jamais atteint dans la fenêtre PINN, utilise fallback_days
-    (= durée observée de l'épisode) comme borne basse conservative.
+    If the threshold is never reached within the PINN window, fallback_days
+    (= observed episode duration) is used as a conservative lower bound.
 
     Returns
     -------
-    (ttc_value, source)  où source ∈ {"pinn", "duration_fallback", "unavailable"}
+    (ttc_value, source)  where source ∈ {"pinn", "duration_fallback", "unavailable"}
     """
     t_series = (
         profiles.groupby("t_days")["rho_hat"]
@@ -130,14 +130,14 @@ def _compute_ttc(
     if len(below) > 0:
         return float(t_vals[below[0]]), "pinn"
 
-    # PINN n'a pas prédit de résolution → fallback sur la durée observée
+    # The PINN did not predict a resolution → fall back to the observed duration
     if fallback_days is not None:
         return fallback_days, "duration_fallback"
     return None, "unavailable"
 
 
 def _load_checkpoint(model_path: Path) -> tuple[LWRPINN, dict]:
-    """Charge un checkpoint PINN et retourne (model, global_meta)."""
+    """Load a PINN checkpoint and return (model, global_meta)."""
     ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
     model = LWRPINN(
         hidden_layers=4, hidden_size=64,
@@ -147,14 +147,14 @@ def _load_checkpoint(model_path: Path) -> tuple[LWRPINN, dict]:
     model.load_state_dict(ckpt["model_state"])
     model.eval()
     log.info(
-        "Checkpoint charge: %s | best_loss=%.6f | %d episode(s) d'entrainement",
+        "Checkpoint loaded: %s | best_loss=%.6f | %d training episode(s)",
         model_path, ckpt["best_loss"], ckpt["n_episodes"],
     )
     return model, ckpt["global_meta"]
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# ÉTAPE 1 — Extraction des métriques physiques
+# STEP 1 — Physical metrics extraction
 # ════════════════════════════════════════════════════════════════════════════
 
 def build_events_dataset(
@@ -170,39 +170,39 @@ def build_events_dataset(
     t_grid_points: int = 80,
 ) -> pd.DataFrame:
     """
-    Étape 1 — Extrait Gravity Score + TTC pour chaque épisode de disruption.
+    Step 1 — Extract gravity score + TTC for each disruption episode.
 
-    Pour chaque épisode détecté par structure_episodes():
-      1. Reconstruit les coordonnées physiques (x_km, t_days) depuis Episode.
-      2. Appelle extract_physical_profiles() → champ PINN dense (ρ̂, v̂).
-      3. Calcule le TTC via _compute_ttc() (sans PNG).
+    For each episode detected by structure_episodes():
+      1. Rebuild the physical coordinates (x_km, t_days) from the Episode.
+      2. Call extract_physical_profiles() → dense PINN field (ρ̂, v̂).
+      3. Compute the TTC with _compute_ttc() (no PNG).
 
     Parameters
     ----------
-    model             : LWRPINN pré-entraîné (depuis checkpoint)
-    global_meta       : métadonnées de normalisation du checkpoint
-    location          : 'houston' ou 'la'
-    gravity_threshold : seuil de déclenchement (défaut: LOCATION_DEFAULTS)
-    start_date        : borne inférieure de la période de scan
-    end_date          : borne supérieure de la période de scan
-    gravity_path      : chemin custom vers gravity_daily.parquet
-    rho_threshold_frac: fraction du pic définissant le seuil TTC
-    x_grid_points     : résolution spatiale de la grille PINN
-    t_grid_points     : résolution temporelle de la grille PINN
+    model             : pre-trained LWRPINN (from checkpoint)
+    global_meta       : normalisation metadata of the checkpoint
+    location          : 'houston' or 'la'
+    gravity_threshold : trigger threshold (default: LOCATION_DEFAULTS)
+    start_date        : lower bound of the scan period
+    end_date          : upper bound of the scan period
+    gravity_path      : custom path to gravity_daily.parquet
+    rho_threshold_frac: fraction of the peak defining the TTC threshold
+    x_grid_points     : spatial resolution of the PINN grid
+    t_grid_points     : temporal resolution of the PINN grid
 
     Returns
     -------
     DataFrame pandas:
         episode_id    | start_date | end_date | duration_days
-        gravity_score | ttc_days   | n_ais_points
+        gravity_score | ttc_pinn   | n_ais_points | PINN summaries
     """
     if gravity_threshold is None:
         gravity_threshold = LOCATION_DEFAULTS.get(location, {}).get("gravity_threshold", 50_000)
 
     log.info(
-        "=== ETAPE 1: Build events dataset | %s | threshold=%.0f | %s -> %s",
+        "=== STEP 1: Build events dataset | %s | threshold=%.0f | %s -> %s",
         location, gravity_threshold,
-        start_date or "debut", end_date or "fin",
+        start_date or "start", end_date or "end",
     )
 
     episodes, _ = structure_episodes(
@@ -214,13 +214,13 @@ def build_events_dataset(
     )
 
     if not episodes:
-        log.warning("Aucun episode detecte — DataFrame vide retourne.")
+        log.warning("No episode detected — returning an empty DataFrame.")
         return pd.DataFrame(columns=[
             "episode_id", "start_date", "end_date",
             "duration_days", "gravity_score", "ttc_days", "ttc_source", "n_ais_points",
         ])
 
-    log.info("%d episodes detectes. Extraction des profils PINN...", len(episodes))
+    log.info("%d episodes detected. Extracting PINN profiles...", len(episodes))
     model.eval()
     records = []
 
@@ -233,7 +233,7 @@ def build_events_dataset(
 
         ttc, ttc_source = None, "unavailable"
         if ep.n_points > 0:
-            # Reconstruire les coordonnées physiques depuis les valeurs normalisées
+            # Rebuild physical coordinates from the normalised values
             episode_data = pd.DataFrame({
                 "x_km":   ep.x_norm * ep.channel_len_km,
                 "t_days": ep.t_norm * ep.duration_days,
@@ -257,12 +257,12 @@ def build_events_dataset(
                 )
                 pinn_summaries = extract_pinn_summaries(profiles)
                 log.info(
-                    "    TTC = %.1f jours [%s] | peak_rho=%.2f | decay=%.4f",
+                    "    TTC = %.1f days [%s] | peak_rho=%.2f | decay=%.4f",
                     ttc, ttc_source,
                     pinn_summaries["peak_rho"], pinn_summaries["decay_rate"],
                 )
             except Exception as exc:
-                log.warning("    Erreur profils PINN (%s) — fallback duration", exc)
+                log.warning("    PINN profile error (%s) — fallback duration", exc)
                 ttc, ttc_source = float(ep.duration_days), "duration_fallback"
                 pinn_summaries = {
                     "peak_rho": float("nan"), "t_to_peak_days": float("nan"),
@@ -270,7 +270,7 @@ def build_events_dataset(
                     "flux_entry_mean": float("nan"), "v_mean_global": float("nan"),
                 }
         else:
-            log.warning("    Aucun point AIS — fallback duration")
+            log.warning("    No AIS point — fallback duration")
             ttc, ttc_source = float(ep.duration_days), "duration_fallback"
             pinn_summaries = {
                 "peak_rho": float("nan"), "t_to_peak_days": float("nan"),
@@ -282,9 +282,9 @@ def build_events_dataset(
             "episode_id":    ep.episode_id,
             "start_date":    ep.start_date,
             "end_date":      ep.end_date,
-            "duration_days": ep.duration_days,   # TTC observé — label XGBoost Phase 4
+            "duration_days": ep.duration_days,   # observed TTC — Phase 4 XGBoost label
             "gravity_score": float(ep.trigger_score),
-            "ttc_pinn":      ttc,                # TTC par seuillage PINN (référence)
+            "ttc_pinn":      ttc,                # TTC from PINN thresholding (reference)
             "ttc_source":    ttc_source,
             "n_ais_points":  ep.n_points,
             **pinn_summaries,                    # peak_rho, t_to_peak_days, area_under_rho, decay_rate, flux_entry_mean, v_mean_global
@@ -294,14 +294,14 @@ def build_events_dataset(
     n_pinn     = (df["ttc_source"] == "pinn").sum()
     n_fallback = (df["ttc_source"] == "duration_fallback").sum()
     log.info(
-        "Dataset: %d episodes | TTC: %d via PINN, %d via fallback duree, %d indisponible",
+        "Dataset: %d episodes | TTC: %d via PINN, %d via duration fallback, %d unavailable",
         len(df), n_pinn, n_fallback, (df["ttc_source"] == "unavailable").sum(),
     )
     return df
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# ÉTAPE 1b — Mode rapide : épisodes depuis gravity parquet (sans PINN)
+# STEP 1b — Fast mode: episodes from the gravity parquet (no PINN)
 # ════════════════════════════════════════════════════════════════════════════
 
 def build_events_from_gravity(
@@ -314,29 +314,29 @@ def build_events_from_gravity(
     gap_tolerance_days: int = 1,
 ) -> pd.DataFrame:
     """
-    Mode --gravity-only : construit le dataset d'épisodes directement depuis
-    le gravity parquet, sans charger les AIS ni faire tourner le PINN.
+    --gravity-only mode: build the episode dataset directly from the
+    gravity parquet, without loading AIS data or running the PINN.
 
-    TTC = durée observée de l'épisode (duration_fallback).
-    Gravity score = max du score sur la durée de l'épisode.
+    TTC = observed episode duration (duration_fallback).
+    Gravity score = max score over the episode.
 
-    Avantage : traite des années entières en quelques secondes.
-    Usage typique : grande période (2021-2024) quand les parquets AIS ont
-    été supprimés ou quand on veut une corrélation rapide.
+    Advantage: processes whole years in a few seconds.
+    Typical use: long periods (2021-2024) when the AIS parquets have
+    been deleted, or for a quick correlation.
 
     Parameters
     ----------
-    gap_tolerance_days : nombre de jours "sous le seuil" tolérés à l'intérieur
-                         d'un épisode (évite de fragmenter sur les week-ends).
+    gap_tolerance_days : number of "below threshold" days tolerated inside
+                         an episode (avoids fragmenting on weekends).
     """
     if gravity_threshold is None:
         gravity_threshold = LOCATION_DEFAULTS.get(location, {}).get("gravity_threshold", 50_000)
 
-    # Chemin du fichier gravity
+    # Gravity file path
     if gravity_path is None:
         gravity_path = Path(f"data/features/{location}_gravity_daily.parquet")
     if not gravity_path.exists():
-        raise FileNotFoundError(f"Gravity parquet introuvable : {gravity_path}")
+        raise FileNotFoundError(f"Gravity parquet not found: {gravity_path}")
 
     df = pd.read_parquet(gravity_path)
     df["date"] = pd.to_datetime(df["date"])
@@ -349,13 +349,13 @@ def build_events_from_gravity(
     df = df.sort_values("date").reset_index(drop=True)
 
     log.info(
-        "=== ETAPE 1 (gravity-only) | %s | threshold=%.0f | %d jours | %s -> %s",
+        "=== STEP 1 (gravity-only) | %s | threshold=%.0f | %d days | %s -> %s",
         location, gravity_threshold, len(df),
         df["date"].iloc[0].date() if len(df) else "?",
         df["date"].iloc[-1].date() if len(df) else "?",
     )
 
-    # ── Groupement en épisodes ──────────────────────────────────────────────
+    # ── Group into episodes ─────────────────────────────────────────────────
     above = df["gravity_score"] >= gravity_threshold
     records = []
     i = 0
@@ -364,7 +364,7 @@ def build_events_from_gravity(
             i += 1
             continue
 
-        # Début d'un épisode
+        # Start of an episode
         ep_start = i
         j = i + 1
         gap = 0
@@ -377,7 +377,7 @@ def build_events_from_gravity(
                 j += 1
             else:
                 break
-        # Retrancher les jours de gap en fin d'épisode
+        # Remove trailing gap days at the end of the episode
         ep_end = j - gap - 1
 
         ep_df   = df.iloc[ep_start : ep_end + 1]
@@ -403,36 +403,36 @@ def build_events_from_gravity(
 
     result = pd.DataFrame(records)
     log.info(
-        "%d episodes detectes (threshold=%.0f, min_days=%d)",
+        "%d episodes detected (threshold=%.0f, min_days=%d)",
         len(result), gravity_threshold, min_episode_days,
     )
     return result
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# ÉTAPE 2 — Alignement avec les données financières
+# STEP 2 — Alignment with financial data
 # ════════════════════════════════════════════════════════════════════════════
 
 def load_financial_data(path: Path, date_col: str = "Date", price_col: str = "Close") -> pd.DataFrame:
     """
-    Charge un fichier CSV d'indice financier.
-    Colonnes attendues: Date (YYYY-MM-DD), et une colonne prix (ex: Close, Price, BDI).
-    Retourne un DataFrame avec index DatetimeIndex et colonne price_col.
+    Load a financial index CSV file.
+    Expected columns: Date (YYYY-MM-DD) and a price column (e.g. Close, Price, BDI).
+    Returns a DataFrame with a DatetimeIndex and the price_col column.
     """
     df = pd.read_csv(path, parse_dates=[date_col])
     if date_col not in df.columns:
-        raise ValueError(f"Colonne '{date_col}' introuvable dans {path}. Colonnes: {list(df.columns)}")
+        raise ValueError(f"Column '{date_col}' not found in {path}. Columns: {list(df.columns)}")
     if price_col not in df.columns:
         available = [c for c in df.columns if c != date_col]
         raise ValueError(
-            f"Colonne '{price_col}' introuvable dans {path}. "
-            f"Colonnes disponibles: {available}. Utilisez --price-col."
+            f"Column '{price_col}' not found in {path}. "
+            f"Available columns: {available}. Use --price-col."
         )
     df = df[[date_col, price_col]].dropna().sort_values(date_col)
     df = df.set_index(date_col)
     df.index = pd.DatetimeIndex(df.index)
     log.info(
-        "Donnees financieres: %d jours de cotation | %s -> %s | col='%s'",
+        "Financial data: %d trading days | %s -> %s | col='%s'",
         len(df), df.index.min().date(), df.index.max().date(), price_col,
     )
     return df
@@ -446,51 +446,51 @@ def select_financial_data(
     price_col: str = "Close",
 ) -> tuple[pd.DataFrame, dict]:
     """
-    Sélectionne et charge l'actif financier cible selon le port d'étude.
+    Select and load the target financial asset for the studied port.
 
-    Houston → WTI Crude Oil  (port pétrolier, ~70% trafic energy)
-    LA      → S&P 500        (porte d'entrée biens de consommation US)
+    Houston → WTI crude oil (oil port, ~70% energy traffic)
+    LA      → S&P 500       (US consumer-goods gateway)
 
     Parameters
     ----------
-    location   : 'houston' ou 'la'
-    wti_path   : chemin vers le CSV WTI  (requis si location=houston)
-    sp500_path : chemin vers le CSV S&P 500 (requis si location=la)
-    date_col   : colonne date dans les CSV
-    price_col  : colonne prix dans les CSV (typiquement 'Close' pour Stooq)
+    location   : 'houston' or 'la'
+    wti_path   : path to the WTI CSV     (required if location=houston)
+    sp500_path : path to the S&P 500 CSV (required if location=la)
+    date_col   : date column in the CSVs
+    price_col  : price column in the CSVs (typically 'Close' for Stooq)
 
     Returns
     -------
     (financial_df, asset_info_dict)
-      asset_info_dict : entrée de LOCATION_ASSET_MAP (asset_name, asset_short, consequence)
+      asset_info_dict : LOCATION_ASSET_MAP entry (asset_name, asset_short, consequence)
     """
     asset_info = LOCATION_ASSET_MAP.get(location)
     if asset_info is None:
         raise ValueError(
-            f"Location '{location}' inconnue dans LOCATION_ASSET_MAP. "
+            f"Location '{location}' unknown in LOCATION_ASSET_MAP. "
             f"Valeurs acceptees : {list(LOCATION_ASSET_MAP.keys())}"
         )
 
     if location == "houston":
         if wti_path is None:
             raise ValueError(
-                "location=houston requiert --wti <chemin/WTI.csv>. "
-                "Source gratuite : stooq.com/q/d/l/?s=cl.f&i=d"
+                "location=houston requires --wti <path/WTI.csv>. "
+                "Free source: stooq.com/q/d/l/?s=cl.f&i=d"
             )
         if not wti_path.exists():
-            raise FileNotFoundError(f"Fichier WTI introuvable : {wti_path}")
-        log.info("Houston → actif financier cible : %s (%s)", asset_info["asset_name"], wti_path)
+            raise FileNotFoundError(f"WTI file not found: {wti_path}")
+        log.info("Houston → target financial asset: %s (%s)", asset_info["asset_name"], wti_path)
         df = load_financial_data(wti_path, date_col, price_col)
 
     else:  # la
         if sp500_path is None:
             raise ValueError(
-                "location=la requiert --sp500 <chemin/SP500.csv>. "
-                "Source gratuite : stooq.com/q/d/l/?s=%%5Espx&i=d"
+                "location=la requires --sp500 <path/SP500.csv>. "
+                "Free source: stooq.com/q/d/l/?s=%%5Espx&i=d"
             )
         if not sp500_path.exists():
-            raise FileNotFoundError(f"Fichier S&P 500 introuvable : {sp500_path}")
-        log.info("LA → actif financier cible : %s (%s)", asset_info["asset_name"], sp500_path)
+            raise FileNotFoundError(f"S&P 500 file not found: {sp500_path}")
+        log.info("LA → target financial asset: %s (%s)", asset_info["asset_name"], sp500_path)
         df = load_financial_data(sp500_path, date_col, price_col)
 
     return df, asset_info
@@ -503,36 +503,36 @@ def align_with_financials(
     n_days_list: Optional[list[int]] = None,
 ) -> pd.DataFrame:
     """
-    Étape 2 — Fusionne les épisodes avec l'indice financier et calcule
-    les rendements forward sur N jours.
+    Step 2 — Merge the episodes with the financial index and compute
+    N-day forward returns.
 
-    Gestion des jours de fermeture de marché (week-ends, fériés) : forward-fill
-    sur calendrier continu → la date d'un épisode tombe toujours sur un prix valide.
-    Adapté à toute fréquence : quotidien (BDI), hebdo (FBX/WCI), mensuel (GSCSI).
+    Market closures (weekends, holidays) are handled with a forward-fill
+    on a continuous calendar → an episode date always falls on a valid price.
+    Works for any frequency: daily (BDI), weekly (FBX/WCI), monthly (GSCSI).
 
-    Rendement N jours = (P[J+N] - P[J]) / |P[J]| × 100
-    où J = start_date de l'épisode.
-    |P[J]| au dénominateur gère les indices pouvant être négatifs (ex. GSCSI).
+    N-day return = (P[D+N] - P[D]) / |P[D]| × 100
+    where D = episode start_date.
+    |P[D]| in the denominator handles indices that can be negative (e.g. GSCSI).
 
     Parameters
     ----------
-    events_df    : sortie de build_events_dataset
-    financial_df : sortie de load_financial_data (index DatetimeIndex)
-    price_col    : nom de la colonne prix dans financial_df
-    n_days_list  : horizons forward en jours calendaires
-                   (défaut: [5, 10, 15, 30] pour données quotidiennes ;
-                    utiliser [30, 60, 90] pour données mensuelles)
+    events_df    : output of build_events_dataset
+    financial_df : output of load_financial_data (DatetimeIndex)
+    price_col    : name of the price column in financial_df
+    n_days_list  : forward horizons in calendar days
+                   (default: [5, 10, 15, 30] for daily data;
+                    use [30, 60, 90] for monthly data)
 
     Returns
     -------
-    DataFrame enrichi avec:
-        index_at_event : valeur de l'indice au J de l'épisode
-        return_{N}d    : variation en % de l'indice à J+N (une colonne par horizon)
+    DataFrame enriched with:
+        index_at_event : index value on the episode day
+        return_{N}d    : % change of the index at D+N (one column per horizon)
     """
     if n_days_list is None:
         n_days_list = DEFAULT_N_DAYS
 
-    # Calendrier continu + forward-fill pour combler les jours sans cotation
+    # Continuous calendar + forward-fill for days without a quote
     full_idx = pd.date_range(financial_df.index.min(), financial_df.index.max(), freq="D")
     fin = financial_df[[price_col]].reindex(full_idx).ffill()
 
@@ -564,14 +564,14 @@ def align_with_financials(
 
     valid = result["index_at_event"].notna().sum()
     log.info(
-        "Alignement financier (%s): %d episodes | %d avec valeur disponible | horizons: %s j",
+        "Financial alignment (%s): %d episodes | %d with an available value | horizons: %s d",
         price_col, len(result), valid, n_days_list,
     )
     return result
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# ÉTAPE 3 — Corrélations + XGBoost
+# STEP 3 — Correlations + XGBoost
 # ════════════════════════════════════════════════════════════════════════════
 
 def run_correlation_analysis(
@@ -580,18 +580,18 @@ def run_correlation_analysis(
     targets: Optional[list[str]] = None,
 ) -> pd.DataFrame:
     """
-    Étape 3a — Corrélations de Pearson et Spearman entre métriques physiques
-    [gravity_score, ttc_days] et rendements financiers [return_Nd].
+    Step 3a — Pearson and Spearman correlations between physical metrics
+    [gravity_score, ttc_days] and financial returns [return_Nd].
 
     Parameters
     ----------
-    dataset  : sortie de align_with_financials
-    features : variables explicatives (défaut: ['gravity_score', 'ttc_days'])
-    targets  : variables cibles (défaut: toutes colonnes 'return_*')
+    dataset  : output of align_with_financials
+    features : explanatory variables (default: ['gravity_score', 'ttc_days'])
+    targets  : target variables (default: all 'return_*' columns)
 
     Returns
     -------
-    DataFrame: feature × target avec pearson_r, pearson_p, spearman_r, spearman_p, n_obs
+    DataFrame: feature × target with pearson_r, pearson_p, spearman_r, spearman_p, n_obs
     """
     if features is None:
         features = ["gravity_score", "ttc_days"]
@@ -628,17 +628,17 @@ def train_xgboost(
     n_splits: int = 3,
 ) -> tuple:
     """
-    Étape 3b — XGBRegressor avec validation chronologique (TimeSeriesSplit).
+    Step 3b — XGBRegressor with chronological validation (TimeSeriesSplit).
 
-    Séparation train/test strictement chronologique pour éviter tout data
-    leakage : les épisodes futurs ne contaminent jamais l'entraînement.
+    Strictly chronological train/test split to avoid any data
+    leakage: future episodes never contaminate training.
 
     Parameters
     ----------
-    dataset    : sortie de align_with_financials
-    target_col : colonne cible (ex: 'return_10d')
-    features   : features X (défaut: ['gravity_score', 'ttc_days'])
-    n_splits   : nombre de folds chronologiques
+    dataset    : output of align_with_financials
+    target_col : target column (e.g. 'return_10d')
+    features   : X features (default: ['gravity_score', 'ttc_days'])
+    n_splits   : number of chronological folds
 
     Returns
     -------
@@ -649,19 +649,19 @@ def train_xgboost(
         from sklearn.model_selection import TimeSeriesSplit
         from sklearn.metrics import mean_squared_error, mean_absolute_error
     except ImportError:
-        raise ImportError("Requis: pip install xgboost scikit-learn")
+        raise ImportError("Required: pip install xgboost scikit-learn")
 
     if features is None:
         features = ["gravity_score", "ttc_days"]
 
-    # Supprimer automatiquement les features entièrement NaN (ex: ttc_days si jamais atteint)
+    # Automatically drop all-NaN features (e.g. ttc_days if never reached)
     available = [f for f in features if f in dataset.columns and dataset[f].notna().any()]
     dropped = [f for f in features if f not in available]
     if dropped:
-        log.warning("Features ignorees (toutes NaN) : %s", dropped)
+        log.warning("Features ignored (all NaN): %s", dropped)
     features = available
     if not features:
-        raise ValueError("Aucune feature valide — toutes les colonnes sont NaN.")
+        raise ValueError("No valid feature — all columns are NaN.")
 
     sort_col = "start_date" if "start_date" in dataset.columns else None
     sub = dataset[features + [target_col]].dropna()
@@ -675,16 +675,16 @@ def train_xgboost(
     min_samples = 4
     if len(X) < min_samples:
         raise ValueError(
-            f"Pas assez de donnees pour XGBoost ({len(X)} lignes apres dropna — "
-            f"minimum {min_samples}). Elargissez la fenetre temporelle ou "
-            f"abaissez le gravity_threshold."
+            f"Not enough data for XGBoost ({len(X)} rows after dropna — "
+            f"minimum {min_samples}). Widen the time window or "
+            f"lower gravity_threshold."
         )
 
     n_splits = min(n_splits, len(X) - 1)
     tscv = TimeSeriesSplit(n_splits=n_splits)
 
     log.info(
-        "=== ETAPE 3b: XGBoost | target=%s | features=%s | %d obs | %d folds",
+        "=== STEP 3b: XGBoost | target=%s | features=%s | %d obs | %d folds",
         target_col, features, len(X), n_splits,
     )
 
@@ -711,7 +711,7 @@ def train_xgboost(
             fold + 1, n_splits, len(train_idx), len(test_idx), rmse, mae,
         )
 
-    # Modèle final entraîné sur l'ensemble des données disponibles
+    # Final model trained on all available data
     final_model = XGBRegressor(
         n_estimators=200,
         max_depth=3,
@@ -748,7 +748,7 @@ def train_xgboost(
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# ÉTAPE 4 — Générateur de signal boursier
+# STEP 4 — Market signal generator
 # ════════════════════════════════════════════════════════════════════════════
 
 def generate_trading_signal(
@@ -761,26 +761,26 @@ def generate_trading_signal(
     rho_threshold_frac: float = DEFAULT_RHO_THRESHOLD_FRAC,
 ) -> dict:
     """
-    Étape 4 — Génère une alerte de marché structurée pour un épisode en direct.
+    Step 4 — Generate a structured market alert for a live episode.
 
-    Chaîne complète:
-        Episode → PINN → TTC → XGBoost → variation attendue → signal directionnel
+    Full chain:
+        Episode → PINN → TTC → XGBoost → expected change → directional signal
 
     Parameters
     ----------
-    episode             : Episode détecté en temps réel
-    pinn_model          : LWRPINN pré-entraîné
-    pinn_global_meta    : métadonnées du checkpoint PINN
-    xgb_model           : XGBRegressor entraîné via train_xgboost()
-    current_index_price : prix courant de l'indice (ex: BDI = 1250)
-    n_days              : horizon de prédiction en jours
-    rho_threshold_frac  : doit correspondre à celui utilisé à l'entraînement
+    episode             : episode detected in real time
+    pinn_model          : pre-trained LWRPINN
+    pinn_global_meta    : PINN checkpoint metadata
+    xgb_model           : XGBRegressor trained with train_xgboost()
+    current_index_price : current index price (e.g. BDI = 1250)
+    n_days              : prediction horizon in days
+    rho_threshold_frac  : must match the one used for training
 
     Returns
     -------
     dict: episode_id, gravity_score, ttc_days, predicted_return, signal, alert_text
     """
-    # --- TTC via PINN (fallback = durée observée de l'épisode) ---
+    # --- TTC via PINN (fallback = observed episode duration) ---
     ttc, ttc_source = float(episode.duration_days), "duration_fallback"
     if episode.n_points > 0:
         episode_data = pd.DataFrame({
@@ -801,56 +801,56 @@ def generate_trading_signal(
                 fallback_days=float(episode.duration_days),
             )
         except Exception as exc:
-            log.warning("Signal: erreur TTC (%s) — fallback duree", exc)
+            log.warning("Signal: TTC error (%s) — fallback duration", exc)
 
     gravity = float(episode.trigger_score)
 
-    # --- Prédiction XGBoost ---
+    # --- XGBoost prediction ---
     x_in = np.array([[gravity, ttc if ttc is not None else np.nan]])
     try:
         predicted_return = float(xgb_model.predict(x_in)[0])
     except Exception as exc:
-        log.warning("Signal: erreur XGBoost (%s)", exc)
+        log.warning("Signal: XGBoost error (%s)", exc)
         predicted_return = np.nan
 
-    # --- Classification du signal ---
+    # --- Signal classification ---
     if np.isnan(predicted_return):
-        signal, direction = "NEUTRE", "="
+        signal, direction = "NEUTRAL", "="
     elif predicted_return > 1.0:
-        signal, direction = "HAUSSIER", "+"
+        signal, direction = "BULLISH", "+"
     elif predicted_return < -1.0:
-        signal, direction = "BAISSIER", "-"
+        signal, direction = "BEARISH", "-"
     else:
-        signal, direction = "NEUTRE", "="
+        signal, direction = "NEUTRAL", "="
 
     ttc_str  = f"{ttc:.1f}" if ttc is not None else "N/A"
     ret_str  = f"{predicted_return:+.2f}%" if not np.isnan(predicted_return) else "N/A"
-    src_label = {"pinn": "PINN", "duration_fallback": "duree observee", "unavailable": "N/A"}.get(
+    src_label = {"pinn": "PINN", "duration_fallback": "observed", "unavailable": "N/A"}.get(
         ttc_source, ttc_source
     )
 
     asset_info  = LOCATION_ASSET_MAP.get(episode.location, {})
-    asset_name  = asset_info.get("asset_name",  "l'indice de fret")
+    asset_name  = asset_info.get("asset_name",  "the freight index")
     asset_short = asset_info.get("asset_short", "IDX")
-    consequence = asset_info.get("consequence", "traduisant une pression sur les prix du fret.")
+    consequence = asset_info.get("consequence", "reflecting pressure on freight prices.")
 
     alert_text = (
         f"\n{'='*68}\n"
-        f"  [{direction}] ALERTE NOWCASTING MARITIME — {episode.location.upper()}\n"
+        f"  [{direction}] MARITIME NOWCASTING ALERT — {episode.location.upper()}\n"
         f"{'='*68}\n"
         f"  Episode ID      : {episode.episode_id}\n"
-        f"  Periode         : {episode.start_date} -> {episode.end_date} "
-        f"({episode.duration_days} jours)\n"
+        f"  Period          : {episode.start_date} -> {episode.end_date} "
+        f"({episode.duration_days} days)\n"
         f"  Gravity Score   : {gravity:>12,.0f}\n"
-        f"  TTC [{src_label:<13s}]: {ttc_str} jours\n"
+        f"  TTC [{src_label:<13s}]: {ttc_str} days\n"
         f"  {asset_short:<14s}: {current_index_price:>+12.4f}\n"
         f"  Signal          : {signal} [{direction}]\n"
         f"  {'─'*60}\n"
-        f"  ALERTE NOWCASTING : L'evenement detecte (ID: {episode.episode_id})\n"
-        f"  a un Gravity Score de {gravity:,.0f}. Le modele physique PINN\n"
-        f"  estime qu'il mettra {ttc_str} jours a se resorber [{src_label}].\n"
-        f"  Consequence : Le modele XGBoost anticipe une variation de\n"
-        f"  {ret_str} sur les prix du {asset_name},\n"
+        f"  NOWCASTING ALERT: the detected event (ID: {episode.episode_id})\n"
+        f"  has a gravity score of {gravity:,.0f}. The physical PINN model\n"
+        f"  estimates it will take {ttc_str} days to clear [{src_label}].\n"
+        f"  Consequence: the XGBoost model expects a change of\n"
+        f"  {ret_str} in {asset_name} prices,\n"
         f"  {consequence}\n"
         f"{'='*68}\n"
     )
@@ -877,59 +877,59 @@ def generate_trading_signal(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Phase 4-5 — Pipeline financier: PINN + XGBoost → signal de marché"
+        description="Phase 4 — Financial pipeline: PINN + XGBoost → market signal"
     )
 
-    # Données physiques
+    # Physical data
     parser.add_argument("--model",    type=Path, default=None,
-                        help="Checkpoint PINN (.pt) — non requis en mode --gravity-only")
+                        help="PINN checkpoint (.pt) — not required in --gravity-only mode")
     parser.add_argument("--location", default="houston", choices=["houston", "la"])
-    parser.add_argument("--start",    help="Début de la fenêtre d'épisodes (YYYY-MM-DD)")
-    parser.add_argument("--end",      help="Fin de la fenêtre d'épisodes (YYYY-MM-DD)")
+    parser.add_argument("--start",    help="Start of the episode window (YYYY-MM-DD)")
+    parser.add_argument("--end",      help="End of the episode window (YYYY-MM-DD)")
     parser.add_argument("--gravity-threshold", type=float, default=None,
-                        help="Seuil episodes (défaut: LOCATION_DEFAULTS)")
+                        help="Episode threshold (default: LOCATION_DEFAULTS)")
     parser.add_argument("--gravity-path", type=Path, default=None)
     parser.add_argument("--rho-threshold-frac", type=float, default=DEFAULT_RHO_THRESHOLD_FRAC,
-                        help="Fraction du pic pour définir le TTC (défaut: 0.3)")
+                        help="Fraction of the peak defining the TTC (default: 0.3)")
     parser.add_argument("--gravity-only", action="store_true",
-                        help="Mode rapide : episodes depuis gravity parquet uniquement, "
-                             "sans charger les AIS ni faire tourner le PINN. "
-                             "TTC = duree observee. Ideal pour grandes periodes (2021-2024).")
+                        help="Fast mode: episodes from the gravity parquet only, "
+                             "without loading AIS or running the PINN. "
+                             "TTC = observed duration. Ideal for long periods (2021-2024).")
     parser.add_argument("--gap-tolerance", type=int, default=1,
-                        help="Jours sous le seuil toleres a l'interieur d'un episode "
-                             "(defaut: 1 — gere les week-ends)")
+                        help="Below-threshold days tolerated inside an episode "
+                             "(default: 1 — handles weekends)")
 
-    # Données financières — routage automatique par port
+    # Financial data — automatic routing per port
     parser.add_argument("--wti",   type=Path, default=None,
-                        help="CSV WTI Crude Oil (requis si location=houston). "
+                        help="WTI crude oil CSV (required if location=houston). "
                              "Source: stooq.com/q/d/l/?s=cl.f&i=d")
     parser.add_argument("--sp500", type=Path, default=None,
-                        help="CSV S&P 500 (requis si location=la). "
+                        help="S&P 500 CSV (required if location=la). "
                              "Source: stooq.com/q/d/l/?s=%%5Espx&i=d")
     parser.add_argument("--financial", type=Path, default=None,
-                        help="Override manuel: CSV d'un indice quelconque "
-                             "(BDI, FBX, GSCSI…). Prioritaire sur --wti/--sp500.")
-    parser.add_argument("--date-col",  default="Date",  help="Colonne date dans le CSV (défaut: Date)")
+                        help="Manual override: CSV of any index "
+                             "(BDI, FBX, GSCSI…). Takes precedence over --wti/--sp500.")
+    parser.add_argument("--date-col",  default="Date",  help="Date column in the CSV (default: Date)")
     parser.add_argument("--price-col", default="Close",
-                        help="Colonne prix dans le CSV (défaut: Close)")
+                        help="Price column in the CSV (default: Close)")
     parser.add_argument("--n-days",    type=int, nargs="+", default=DEFAULT_N_DAYS,
-                        help="Horizons forward en jours (défaut: 5 10 15 30)")
+                        help="Forward horizons in days (default: 5 10 15 30)")
 
     # XGBoost
     parser.add_argument("--target", default="return_10d",
-                        help="Colonne cible pour XGBoost (défaut: return_10d)")
+                        help="XGBoost target column (default: return_10d)")
     parser.add_argument("--n-splits", type=int, default=3,
-                        help="Folds TimeSeriesSplit (défaut: 3)")
+                        help="TimeSeriesSplit folds (default: 3)")
 
-    # Sortie
+    # Output
     parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR,
-                        help="Dossier de sortie (CSV, modèle XGBoost)")
+                        help="Output folder (CSV, XGBoost model)")
     parser.add_argument("--save-model", action="store_true",
-                        help="Sauvegarder le modèle XGBoost (.json)")
+                        help="Save the XGBoost model (.json)")
 
     args = parser.parse_args()
 
-    # Forcer UTF-8 sur le terminal Windows (évite UnicodeEncodeError avec ─ ══ etc.)
+    # Force UTF-8 on the Windows terminal (avoids UnicodeEncodeError with ─ ══ etc.)
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -944,10 +944,10 @@ def main() -> None:
     start_d = date.fromisoformat(args.start) if args.start else None
     end_d   = date.fromisoformat(args.end)   if args.end   else None
 
-    # ── ÉTAPE 1 — Extraction des épisodes ─────────────────────────────────
+    # ── STEP 1 — Episode extraction ───────────────────────────────────────
     if args.gravity_only:
-        # Mode rapide : gravity parquet uniquement, sans PINN ni AIS
-        log.info("Mode --gravity-only active : pas de PINN, TTC = duree observee")
+        # Fast mode: gravity parquet only, no PINN or AIS
+        log.info("--gravity-only mode: no PINN, TTC = observed duration")
         try:
             events_df = build_events_from_gravity(
                 location=args.location,
@@ -964,10 +964,10 @@ def main() -> None:
     else:
         # Mode complet : PINN + AIS
         if args.model is None:
-            log.error("--model requis en mode PINN (ou utilisez --gravity-only)")
+            log.error("--model required in PINN mode (or use --gravity-only)")
             sys.exit(1)
         if not args.model.exists():
-            log.error("Checkpoint introuvable: %s", args.model)
+            log.error("Checkpoint not found: %s", args.model)
             sys.exit(1)
         pinn_model, global_meta = _load_checkpoint(args.model)
         events_df = build_events_dataset(
@@ -982,25 +982,25 @@ def main() -> None:
         )
 
     if events_df.empty:
-        log.error("Aucun episode detecte — pipeline arrete.")
+        log.error("No episode detected — pipeline stopped.")
         sys.exit(1)
 
     events_path = args.output_dir / f"{args.location}_events.csv"
     events_df.to_csv(events_path, index=False)
-    log.info("Events dataset sauvegarde -> %s", events_path)
+    log.info("Events dataset saved -> %s", events_path)
 
-    # ── ÉTAPE 2 — Chargement de l'actif financier cible ───────────────────
+    # ── STEP 2 — Load the target financial asset ──────────────────────────
     if args.financial is not None:
-        # Override manuel — ignore la logique de routage par port
+        # Manual override — bypasses per-port routing
         if not args.financial.exists():
-            log.error("Fichier financier introuvable: %s", args.financial)
+            log.error("Financial file not found: %s", args.financial)
             sys.exit(1)
         financial_df = load_financial_data(args.financial, args.date_col, args.price_col)
         asset_info = LOCATION_ASSET_MAP.get(args.location, {
             "asset_name": args.price_col, "asset_short": args.price_col, "consequence": "",
         })
         log.info(
-            "Override manuel — indice: %s | col: %s",
+            "Manual override — index: %s | col: %s",
             args.financial.name, args.price_col,
         )
     else:
@@ -1014,7 +1014,7 @@ def main() -> None:
             sys.exit(1)
 
     log.info(
-        "=== ETAPE 2: Alignement | port=%s | actif=%s ===",
+        "=== STEP 2: Alignment | port=%s | asset=%s ===",
         args.location, asset_info.get("asset_name", args.price_col),
     )
     dataset = align_with_financials(
@@ -1026,25 +1026,25 @@ def main() -> None:
 
     dataset_path = args.output_dir / f"{args.location}_dataset_aligned.csv"
     dataset.to_csv(dataset_path, index=False)
-    log.info("Dataset aligne sauvegarde -> %s", dataset_path)
+    log.info("Aligned dataset saved -> %s", dataset_path)
 
-    # ── ÉTAPE 3a — Corrélations ────────────────────────────────────────────
-    log.info("=== ETAPE 3a: Analyse de correlation ===")
+    # ── STEP 3a — Correlations ─────────────────────────────────────────────
+    log.info("=== STEP 3a: Correlation analysis ===")
     corr_df = run_correlation_analysis(dataset)
 
-    print("\n── Corrélations Pearson / Spearman ──")
+    print("\n── Pearson / Spearman correlations ──")
     print(corr_df.to_string(index=False))
 
     corr_path = args.output_dir / f"{args.location}_correlations.csv"
     corr_df.to_csv(corr_path, index=False)
-    log.info("Correlations sauvegardees -> %s", corr_path)
+    log.info("Correlations saved -> %s", corr_path)
 
-    # ── ÉTAPE 3b — XGBoost ────────────────────────────────────────────────
+    # ── STEP 3b — XGBoost ─────────────────────────────────────────────────
     if args.target not in dataset.columns:
         available_targets = [c for c in dataset.columns if c.startswith("return_")]
         log.error(
-            "Target '%s' absente. Disponibles: %s. "
-            "Verifiez --target ou --n-days.",
+            "Target '%s' missing. Available: %s. "
+            "Check --target or --n-days.",
             args.target, available_targets,
         )
         sys.exit(1)
@@ -1071,16 +1071,16 @@ def main() -> None:
             try:
                 xgb_path = args.output_dir / f"{args.location}_xgb_{args.target}.json"
                 xgb_model.save_model(str(xgb_path))
-                log.info("Modele XGBoost sauvegarde -> %s", xgb_path)
+                log.info("XGBoost model saved -> %s", xgb_path)
             except Exception as exc:
-                log.warning("Impossible de sauvegarder le modèle XGBoost: %s", exc)
+                log.warning("Could not save the XGBoost model: %s", exc)
 
-        # ── TABLEAU PAR ÉPISODE ────────────────────────────────────────────
+        # ── PER-EPISODE TABLE ──────────────────────────────────────────────
         asset_info  = asset_info if "asset_info" in dir() else {}
         asset_short = asset_info.get("asset_short", args.price_col)
         features_used = metrics["features"]
 
-        # Horizon cible (ex: return_10d → 10)
+        # Target horizon (e.g. return_10d → 10)
         n_target = int(args.target.replace("return_", "").replace("d", ""))
 
         ep_rows = []
@@ -1096,7 +1096,7 @@ def main() -> None:
             ttc_val  = row.get("ttc_days")
             ttc_src  = row.get("ttc_source", "?")
 
-            # Signal basé sur la prédiction
+            # Signal based on the prediction
             if np.isnan(pred):
                 sig = "="
             elif pred > 1.0:
@@ -1106,7 +1106,7 @@ def main() -> None:
             else:
                 sig = "="
 
-            # Qualité de la prédiction (si réalisé disponible)
+            # Prediction quality (if the realised value is available)
             if not np.isnan(error):
                 ok = "OK" if abs(error) < 1.5 else "KO"
             else:
@@ -1128,17 +1128,17 @@ def main() -> None:
 
         ep_df = pd.DataFrame(ep_rows)
 
-        # Métriques globales de backtest
+        # Global backtest metrics
         errs = [float(r["erreur_%"].replace("%","")) for r in ep_rows if r["erreur_%"] != "N/A"]
         mae_bt  = float(np.mean(np.abs(errs))) if errs else np.nan
         rmse_bt = float(np.sqrt(np.mean(np.array(errs)**2))) if errs else np.nan
         n_ok    = sum(1 for r in ep_rows if r["ok"] == "OK")
 
         print(f"\n{'='*80}")
-        print(f"  NOWCASTING PAR EPISODE — {args.location.upper()} | cible: {asset_short} | horizon: {n_target}j")
-        print(f"  ttc_j : duree estimee de resorption (obs=duree observee, PINN=calcul physique)")
-        print(f"  pred  : variation anticipee par XGBoost | reel : variation effectivement realisee")
-        print(f"  ok    : |erreur| < 1.5% (seuil indicatif)")
+        print(f"  NOWCASTING PER EPISODE — {args.location.upper()} | target: {asset_short} | horizon: {n_target}d")
+        print(f"  ttc_j : estimated clearing time (obs=observed duration, PINN=physical model)")
+        print(f"  pred  : change expected by XGBoost | reel : realised change")
+        print(f"  ok    : |error| < 1.5% (indicative threshold)")
         print(f"{'='*80}")
         print(ep_df.to_string(index=False))
         print(f"{'─'*80}")
@@ -1149,7 +1149,7 @@ def main() -> None:
 
         ep_path = args.output_dir / f"{args.location}_episodes_predictions.csv"
         ep_df.to_csv(ep_path, index=False)
-        log.info("Predictions par episode -> %s", ep_path)
+        log.info("Per-episode predictions -> %s", ep_path)
 
     except ValueError as exc:
         log.warning("XGBoost ignore: %s", exc)

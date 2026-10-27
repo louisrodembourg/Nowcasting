@@ -43,7 +43,7 @@ LOC_CONFIG = {
         "zoom":         11,
         "event_start":  date(2017, 8, 25),
         "event_end":    date(2017, 8, 31),
-        "event_label":  "Hurricane Harvey (25–31 août 2017)",
+        "event_label":  "Hurricane Harvey (25–31 Aug 2017)",
         "event_marker": [29.76, -95.37],
         "title_suffix": "Hurricane Harvey, juil–sept 2017",
     },
@@ -80,7 +80,7 @@ def map_single_day(d: date, location: str = "houston") -> Path:
     parquet_path = parquet_dir / f"{prefix}_{d.strftime('%Y_%m_%d')}.parquet"
 
     if not parquet_path.exists():
-        raise FileNotFoundError(f"Parquet introuvable : {parquet_path}")
+        raise FileNotFoundError(f"Parquet not found: {parquet_path}")
 
     df             = pl.read_parquet(parquet_path)
     cluster_df, _  = cluster_day(parquet_path)
@@ -93,7 +93,7 @@ def map_single_day(d: date, location: str = "houston") -> Path:
     moving = df.filter(pl.col("SOG") >= 1.0)
     if len(moving) > 0:
         sample = moving.sample(min(len(moving), 2000), seed=42)
-        moving_group = folium.FeatureGroup(name="En mouvement (SOG ≥ 1 kt)", show=False)
+        moving_group = folium.FeatureGroup(name="Moving (SOG ≥ 1 kt)", show=False)
         for row in sample.iter_rows(named=True):
             folium.CircleMarker(
                 location=[row["LAT"], row["LON"]],
@@ -103,7 +103,7 @@ def map_single_day(d: date, location: str = "houston") -> Path:
         moving_group.add_to(m)
 
     if cluster_df is not None and len(cluster_df) > 0:
-        static_group = folium.FeatureGroup(name="Stationnaires (HDBSCAN)")
+        static_group = folium.FeatureGroup(name="Stationary (HDBSCAN)")
         for row in cluster_df.iter_rows(named=True):
             ctype  = row.get("cluster_type") or "noise"
             color  = COLORS.get(ctype, COLORS["noise"])
@@ -143,8 +143,8 @@ def map_single_day(d: date, location: str = "houston") -> Path:
       <span style="color:{COLORS['docked']}">●</span> Docked &nbsp;
       <span style="color:{COLORS['waiting']}">●</span> Waiting &nbsp;
       <span style="color:{COLORS['noise']}">●</span> Noise<br><br>
-      Navires distincts : <b>{n_vessels}</b><br>
-      Stationnaires     : <b>{n_static}</b><br>
+      Distinct vessels: <b>{n_vessels}</b><br>
+      Stationary        : <b>{n_static}</b><br>
       Clusters          : <b>{n_clusters}</b>
     </div>"""
     m.get_root().html.add_child(folium.Element(legend))
@@ -152,12 +152,12 @@ def map_single_day(d: date, location: str = "houston") -> Path:
 
     out_path = OUT_DIR / f"{location}_clusters_{d.strftime('%Y_%m_%d')}.html"
     m.save(str(out_path))
-    log.info("Sauvegardé : %s", out_path)
+    log.info("Saved: %s", out_path)
     return out_path
 
 
 # ---------------------------------------------------------------------------
-# Période — heatmap animée
+# Period — animated heatmap
 # ---------------------------------------------------------------------------
 
 def map_period(start: date, end: date, location: str = "houston",
@@ -193,16 +193,16 @@ def map_period(start: date, end: date, location: str = "houston",
         d += timedelta(days=1)
 
     if days_missing > 0:
-        log.warning("%d jour(s) sans parquet", days_missing)
+        log.warning("%d day(s) without parquet", days_missing)
 
     HeatMapWithTime(
         heat_data, index=dates_index,
         auto_play=False, radius=14, min_opacity=0.3, max_opacity=0.85,
         gradient={0.2: "#2196F3", 0.55: "#FF9800", 1.0: "#F44336"},
-        name="Densité navires stationnaires",
+        name="Stationary vessel density",
     ).add_to(m)
 
-    # Marqueur événement si dans la période
+    # Event marker if inside the period
     ev_start = disp["event_start"]
     if start <= ev_start <= end:
         folium.Marker(
@@ -216,7 +216,7 @@ def map_period(start: date, end: date, location: str = "houston",
 
     out_path = OUT_DIR / f"{location}_heatmap_{start.strftime('%Y%m%d')}_{end.strftime('%Y%m%d')}.html"
     m.save(str(out_path))
-    log.info("Sauvegardé : %s", out_path)
+    log.info("Saved: %s", out_path)
     return out_path
 
 
@@ -228,7 +228,7 @@ def plot_gravity_score(location: str = "houston") -> tuple[Path, Path]:
     _, disp, _, gravity_path, _ = _get_cfg(location)
 
     if not gravity_path.exists():
-        raise FileNotFoundError(f"Gravity score introuvable : {gravity_path} — run run_phase2.py --location {location}")
+        raise FileNotFoundError(f"Gravity score not found: {gravity_path} — run src/manifold/manifold_pipeline.py --location {location}")
 
     df       = pl.read_parquet(gravity_path).sort("date")
     dates    = df["date"].to_list()
@@ -257,7 +257,7 @@ def plot_gravity_score(location: str = "houston") -> tuple[Path, Path]:
     ax0.fill_between(dates, gravity, alpha=0.15, color="#1565C0")
     char_dates = [d for d, c in zip(dates, is_char) if c]
     char_vals  = [g for g, c in zip(gravity, is_char) if c]
-    ax0.scatter(char_dates, char_vals, color="#F44336", zorder=5, s=40, label="Point caractéristique")
+    ax0.scatter(char_dates, char_vals, color="#F44336", zorder=5, s=40, label="Characteristic point")
     ax0.set_ylabel("Gravity Score [0–1]", fontsize=10)
     ax0.set_ylim(-0.05, 1.1)
     ax0.legend(fontsize=8, loc="upper left")
@@ -265,14 +265,14 @@ def plot_gravity_score(location: str = "houston") -> tuple[Path, Path]:
 
     ax1 = axes[1]
     ax1.bar(dates, capacity / 1e6, color="#FB8C00", alpha=0.7, width=0.8)
-    ax1.set_ylabel("Capacité bloquée\n(Σ L×l, ×10⁶ m²)", fontsize=10)
+    ax1.set_ylabel("Blocked capacity\n(Σ L×W, ×10⁶ m²)", fontsize=10)
     ax1.grid(axis="y", alpha=0.3)
 
     ax2 = axes[2]
     vessel_count = df["vessel_count"].to_numpy()
     ax2.plot(dates, vessel_count, color="#388E3C", linewidth=1.5)
     ax2.fill_between(dates, vessel_count, alpha=0.15, color="#388E3C")
-    ax2.set_ylabel("Navires distincts", fontsize=10)
+    ax2.set_ylabel("Distinct vessels", fontsize=10)
     ax2.grid(axis="y", alpha=0.3)
     ax2.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
     ax2.xaxis.set_major_locator(mdates.WeekdayLocator(interval=2))
@@ -282,18 +282,18 @@ def plot_gravity_score(location: str = "houston") -> tuple[Path, Path]:
     ts_path = OUT_DIR / f"{location}_gravity_timeseries.png"
     fig.savefig(ts_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    log.info("Sauvegardé : %s", ts_path)
+    log.info("Saved: %s", ts_path)
 
     # ── Figure 2 : Manifold 2D scatter ───────────────────────────────────────
     if len(phi_cols) < 2:
-        log.warning("Pas assez de vecteurs propres pour le scatter 2D")
+        log.warning("Not enough eigenvectors for the 2D scatter")
         return ts_path, ts_path
 
     phi1 = df[phi_cols[0]].to_numpy()
     phi2 = df[phi_cols[1]].to_numpy()
 
     fig2, ax = plt.subplots(figsize=(9, 7))
-    fig2.suptitle(f"{location.upper()} — Espace Manifold (ϕ₁ vs ϕ₂)\ncoloré par Gravity Score",
+    fig2.suptitle(f"{location.upper()} — Manifold space (ϕ₁ vs ϕ₂)\ncoloured by gravity score",
                   fontsize=12, fontweight="bold")
 
     sc = ax.scatter(phi1, phi2, c=gravity, cmap="RdYlBu_r", s=60, zorder=3, vmin=0, vmax=1)
@@ -326,7 +326,7 @@ def plot_gravity_score(location: str = "houston") -> tuple[Path, Path]:
     scatter_path = OUT_DIR / f"{location}_manifold_2d.png"
     fig2.savefig(scatter_path, dpi=150, bbox_inches="tight")
     plt.close(fig2)
-    log.info("Sauvegardé : %s", scatter_path)
+    log.info("Saved: %s", scatter_path)
 
     return ts_path, scatter_path
 
@@ -336,16 +336,16 @@ def plot_gravity_score(location: str = "houston") -> tuple[Path, Path]:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Visualisation Phase 1 & 2 (multi-location)")
+    parser = argparse.ArgumentParser(description="Visualisation, Phase 1 & 2 (multi-location)")
     parser.add_argument("--location", default="houston", choices=list(LOCATIONS.keys()),
-                        help="Port cible (default: houston)")
+                        help="Target port (default: houston)")
     mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--date",    metavar="YYYY-MM-DD", help="Carte clusters pour un seul jour")
-    mode.add_argument("--start",   metavar="YYYY-MM-DD", help="Période — début (utiliser avec --end)")
+    mode.add_argument("--date",    metavar="YYYY-MM-DD", help="Cluster map for a single day")
+    mode.add_argument("--start",   metavar="YYYY-MM-DD", help="Period start (use with --end)")
     mode.add_argument("--gravity", action="store_true",  help="Phase 2 : gravity score + manifold 2D")
-    parser.add_argument("--end",      metavar="YYYY-MM-DD", help="Fin de période (obligatoire avec --start)")
+    parser.add_argument("--end",      metavar="YYYY-MM-DD", help="Period end (required with --start)")
     parser.add_argument("--each-day", action="store_true",
-                        help="Avec --start/--end : génère une carte de clusters par jour")
+                        help="With --start/--end: generate one cluster map per day")
     args = parser.parse_args()
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -358,10 +358,10 @@ def main() -> None:
 
     if args.date:
         out = map_single_day(date.fromisoformat(args.date), location=args.location)
-        print(f"\nOuvrir dans le navigateur :\n  {out.resolve()}")
+        print(f"\nOpen in the browser:\n  {out.resolve()}")
     else:
         if not args.end:
-            parser.error("--end requis avec --start")
+            parser.error("--end required with --start")
         start = date.fromisoformat(args.start)
         end   = date.fromisoformat(args.end)
 

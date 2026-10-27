@@ -1,5 +1,5 @@
 """
-Phase 2 — PCA pour zones constituantes + Gravity Score.
+Phase 2 — PCA for constituent zones + gravity score.
 
 Usage:
     python src/manifold/pca_pipeline.py --both --start 2019-01-01 --end 2019-01-31 --location houston

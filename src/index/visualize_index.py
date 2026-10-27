@@ -1,19 +1,19 @@
 """
-Visualisation de la corrélation entre le gravity score (manifold pipeline)
-et des indices financiers du fret (BDI, FBX, WCI).
+Visualise the correlation between the gravity score (manifold pipeline)
+and freight indices (BDI, FBX, WCI).
 
-Attendu dans data/parquet/market/ :
-  - CSV  : colonnes 'Date' (DD/MM/YYYY), 'Dernier' (valeur, format FR)
-  - Parquet : colonnes 'date', 'value' (ou 'close')
-  Le nom du fichier doit commencer par le ticker : bdi_*, fbx_*, wci_*, etc.
+Expected in data/parquet/market/:
+  - CSV    : columns 'Date' (DD/MM/YYYY), 'Dernier' (value, French number format)
+  - Parquet: columns 'date', 'value' (or 'close')
+  The file name must start with the ticker: bdi_*, fbx_*, wci_*, etc.
 
-  Parametres :
-    --location : la | houston | suez  (correspond au gravity score à utiliser)
-    --index    : ticker de l'indice à charger (ex: bdi, fbx, wci)
-    --lag      : décalage en jours (gravity prédit l'indice à J+lag)
-    
-  
-Usage :
+  Parameters:
+    --location : la | houston | suez  (which gravity score to use)
+    --index    : ticker of the index to load (e.g. bdi, fbx, wci)
+    --lag      : shift in days (gravity predicts the index at D+lag)
+
+
+Usage:
     python src/index/visualize_index.py --location la
     python src/index/visualize_index.py --location houston --index bdi --lag 5
     python src/index/visualize_index.py --location la --index fbx --lag 0 7 14
@@ -53,8 +53,8 @@ def load_gravity(location: str) -> pl.DataFrame:
     path = GRAVITY_DIR / f"{location}_gravity_daily.parquet"
     if not path.exists():
         raise FileNotFoundError(
-            f"Gravity score introuvable : {path}\n"
-            f"Lance d'abord : python src/manifold/manifold_pipeline.py --both "
+            f"Gravity score not found: {path}\n"
+            f"Run first: python src/manifold/manifold_pipeline.py --both "
             f"--location {location} ..."
         )
     df = (
@@ -62,25 +62,25 @@ def load_gravity(location: str) -> pl.DataFrame:
         .with_columns(pl.col("date").cast(pl.Date))
         .sort("date")
     )
-    log.info("Gravity %s : %d jours (%s ->%s)", location, len(df),
+    log.info("Gravity %s : %d days (%s ->%s)", location, len(df),
              df["date"].min(), df["date"].max())
     return df
 
 
 def load_index(ticker: str) -> pl.DataFrame:
     """
-    Charge un fichier d'indice depuis MARKET_DIR.
-    Cherche d'abord un CSV puis un Parquet dont le nom commence par ticker.
-    Retourne un DataFrame avec colonnes ['date', 'value'].
+    Load an index file from MARKET_DIR.
+    Looks for a CSV first, then a Parquet whose name starts with the ticker.
+    Returns a DataFrame with columns ['date', 'value'].
     """
     candidates = sorted(MARKET_DIR.glob(f"{ticker.lower()}_*"))
     if not candidates:
         raise FileNotFoundError(
-            f"Aucun fichier pour l'indice '{ticker}' dans {MARKET_DIR}/\n"
-            f"Fichiers présents : {[f.name for f in MARKET_DIR.iterdir()]}"
+            f"No file for index '{ticker}' in {MARKET_DIR}/\n"
+            f"Files present: {[f.name for f in MARKET_DIR.iterdir()]}"
         )
     path = candidates[0]
-    log.info("Chargement indice : %s", path)
+    log.info("Loading index: %s", path)
 
     if path.suffix == ".csv":
         raw = pl.read_csv(path)
@@ -127,18 +127,18 @@ def load_index(ticker: str) -> pl.DataFrame:
             pl.col(value_col).cast(pl.Float64).alias("value"),
         ])
     else:
-        raise ValueError(f"Format non supporté : {path.suffix}")
+        raise ValueError(f"Unsupported format: {path.suffix}")
 
     result = result.sort("date").drop_nulls()
-    log.info("Indice %s : %d points (%s ->%s)", ticker.upper(), len(result),
+    log.info("Index %s : %d points (%s ->%s)", ticker.upper(), len(result),
              result["date"].min(), result["date"].max())
     return result
 
 
 def align(gravity: pl.DataFrame, index: pl.DataFrame, lag_days: int = 0) -> pl.DataFrame:
     """
-    Joint les deux séries sur la date.
-    lag_days > 0 : décale l'indice vers l'avenir (gravity prédit l'indice à J+lag).
+    Join both series on the date.
+    lag_days > 0: shifts the index into the future (gravity predicts the index at D+lag).
     """
     idx = index.with_columns(
         (pl.col("date") - pl.duration(days=lag_days)).alias("date")
@@ -161,20 +161,20 @@ def plot_correlation(
     out_path: Path,
 ) -> None:
     if len(merged) < 3:
-        print(f"  [!] Seulement {len(merged)} points communs — graphique vide.")
-        print(f"      Gravity couvre : voir la_gravity_daily.parquet")
-        print(f"      Indice couvre  : voir fichier {ticker}")
+        print(f"  [!] Only {len(merged)} common points — empty chart.")
+        print(f"      Gravity covers: see la_gravity_daily.parquet")
+        print(f"      Index covers   : see file {ticker}")
         return
 
     dates   = merged["date"].to_list()
     gravity = merged["gravity_score"].to_numpy()
     index   = merged["index_value"].to_numpy()
 
-    # Normalise pour affichage dual-axis
+    # Normalise for dual-axis display
     g_norm = (gravity - gravity.mean()) / (gravity.std() or 1)
     i_norm = (index   - index.mean())   / (index.std()   or 1)
 
-    # Corrélations
+    # Correlations
     r_pearson,  p_pearson  = stats.pearsonr(gravity, index)
     r_spearman, p_spearman = stats.spearmanr(gravity, index)
 
@@ -184,7 +184,7 @@ def plot_correlation(
     fig = make_subplots(
         rows=2, cols=2,
         subplot_titles=(
-            "Séries temporelles normalisées",
+            "Normalised time series",
             f"Scatter — r={r_pearson:.3f} (Pearson)",
             "Gravity Score brut",
             f"{ticker.upper()} brut",
@@ -194,7 +194,7 @@ def plot_correlation(
         horizontal_spacing=0.10,
     )
 
-    # --- Dual time series (normalisées) ---
+    # --- Dual time series (normalised) ---
     fig.add_trace(go.Scatter(
         x=dates, y=g_norm, name="Gravity (norm.)",
         mode="lines", line=dict(color="#1565C0", width=2),
@@ -212,13 +212,13 @@ def plot_correlation(
         name="Points",
         showlegend=False,
     ), row=2, col=1)
-    # Droite de régression
+    # Regression line
     m, b = np.polyfit(gravity, index, 1)
     x_line = np.linspace(gravity.min(), gravity.max(), 100)
     fig.add_trace(go.Scatter(
         x=x_line, y=m * x_line + b,
         mode="lines", line=dict(color="#E65100", width=2),
-        name="Régression", showlegend=False,
+        name="Regression", showlegend=False,
     ), row=2, col=1)
     fig.update_xaxes(title_text="Gravity Score", row=2, col=1)
     fig.update_yaxes(title_text=ticker.upper(), row=2, col=1)
@@ -238,11 +238,11 @@ def plot_correlation(
         showlegend=False,
     ), row=2, col=2)
 
-    # --- Annotation corrélation ---
+    # --- Correlation annotation ---
     corr_text = (
         f"<b>Pearson  r = {r_pearson:.3f}</b>  (p={p_pearson:.3f})<br>"
         f"Spearman r = {r_spearman:.3f}  (p={p_spearman:.3f})<br>"
-        f"N = {len(merged)} jours communs"
+        f"N = {len(merged)} common days"
     )
     fig.add_annotation(
         xref="paper", yref="paper", x=0.5, y=1.04,
@@ -266,7 +266,7 @@ def plot_correlation(
     print(f"Saved : {out_path.resolve()}")
     print(f"  Pearson  r = {r_pearson:.3f}  (p={p_pearson:.4f})")
     print(f"  Spearman r = {r_spearman:.3f}  (p={p_spearman:.4f})")
-    print(f"  N = {len(merged)} jours communs")
+    print(f"  N = {len(merged)} common days")
 
 
 # ============================================================================
@@ -275,16 +275,16 @@ def plot_correlation(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Corrélation gravity score ↔ indice financier")
+    parser = argparse.ArgumentParser(description="Gravity score ↔ financial index correlation")
     parser.add_argument("--location", default="la", choices=["la", "houston", "suez"],
-                        help="Localisation du gravity score (défaut: la)")
+                        help="Location of the gravity score (default: la)")
     parser.add_argument("--index", default="bdi",
-                        help="Ticker de l'indice (ex: bdi, fbx, wci) — doit correspondre "
-                             "au nom de fichier dans data/parquet/market/")
+                        help="Index ticker (e.g. bdi, fbx, wci) — must match "
+                             "to the file name in data/parquet/market/")
     parser.add_argument("--lag", type=int, nargs="+", default=[0],
                         metavar="N",
-                        help="Décalage(s) en jours : gravity prédit l'indice à J+lag. "
-                             "Plusieurs valeurs génèrent une figure par lag.")
+                        help="Shift(s) in days: gravity predicts the index at D+lag. "
+                             "Several values produce one figure per lag.")
     args = parser.parse_args()
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -292,18 +292,18 @@ def main() -> None:
     gravity = load_gravity(args.location)
     index   = load_index(args.index)
 
-    # Résumé de couverture
+    # Coverage summary
     g_min, g_max = gravity["date"].min(), gravity["date"].max()
     i_min, i_max = index["date"].min(),   index["date"].max()
-    print(f"\nGravity  : {g_min} ->{g_max}  ({len(gravity)} jours)")
-    print(f"Indice   : {i_min} ->{i_max}  ({len(index)} points)")
+    print(f"\nGravity  : {g_min} ->{g_max}  ({len(gravity)} days)")
+    print(f"Index    : {i_min} ->{i_max}  ({len(index)} points)")
 
     overlap_start = max(g_min, i_min)
     overlap_end   = min(g_max, i_max)
     if overlap_start > overlap_end:
-        print(f"\n[ATTENTION] Aucun overlap temporel entre gravity ({g_min}->{g_max}) "
-              f"et indice ({i_min}->{i_max}).")
-        print("  ->Ajoute des données de marché couvrant la même période dans data/parquet/market/")
+        print(f"\n[WARNING] No time overlap between gravity ({g_min}->{g_max}) "
+              f"and index ({i_min}->{i_max}).")
+        print("  ->Add market data covering the same period in data/parquet/market/")
         return
 
     print(f"Overlap  : {overlap_start} ->{overlap_end}")

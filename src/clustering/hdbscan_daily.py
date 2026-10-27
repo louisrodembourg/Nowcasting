@@ -1,18 +1,18 @@
 """
-Étape 4 : Clustering quotidien HDBSCAN des navires stationnaires — Chenal du Navire de Houston.
+Step 4: daily HDBSCAN clustering of stationary vessels.
 
-Pipeline pour un fichier Parquet quotidien :
-  1. Prétraitement cinématique (SOG_corr, traj_id) via kinematic_filter
-  2. Filtrer les navires stationnaires (SOG_corr < SOG_STATIC_THRESHOLD)
-  3. Dédupliquer à une position par (MMSI, traj_id) — chaque épisode statique séparément
-  4. Exécuter HDBSCAN sur (LAT, LON) en utilisant la métrique haversine
-  5. Classer chaque cluster : 'à quai' (caps alignés) vs 'en attente' (caps dispersés)
+Pipeline for one daily Parquet file:
+  1. Kinematic preprocessing (SOG_corr, traj_id) via kinematic_filter
+  2. Keep stationary vessels (SOG_corr < SOG_STATIC_THRESHOLD)
+  3. Deduplicate to one position per (MMSI, traj_id) — each static episode separately
+  4. Run HDBSCAN on (LAT, LON) with the haversine metric
+  5. Classify each cluster: 'docked' (aligned headings) vs 'waiting' (scattered headings)
 
-Retourne (cluster_df, prepared_df) :
-  - cluster_df  : une ligne par épisode statique (MMSI + traj_id) + métadonnées du cluster
-  - prepared_df : DataFrame complet du jour avec colonnes SOG_corr et traj_id ajoutées
+Returns (cluster_df, prepared_df):
+  - cluster_df  : one row per static episode (MMSI + traj_id) + cluster metadata
+  - prepared_df : full daily DataFrame with the SOG_corr and traj_id columns added
 
-Usage (autonome) :
+Usage (standalone):
     python src/clustering/hdbscan_daily.py data/parquet/houston/houston_2017_07_01.parquet
 """
 
@@ -35,29 +35,29 @@ from src.ingestion.kinematic_filter import prepare_kinematics
 
 log = logging.getLogger(__name__)
 
-# Paramètres de clustering et seuils cinématiques (valeurs par défaut)
-SOG_STATIC_THRESHOLD = 1.0   # nœuds — en dessous = navire stationnaire
-HDBSCAN_MIN_CLUSTER_SIZE = 5  # taille minimale du cluster (CLAUDE.md spec)
-HDBSCAN_MIN_SAMPLES = 2       # nombre minimal d'échantillons pour HDBSCAN
+# Clustering parameters and kinematic thresholds (defaults)
+SOG_STATIC_THRESHOLD = 1.0   # knots — below = stationary vessel
+HDBSCAN_MIN_CLUSTER_SIZE = 5  # minimum cluster size
+HDBSCAN_MIN_SAMPLES = 2       # HDBSCAN min_samples
 
 
 @dataclass
 class ClusteringConfig:
     """
-    Paramètres de clustering HDBSCAN.
-    Instancier sans arguments pour obtenir le comportement par défaut (baseline).
+    HDBSCAN clustering parameters.
+    Instantiate without arguments to get the default (baseline) behaviour.
     """
 
     sog_static_threshold: float = SOG_STATIC_THRESHOLD
     hdbscan_min_cluster_size: int = HDBSCAN_MIN_CLUSTER_SIZE
     hdbscan_min_samples: int = HDBSCAN_MIN_SAMPLES
-    # Rayon max (en nm) pour qu'un cluster soit classé "docked".
-    # None = pas de contrainte spatiale.
-    # 0.3 nm ≈ 550 m — taille typique d'un terminal de quai.
+    # Max radius (nm) for a cluster to be classified as "docked".
+    # None = no spatial constraint.
+    # 0.3 nm ≈ 550 m — typical size of a quay terminal.
     max_docked_radius_nm: Optional[float] = None
-    # Polygones délimitant les zones où le statut "waiting" est possible.
-    # Chaque polygone = liste de (lat, lon) — fermé implicitement.
-    # Tout cluster en DEHORS de TOUS ces polygones est forcé à "docked".
+    # Polygons delimiting the areas where the "waiting" status is possible.
+    # Each polygon = list of (lat, lon) — implicitly closed.
+    # Any cluster OUTSIDE ALL these polygons is forced to "docked".
     waiting_allowed_polygons: Optional[list[list[tuple[float, float]]]] = None
 
 
@@ -66,8 +66,8 @@ def cluster_day_from_df(
     config: Optional[ClusteringConfig] = None,
 ) -> tuple[Optional[pl.DataFrame], Optional[pl.DataFrame]]:
     """
-    Exécute HDBSCAN sur un DataFrame déjà préparé (sortie de prepare_kinematics).
-    Retourne (cluster_df, prepared_df) — même contrat que cluster_day.
+    Run HDBSCAN on an already prepared DataFrame (output of prepare_kinematics).
+    Returns (cluster_df, prepared_df) — same contract as cluster_day.
     """
     return _run_hdbscan(
         prepared, label="<DataFrame>", config=config or ClusteringConfig()
@@ -79,18 +79,18 @@ def cluster_day(
     config: Optional[ClusteringConfig] = None,
 ) -> tuple[Optional[pl.DataFrame], Optional[pl.DataFrame]]:
     """
-    Exécute le prétraitement cinématique + HDBSCAN sur un fichier Parquet quotidien.
+    Run kinematic preprocessing + HDBSCAN on one daily Parquet file.
 
-    Retourne (cluster_df, prepared_df).
-    Les deux sont None si le fichier est manquant ou a trop peu de navires statiques.
+    Returns (cluster_df, prepared_df).
+    Both are None if the file is missing or has too few static vessels.
 
-    Colonnes de cluster_df :
+    cluster_df columns:
         MMSI, traj_id, LAT, LON, Heading_mean, Heading_std,
         Draft, Length, Width, VesselType, nb_messages,
         cluster_label, membership_score, cluster_type
     """
     if not parquet_path.exists():
-        log.warning("Fichier non trouvé : %s", parquet_path)
+        log.warning("File not found: %s", parquet_path)
         return None, None
 
     raw_df = pl.read_parquet(parquet_path)
@@ -106,21 +106,21 @@ def _run_hdbscan(
     label: str = "",
     config: Optional[ClusteringConfig] = None,
 ) -> tuple[Optional[pl.DataFrame], Optional[pl.DataFrame]]:
-    """Logique centrale du clustering HDBSCAN sur un DataFrame préparé."""
+    """Core HDBSCAN clustering logic on a prepared DataFrame."""
     cfg = config or ClusteringConfig()
 
-    # --- Filtre les navires stationnaires (en utilisant la SOG corrigée) -------
+    # --- Keep stationary vessels (using the corrected SOG) -------------------
     static = prepared.filter(pl.col("SOG_corr") < cfg.sog_static_threshold)
 
     if len(static) < cfg.hdbscan_min_cluster_size:
         log.warning(
-            "%s : seulement %d messages statiques — skip clustering",
+            "%s : only %d static messages — skip clustering",
             label,
             len(static),
         )
         return None, prepared
 
-    # --- Déduplique : une position par (MMSI, traj_id) ----------------------
+    # --- Deduplicate: one position per (MMSI, traj_id) ----------------------
     agg_exprs = [
         pl.col("LAT").median().alias("LAT"),
         pl.col("LON").median().alias("LON"),
@@ -165,13 +165,13 @@ def _run_hdbscan(
 
     if len(agg) < cfg.hdbscan_min_cluster_size:
         log.warning(
-            "%s : seulement %d épisodes après dédupication — skip HDBSCAN",
+            "%s : only %d episodes after deduplication — skip HDBSCAN",
             label,
             len(agg),
         )
         return None, prepared
 
-    # --- HDBSCAN sur (LAT, LON) avec distance haversine ----------------------
+    # --- HDBSCAN on (LAT, LON) with haversine distance -----------------------
     coords_deg = agg.select(["LAT", "LON"]).to_numpy()
     coords_rad = np.radians(coords_deg)
 
@@ -191,7 +191,7 @@ def _run_hdbscan(
         ]
     )
 
-    # --- Classifie les clusters : à quai vs en attente ----------------------
+    # --- Classify clusters: docked vs waiting -------------------------------
     cluster_types = _classify_clusters(agg, cfg)
     agg = agg.join(cluster_types, on="cluster_label", how="left")
 
@@ -200,7 +200,7 @@ def _run_hdbscan(
     n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
     n_noise = int((labels == -1).sum())
     log.info(
-        "%s : %d épisodes (%d navires) → %d clusters, %d bruits (%.1f%%)",
+        "%s : %d episodes (%d vessels) → %d clusters, %d noise (%.1f%%)",
         label,
         n_episodes,
         n_vessels,
@@ -214,8 +214,8 @@ def _run_hdbscan(
 
 def _compute_cluster_radius_nm(lats: np.ndarray, lons: np.ndarray) -> float:
     """
-    Rayon du cluster = distance haversine max du centroïde au point le plus éloigné (en nm).
-    Retourne 0 si le cluster a un seul point.
+    Cluster radius = max haversine distance from the centroid to the farthest point (nm).
+    Returns 0 if the cluster has a single point.
     """
     if len(lats) <= 1:
         return 0.0
@@ -233,8 +233,8 @@ def _point_in_polygon(
     lat: float, lon: float, polygon: list[tuple[float, float]]
 ) -> bool:
     """
-    Ray-casting algorithm : point (lat, lon) dans le polygone ?
-    polygon = liste de (lat, lon) — fermé implicitement.
+    Ray-casting algorithm: is the point (lat, lon) inside the polygon?
+    polygon = list of (lat, lon) — implicitly closed.
     """
     n = len(polygon)
     inside = False
@@ -242,11 +242,11 @@ def _point_in_polygon(
     for i in range(n):
         lat_i, lon_i = polygon[i]
         lat_j, lon_j = polygon[j]
-        # Rayon horizontal vers la droite depuis (lat, lon)
-        # L'arête (lat_i,lon_i)-(lat_j,lon_j) traverse-t-elle ce rayon ?
+        # Horizontal ray to the right from (lat, lon)
+        # Does the edge (lat_i,lon_i)-(lat_j,lon_j) cross this ray?
         edge_crosses_y = (lat_i > lat) != (lat_j > lat)
         if edge_crosses_y:
-            # Intersection x du rayon avec l'arête
+            # x-intersection of the ray with the edge
             x_intersect = lon_i + (lon_j - lon_i) * (lat - lat_i) / (lat_j - lat_i)
             if lon < x_intersect:
                 inside = not inside
@@ -256,8 +256,8 @@ def _point_in_polygon(
 
 def _load_geojson_polygons(path: Path) -> list[list[tuple[float, float]]]:
     """
-    Charge les polygones d'un fichier GeoJSON (Polygon ou MultiPolygon).
-    Retourne une liste de polygones (chacun = liste de (lat, lon)).
+    Load the polygons of a GeoJSON file (Polygon or MultiPolygon).
+    Returns a list of polygons (each = list of (lat, lon)).
     """
     with open(path) as f:
         fc = json.load(f)
@@ -265,7 +265,7 @@ def _load_geojson_polygons(path: Path) -> list[list[tuple[float, float]]]:
     for feat in fc["features"]:
         geom = feat["geometry"]
         if geom["type"] == "Polygon":
-            # coordinates[0] = anneau extérieur ; on ignore les trous
+            # coordinates[0] = outer ring; holes are ignored
             zones.append([(c[1], c[0]) for c in geom["coordinates"][0]])
         elif geom["type"] == "MultiPolygon":
             for polygon in geom["coordinates"]:
@@ -275,9 +275,9 @@ def _load_geojson_polygons(path: Path) -> list[list[tuple[float, float]]]:
 
 def load_waiting_zones(location: str) -> list[list[tuple[float, float]]]:
     """
-    Charge les polygones de zone d'attente depuis data/features/{location}_waiting_zones.geojson.
-    Retourne une liste de polygones (chacun = liste de (lat, lon)).
-    Lève FileNotFoundError si le fichier n'existe pas.
+    Load the waiting-zone polygons from data/features/{location}_waiting_zones.geojson.
+    Returns a list of polygons (each = list of (lat, lon)).
+    Raises FileNotFoundError if the file does not exist.
     """
     path = (
         Path(__file__).resolve().parents[2]
@@ -290,16 +290,16 @@ def load_waiting_zones(location: str) -> list[list[tuple[float, float]]]:
 
 def _classify_clusters(df: pl.DataFrame, config: ClusteringConfig) -> pl.DataFrame:
     """
-    Étiquette chaque cluster comme 'à quai' ou 'en attente'.
+    Label each cluster as 'docked' or 'waiting'.
 
-    Règles de classification (appliquées dans l'ordre) :
-      0. Si config.waiting_allowed_polygons est défini :
-           cluster DANS au moins un polygone → forcé "waiting"
-           cluster HORS de tous les polygones → forcé "docked"
-      1. Sinon : si config.max_docked_radius_nm est défini,
-           cluster compact → "docked", sinon "waiting"
-      2. Sans contrainte de rayon explicite, le comportement reste conservateur :
-           par défaut "docked".
+    Classification rules (applied in order):
+      0. If config.waiting_allowed_polygons is set:
+           cluster INSIDE at least one polygon → forced "waiting"
+           cluster OUTSIDE all polygons        → forced "docked"
+      1. Otherwise, if config.max_docked_radius_nm is set,
+           compact cluster → "docked", else "waiting"
+      2. Without an explicit radius constraint the behaviour stays conservative:
+           "docked" by default.
     """
     valid = df.filter(pl.col("cluster_label") >= 0)
 
@@ -307,8 +307,8 @@ def _classify_clusters(df: pl.DataFrame, config: ClusteringConfig) -> pl.DataFra
     for label in valid["cluster_label"].unique().to_list():
         cluster = valid.filter(pl.col("cluster_label") == label)
 
-        # Règle 0 : waiting_allowed_polygons — waiting si au moins un point du
-        # cluster tombe dans une zone d'attente.
+        # Rule 0: waiting_allowed_polygons — waiting if at least one point of the
+        # cluster falls inside a waiting zone.
         if config.waiting_allowed_polygons is not None:
             any_inside = False
             for lat_i, lon_i in zip(cluster["LAT"].to_numpy(), cluster["LON"].to_numpy()):
@@ -320,8 +320,8 @@ def _classify_clusters(df: pl.DataFrame, config: ClusteringConfig) -> pl.DataFra
                     break
             is_docked = not any_inside
         else:
-            # Sans filtre zonal, on ne classe "docked" que si le cluster
-            # est suffisamment compact selon max_docked_radius_nm.
+            # Without a zonal filter, a cluster is only "docked" if it
+            # is compact enough according to max_docked_radius_nm.
             if config.max_docked_radius_nm is None:
                 is_docked = True
             else:
@@ -344,20 +344,20 @@ def _classify_clusters(df: pl.DataFrame, config: ClusteringConfig) -> pl.DataFra
 
 
 def main() -> None:
-    """Point d'entrée pour l'exécution autonome du script."""
+    """Entry point for standalone execution."""
     parser = argparse.ArgumentParser(
-        description="Clustering HDBSCAN sur un fichier Parquet quotidien"
+        description="HDBSCAN clustering on a daily Parquet file"
     )
-    parser.add_argument("parquet", help="Chemin vers le fichier Parquet quotidien")
+    parser.add_argument("parquet", help="Path to the daily Parquet file")
     parser.add_argument("--preview", type=int, default=10, metavar="N",
-                        help="Nombre de lignes à afficher (défaut: 10)")
+                        help="Number of rows to display (default: 10)")
     parser.add_argument("--save-csv", action="store_true",
-                        help="Sauvegarde cluster_df en CSV à côté du parquet d'entrée")
+                        help="Save cluster_df as CSV next to the input parquet")
     args = parser.parse_args()
 
     cluster_df, _ = cluster_day(Path(args.parquet))
     if cluster_df is None:
-        print("Aucun cluster trouvé.")
+        print("No cluster found.")
         return
 
     docked = cluster_df.filter(pl.col("cluster_type") == "docked").height
@@ -371,13 +371,13 @@ def main() -> None:
     preview = cluster_df.select(cols).head(args.preview)
 
     with pl.Config(tbl_rows=args.preview, tbl_cols=len(cols), tbl_width_chars=120):
-        print(f"\n--- Preview ({args.preview}/{len(cluster_df)} lignes) ---")
+        print(f"\n--- Preview ({args.preview}/{len(cluster_df)} rows) ---")
         print(preview)
 
     if args.save_csv:
         csv_path = Path(args.parquet).with_suffix(".clusters.csv")
         cluster_df.write_csv(csv_path)
-        print(f"\nCSV sauvegardé : {csv_path}")
+        print(f"\nCSV saved: {csv_path}")
 
 
 if __name__ == "__main__":

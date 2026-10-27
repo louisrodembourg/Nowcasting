@@ -1,19 +1,19 @@
 """
-Phase 3 — PINN Physical Engine: pipeline en 4 étapes pour la dynamique
-du trafic maritime lors d'événements de disruption.
+Phase 3 — PINN physical engine: 4-step pipeline for maritime traffic
+dynamics during disruption events.
 
-Implémente un réseau de neurones informé par la physique (PINN) qui modélise
-l'équation macroscopique de Lighthill-Whitham-Richards (LWR):
+Implements a physics-informed neural network (PINN) modelling the
+macroscopic Lighthill-Whitham-Richards (LWR) equation:
     ∂ρ/∂t + ∂(ρ·v)/∂x = 0
 
-Structure en 4 étapes:
-  Étape 1 — structure_episodes()        : découper les données en épisodes
-                                           depuis le gravity score
-  Étape 2 — LWRPINN (lwr_pinn.py)      : MLP (x, t) → (ρ̂, v̂)
-  Étape 3 — hybrid loss (lwr_pinn.py)  : L_data + λ·L_LWR + λ_kin·L_cinématique
-  Étape 4 — train_on_episodes()         : boucle d'entraînement épisodique
-             extract_physical_profiles(): inférence dense avec comblement des
-                                          trous par la physique
+4-step structure:
+  Step 1 — structure_episodes()        : split the data into episodes
+                                         from the gravity score
+  Step 2 — LWRPINN (lwr_pinn.py)      : MLP (x, t) → (ρ̂, v̂)
+  Step 3 — hybrid loss (lwr_pinn.py)  : L_data + λ·L_LWR + λ_kin·L_kinematic
+  Step 4 — train_on_episodes()         : episodic training loop
+           extract_physical_profiles(): dense inference, with gaps filled
+                                        by the physics
 
 Usage:
     python src/pinns/pinn_pipeline.py --train  --location la --start 2019-01-01 --end 2019-12-31
@@ -42,7 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
 def _force_unlink(path: Path) -> None:
-    """Supprime un fichier existant avant ecriture pour eviter les verrous Windows."""
+    """Delete an existing file before writing, to avoid Windows file locks."""
     try:
         path.unlink(missing_ok=True)
     except PermissionError:
@@ -69,25 +69,25 @@ OUTPUT_DIR = Path("outputs/figures")
 MODEL_DIR = Path("outputs/models")
 FEATURES_DIR = Path("data/features")
 
-# Points de collocation pour la contrainte physique
-N_COLLOC = 2000       # nombre de points par tirage
-COLLOC_REFRESH = 500  # reéchantillonnage tous les N époques
-LOG_EVERY = 200       # fréquence de log
+# Collocation points for the physics constraint
+N_COLLOC = 2000       # number of points per draw
+COLLOC_REFRESH = 500  # resample every N epochs
+LOG_EVERY = 200       # logging frequency
 
-# ── Paramètres par localisation ──────────────────────────────────────────────
-# gravity_threshold : seuil de déclenchement des épisodes.
-#   La distribution du gravity score est bimodale (0 ou très grand).
-#   Choisir un seuil au-dessus du bruit de fond mais en dessous des vrais pics.
-#   → Ajuste ces valeurs si tu obtiens trop ou trop peu d'épisodes.
+# ── Per-location parameters ──────────────────────────────────────────────────
+# gravity_threshold: episode trigger threshold.
+#   The gravity score distribution is bimodal (0 or very large).
+#   Pick a threshold above the background noise but below the real peaks.
+#   → Adjust these values if you get too many or too few episodes.
 LOCATION_DEFAULTS: dict[str, dict] = {
     # Houston: non-zero scores 4k–370k | p50=37k | p75=83k | p90=134k
-    # Harvey (août 2017) génère des pics >300k → seuil 50k capture Harvey + gros événements
+    # Harvey (Aug 2017) produces peaks >300k → a 50k threshold captures Harvey + large events
     "houston": {
         "gravity_threshold": 5_000,
         "min_episode_days": 2,
     },
-    # LA: distribution bimodale — 250 jours à 580–7500 (normal) + pics 100k–214k (crises)
-    # p90=5700, p95=7500, p99=109k → seuil 5000 isole les vraies perturbations
+    # LA: bimodal distribution — 250 days at 580–7500 (normal) + peaks 100k–214k (crises)
+    # p90=5700, p95=7500, p99=109k → a 5000 threshold isolates real disruptions
     "la": {
         "gravity_threshold": 5_000,
         "min_episode_days": 3,
@@ -96,35 +96,35 @@ LOCATION_DEFAULTS: dict[str, dict] = {
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# ÉTAPE 1 — STRUCTURATION DES DONNÉES EN ÉPISODES
+# STEP 1 — STRUCTURING THE DATA INTO EPISODES
 #
-# Un épisode commence (t=0) quand le gravity score dépasse un seuil de déclenchement.
-# Pour chaque épisode, on:
-#   1. Extrait les données AIS sur la fenêtre temporelle
-#   2. Projette les coordonnées géographiques sur l'axe 1D du chenal (x en km)
-#   3. Calcule la densité de navires (ρ, vessels/km) et la vitesse moyenne (v, noeuds)
-#   4. Normalise pour le PINN:
+# An episode starts (t=0) when the gravity score exceeds a trigger threshold.
+# For each episode we:
+#   1. Extract the AIS data over the time window
+#   2. Project geographic coordinates onto the 1D channel axis (x in km)
+#   3. Compute vessel density (ρ, vessels/km) and mean speed (v, knots)
+#   4. Normalise for the PINN:
 #        x_norm = x_km / channel_len_km          ∈ [0, 1]
-#        t_norm = (jour − début_épisode) / durée  ∈ [0, 1]  (relatif à l'épisode)
+#        t_norm = (day − episode_start) / duration  ∈ [0, 1]  (episode-relative)
 #        ρ_norm = ρ / ρ_max_global               ∈ [0, 1]
 #        v_norm = v / v_max_global               ∈ [0, 1]
 # ════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class Episode:
-    """Un événement de disruption extrait de la série temporelle du gravity score."""
+    """A disruption event extracted from the gravity score time series."""
     episode_id: str
     location: str
     start_date: date
     end_date: date
-    trigger_score: float    # gravity score au déclenchement
+    trigger_score: float    # gravity score at trigger time
     duration_days: int
-    # Coordonnées normalisées pour le PINN (N points d'observation)
-    x_norm: np.ndarray      # position le long du chenal ∈ [0, 1]
-    t_norm: np.ndarray      # temps relatif à l'épisode ∈ [0, 1]
-    # Valeurs physiques brutes (avant normalisation globale)
-    rho_physical: np.ndarray  # densité en vessels/km
-    v_physical: np.ndarray    # vitesse en noeuds
+    # Normalised coordinates for the PINN (N observation points)
+    x_norm: np.ndarray      # position along the channel ∈ [0, 1]
+    t_norm: np.ndarray      # episode-relative time ∈ [0, 1]
+    # Raw physical values (before global normalisation)
+    rho_physical: np.ndarray  # density in vessels/km
+    v_physical: np.ndarray    # speed in knots
     n_points: int
     channel_len_km: float
 
@@ -136,15 +136,15 @@ def _detect_episode_ranges(
     pad_days: int = 0,
 ) -> list[tuple[date, date, float]]:
     """
-    Parcourt la série de gravity score et retourne les plages
-    (start_date, end_date, trigger_score) de chaque épisode.
+    Scan the gravity score series and return the ranges
+    (start_date, end_date, trigger_score) of each episode.
 
-    Un épisode est une suite continue de jours où gravity_score >= threshold,
-    d'une durée d'au moins min_days jours.
+    An episode is a continuous run of days where gravity_score >= threshold,
+    lasting at least min_days days.
 
-    pad_days > 0 étend chaque épisode au-delà du seuil de déclenchement pour
-    inclure la phase de récupération — indispensable pour que le PINN apprenne
-    la décroissance de densité et puisse estimer un TTC réaliste.
+    pad_days > 0 extends each episode beyond the trigger threshold to
+    include the recovery phase — needed for the PINN to learn the
+    density decay and estimate a realistic TTC.
     """
     sorted_df = gravity_df.sort("date")
     all_dates = [
@@ -178,7 +178,7 @@ def _detect_episode_ranges(
                 episodes.append((run_start, padded_end, trigger_score))
             in_run = False
 
-    # Fermer un épisode qui s'étend jusqu'à la fin de la série
+    # Close an episode that runs until the end of the series
     if in_run and last_date is not None:
         if (last_date - run_start).days + 1 >= min_days:
             episodes.append((run_start, last_date, trigger_score))
@@ -198,27 +198,27 @@ def structure_episodes(
     pad_days: int = 0,
 ) -> tuple[list[Episode], dict]:
     """
-    Étape 1 — Découpe les données en épisodes de disruption et extrait
-    les observations physiques (x, ρ, v) pour chaque épisode.
+    Step 1 — Split the data into disruption episodes and extract
+    the physical observations (x, ρ, v) of each episode.
 
     Parameters
     ----------
-    location          : 'houston' ou 'la'
-    gravity_path      : chemin vers le gravity_daily.parquet
-                        (défaut: data/features/<location>_gravity_daily.parquet)
-    gravity_threshold : seuil de déclenchement d'un épisode
-    min_episode_days  : durée minimale pour qu'un run soit considéré comme épisode
-    dx_km             : largeur des bins spatiaux le long du chenal
-    constituent_path  : filtrage optionnel sur les zones constituantes
-    start_date        : borne inférieure de la période de scan (incluse)
-    end_date          : borne supérieure de la période de scan (incluse)
+    location          : 'houston' or 'la'
+    gravity_path      : path to gravity_daily.parquet
+                        (default: data/features/<location>_gravity_daily.parquet)
+    gravity_threshold : episode trigger threshold
+    min_episode_days  : minimum length for a run to count as an episode
+    dx_km             : width of the spatial bins along the channel
+    constituent_path  : optional filter on the constituent zones
+    start_date        : lower bound of the scan period (inclusive)
+    end_date          : upper bound of the scan period (inclusive)
 
     Returns
     -------
-    episodes    : liste d'objets Episode (coordonnées normalisées pour le PINN)
+    episodes    : list of Episode objects (normalised coordinates for the PINN)
     global_meta : {'channel_len_km', 'global_rho_max', 'global_v_max', 'dx_km', 'location'}
     """
-    # Appliquer les defaults par localisation si non fournis
+    # Apply per-location defaults when not provided
     loc_defaults = LOCATION_DEFAULTS.get(location, {})
     if gravity_threshold is None:
         gravity_threshold = float(loc_defaults.get("gravity_threshold", 5_000))
@@ -228,35 +228,35 @@ def structure_episodes(
     if gravity_path is None:
         gravity_path = FEATURES_DIR / f"{location}_gravity_daily.parquet"
     if not gravity_path.exists():
-        raise FileNotFoundError(f"Fichier gravity score introuvable: {gravity_path}")
+        raise FileNotFoundError(f"Gravity score file not found: {gravity_path}")
 
     gravity_df = pl.read_parquet(gravity_path)
 
-    # Filtrer par période si fournie
+    # Filter by period if provided
     if start_date is not None:
         gravity_df = gravity_df.filter(pl.col("date") >= start_date.isoformat())
     if end_date is not None:
         gravity_df = gravity_df.filter(pl.col("date") <= end_date.isoformat())
 
     period_str = (
-        f"{start_date or 'debut'} -> {end_date or 'fin'}"
+        f"{start_date or 'start'} -> {end_date or 'end'}"
         if (start_date or end_date)
-        else "periode complete"
+        else "full period"
     )
     log.info(
-        "Gravity score: %d lignes | periode: %s | fichier: %s",
+        "Gravity score: %d rows | period: %s | file: %s",
         len(gravity_df), period_str, gravity_path,
     )
 
     date_ranges = _detect_episode_ranges(gravity_df, gravity_threshold, min_episode_days, pad_days=pad_days)
     if not date_ranges:
         log.warning(
-            "Aucun épisode trouvé (threshold=%.2f, min_days=%d). Essayez un seuil plus bas.",
+            "No episode found (threshold=%.2f, min_days=%d). Try a lower threshold.",
             gravity_threshold, min_episode_days,
         )
         return [], {}
 
-    log.info("%d épisode(s) candidat(s) détecté(s) (threshold=%.2f)", len(date_ranges), gravity_threshold)
+    log.info("%d candidate episode(s) detected (threshold=%.2f)", len(date_ranges), gravity_threshold)
 
     waypoints = CHANNEL_AXES[location]
     channel_len_km = compute_channel_length(waypoints)
@@ -266,7 +266,7 @@ def structure_episodes(
     for start_d, end_d, trigger_score in date_ranges:
         ep_id = f"{location}_{start_d.strftime('%Y%m%d')}_{end_d.strftime('%Y%m%d')}"
         duration = (end_d - start_d).days + 1
-        log.info("Traitement de l'épisode %s (%d jours)", ep_id, duration)
+        log.info("Processing episode %s (%d days)", ep_id, duration)
 
         try:
             X_raw, y_raw, meta_ep = build_rho_v_tensors(
@@ -278,18 +278,18 @@ def structure_episodes(
                 use_raw_velocity=True,
             )
         except Exception as exc:
-            log.warning("Épisode %s ignoré: %s", ep_id, exc)
+            log.warning("Episode %s skipped: %s", ep_id, exc)
             continue
 
         if len(X_raw) == 0:
-            log.warning("Épisode %s ignoré: aucune donnée AIS.", ep_id)
+            log.warning("Episode %s skipped: no AIS data.", ep_id)
             continue
 
-        # x_norm = x_km / channel_len est déjà dans X_raw[:, 0] ∈ [0, 1]
+        # x_norm = x_km / channel_len is already in X_raw[:, 0] ∈ [0, 1]
         x_norm = X_raw[:, 0].astype(np.float32)
 
-        # Convertir le temps global normalisé → temps relatif à l'épisode ∈ [0, 1]
-        # t_global_norm = (jour - EPOCH_DATE).days / T_DAYS_MAX
+        # Convert global normalised time → episode-relative time ∈ [0, 1]
+        # t_global_norm = (day - EPOCH_DATE).days / T_DAYS_MAX
         t_start_global = (start_d - EPOCH_DATE).days / T_DAYS_MAX
         t_end_global = (end_d - EPOCH_DATE).days / T_DAYS_MAX
         duration_norm = max(t_end_global - t_start_global, 1e-8)
@@ -297,7 +297,7 @@ def structure_episodes(
             (X_raw[:, 1] - t_start_global) / duration_norm, 0.0, 1.0
         ).astype(np.float32)
 
-        # Récupérer les valeurs physiques brutes (dénormaliser depuis les stats par épisode)
+        # Retrieve raw physical values (denormalised from the per-episode stats)
         # y_raw[:, 0] = (ρ - ρ_min) / (ρ_max - ρ_min)  →  ρ_physical = y_raw[:,0]*(ρ_max-ρ_min)+ρ_min
         rho_range = max(meta_ep["rho_max"] - meta_ep["rho_min"], 1e-8)
         rho_physical = (y_raw[:, 0] * rho_range + meta_ep["rho_min"]).astype(np.float32)
@@ -321,21 +321,21 @@ def structure_episodes(
         ))
 
     if not raw_episodes:
-        log.error("Aucun épisode avec données AIS trouvé.")
+        log.error("No episode with AIS data found.")
         return [], {}
 
-    # Calculer les constantes de normalisation globales (99e percentile pour ignorer les outliers)
+    # Global normalisation constants (99th percentile to ignore outliers)
     all_rho = np.concatenate([ep.rho_physical for ep in raw_episodes])
     all_v = np.concatenate([ep.v_physical for ep in raw_episodes])
     global_rho_max = float(max(np.percentile(all_rho, 99), 1e-4))
     global_v_max = float(max(np.percentile(all_v, 99), 1e-4))
 
     log.info(
-        "Normalisation globale: ρ_max=%.2f vessels/km  v_max=%.2f kn  chenal=%.1f km",
+        "Global normalisation: ρ_max=%.2f vessels/km  v_max=%.2f kn  channel=%.1f km",
         global_rho_max, global_v_max, channel_len_km,
     )
     log.info(
-        "Total: %d points d'observation sur %d épisode(s)",
+        "Total: %d observation points over %d episode(s)",
         sum(ep.n_points for ep in raw_episodes), len(raw_episodes),
     )
 
@@ -351,44 +351,44 @@ def structure_episodes(
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# ÉTAPE 2 — ARCHITECTURE DU PINN  (implémentée dans lwr_pinn.py)
+# STEP 2 — PINN ARCHITECTURE  (implemented in lwr_pinn.py)
 #
 # class LWRPINN(nn.Module):
-#   Entrées : [x_norm, t_norm] ∈ [0, 1]²  (coordonnées normalisées épisode-relatives)
-#   Sorties : [ρ̂_norm, v̂_norm] ∈ (0, 1)  (bornées par sigmoid)
+#   Inputs : [x_norm, t_norm] ∈ [0, 1]²  (episode-relative normalised coordinates)
+#   Outputs: [ρ̂_norm, v̂_norm] ∈ (0, 1)  (bounded by a sigmoid)
 #   Corps   : Linear(2, H) → Tanh → [Linear(H, H) → Tanh] × (L−1) → Linear(H, 2)
-#   Défaut  : L=4 couches, H=64 unités
+#   Default: L=4 layers, H=64 units
 #
-# Interprétation physique des sorties:
+# Physical meaning of the outputs:
 #   ρ_physique [vessels/km] = ρ̂_norm × global_rho_max
 #   v_physique [noeuds]     = v̂_norm × global_v_max
 # ════════════════════════════════════════════════════════════════════════════
 
-# (LWRPINN importé depuis src.pinns.lwr_pinn)
+# (LWRPINN imported from src.pinns.lwr_pinn)
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# ÉTAPE 3 — FONCTION DE PERTE HYBRIDE  (implémentée dans lwr_pinn.py)
+# STEP 3 — HYBRID LOSS FUNCTION  (implemented in lwr_pinn.py)
 #
-#   L_total = L_data  +  λ_pde · L_LWR  +  λ_kin · L_cinématique
+#   L_total = L_data  +  λ_pde · L_LWR  +  λ_kin · L_kinematic
 #
 #   L_data  = MSE(ρ̂, ρ_obs) + MSE(v̂, v_obs)
-#             calculée sur les points d'observation AIS
+#             computed on the AIS observation points
 #
 #   L_LWR   = mean[ (∂ρ̂/∂t + ∂(ρ̂·v̂)/∂x)² ]
-#             résidu de l'équation LWR, calculé via torch.autograd.grad
-#             sur des points de collocation aléatoires dans [0,1]²
+#             LWR residual, computed with torch.autograd.grad
+#             on random collocation points in [0,1]²
 #
-#   L_kin   = mean[ relu(|∂v̂/∂t| − a_max)  ]  (limite d'accélération navire)
-#           + mean[ relu(|∂v̂/∂x| − g_max)  ]  (lissage spatial)
-#           + mean[ relu(ρ̂ − 1) + relu(−ρ̂) ]  (bornes de densité)
+#   L_kin   = mean[ relu(|∂v̂/∂t| − a_max)  ]  (vessel acceleration limit)
+#           + mean[ relu(|∂v̂/∂x| − g_max)  ]  (spatial smoothness)
+#           (density bounds are enforced by the sigmoid outputs)
 # ════════════════════════════════════════════════════════════════════════════
 
-# (total_loss importé depuis src.pinns.lwr_pinn)
+# (total_loss imported from src.pinns.lwr_pinn)
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# ÉTAPE 4 — BOUCLE D'ENTRAÎNEMENT + INFÉRENCE
+# STEP 4 — TRAINING LOOP + INFERENCE
 # ════════════════════════════════════════════════════════════════════════════
 
 def train_on_episodes(
@@ -406,30 +406,30 @@ def train_on_episodes(
     fourier_sigma: float = 1.0,
 ) -> tuple[LWRPINN, dict]:
     """
-    Étape 4a — Entraîne le PINN conjointement sur tous les épisodes historiques.
+    Step 4a — Train the PINN jointly on all historical episodes.
 
-    Un seul modèle est entraîné sur l'ensemble poolé des observations (x_norm, t_norm),
-    normalisées de façon cohérente entre épisodes grâce aux constantes globales.
+    A single model is trained on the pooled observations (x_norm, t_norm),
+    normalised consistently across episodes through the global constants.
 
-    La contrainte physique LWR (Étape 3) est évaluée sur N_COLLOC points de
-    collocation aléatoires dans [0,1]², rééchantillonnés tous les COLLOC_REFRESH
-    époques pour couvrir le domaine complet.
+    The LWR physics constraint (Step 3) is evaluated on N_COLLOC random
+    collocation points in [0,1]², resampled every COLLOC_REFRESH
+    epochs to cover the whole domain.
 
-    Le checkpoint sauvegardé inclut global_meta pour permettre la dénormalisation
-    dans extract_physical_profiles.
+    The saved checkpoint includes global_meta so that
+    extract_physical_profiles can denormalise.
 
     Returns
     -------
-    model   : LWRPINN entraîné (meilleur état selon la loss totale)
-    history : liste de la loss totale par époque
+    model   : trained LWRPINN (best state according to the total loss)
+    history : per-epoch loss components
     """
     device = get_device()
-    log.info("Dispositif: %s", device)
+    log.info("Device: %s", device)
 
     global_rho_max = global_meta["global_rho_max"]
     global_v_max = global_meta["global_v_max"]
 
-    # Pooler tous les épisodes en un seul jeu (X, y) normalisé globalement
+    # Pool all episodes into a single, globally normalised (X, y) set
     x_list, t_list, rho_list, v_list = [], [], [], []
     for ep in episodes:
         rho_norm = np.clip(ep.rho_physical / global_rho_max, 0.0, 1.0)
@@ -445,7 +445,7 @@ def train_on_episodes(
     v_obs = torch.tensor(np.concatenate(v_list), dtype=torch.float32, device=device).unsqueeze(1)
 
     log.info(
-        "Dataset poolé: %d points issus de %d épisode(s)",
+        "Pooled dataset: %d points from %d episode(s)",
         len(x_data), len(episodes),
     )
 
@@ -466,21 +466,21 @@ def train_on_episodes(
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=200, factor=0.5)
 
     if n_freqs > 0:
-        log.info("Fourier embedding actif: n_freqs=%d, sigma=%.2f", n_freqs, fourier_sigma)
+        log.info("Fourier embedding enabled: n_freqs=%d, sigma=%.2f", n_freqs, fourier_sigma)
     if warmup_epochs > 0:
-        log.info("Curriculum learning: warmup sur %d époques", warmup_epochs)
+        log.info("Curriculum learning: warm-up over %d epochs", warmup_epochs)
 
     best_loss = float("inf")
     best_state = None
     history: dict = {"total": [], "data": [], "pde": [], "kin": []}
 
-    # Tirage initial des points de collocation (feuilles requises pour autograd)
+    # Initial draw of the collocation points (leaf tensors required by autograd)
     x_col = torch.rand(n_colloc, 1, device=device, requires_grad=True)
     t_col = torch.rand(n_colloc, 1, device=device, requires_grad=True)
 
     for epoch in range(1, epochs + 1):
 
-        # Rééchantillonner les points de collocation périodiquement
+        # Periodically resample the collocation points
         if epoch % colloc_refresh == 1 and epoch > 1:
             x_col = torch.rand(n_colloc, 1, device=device, requires_grad=True)
             t_col = torch.rand(n_colloc, 1, device=device, requires_grad=True)
@@ -506,7 +506,7 @@ def train_on_episodes(
         )
 
         loss.backward()
-        # Vider les gradients accumulés sur les tenseurs de collocation (non gérés par optimizer)
+        # Clear gradients accumulated on the collocation tensors (not handled by the optimizer)
         if x_col.grad is not None:
             x_col.grad = None
         if t_col.grad is not None:
@@ -526,16 +526,16 @@ def train_on_episodes(
 
         if epoch % LOG_EVERY == 0 or epoch == 1:
             log.info(
-                "Époque %4d/%d  total=%.5f  data=%.5f  pde=%.5f  kin=%.5f",
+                "Epoch %4d/%d  total=%.5f  data=%.5f  pde=%.5f  kin=%.5f",
                 epoch, epochs,
                 comps["total"], comps["data"], comps["pde"], comps["kin"],
             )
 
     if best_state:
         model.load_state_dict(best_state)
-        log.info("Meilleur état restauré (loss=%.6f)", best_loss)
+        log.info("Best state restored (loss=%.6f)", best_loss)
 
-    # Sauvegarde du checkpoint avec les métadonnées de normalisation
+    # Save the checkpoint with the normalisation metadata
     location = global_meta.get("location", "unknown")
     name = model_name or f"pinn_{location}_episodes"
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
@@ -554,13 +554,13 @@ def train_on_episodes(
         },
         save_path,
     )
-    log.info("Checkpoint sauvegardé → %s", save_path)
+    log.info("Checkpoint saved → %s", save_path)
 
     return model, history
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# FINE-TUNING — Adaptation du PINN aux données d'un nouvel événement
+# FINE-TUNING — Adapting the PINN to the data of a new event
 # ════════════════════════════════════════════════════════════════════════════
 
 def fine_tune_on_episode(
@@ -578,38 +578,38 @@ def fine_tune_on_episode(
     n_colloc: int = 500,
 ) -> LWRPINN:
     """
-    Fine-tune rapide du PINN sur les observations AIS d'un nouvel événement.
+    Fast fine-tuning of the PINN on the AIS observations of a new event.
 
-    Part des poids pré-entraînés et adapte le champ (ρ̂, v̂) aux données
-    réelles de l'événement courant tout en conservant la contrainte physique
-    LWR (∂ρ/∂t + ∂(ρv)/∂x = 0).
+    Starts from the pre-trained weights and fits the (ρ̂, v̂) field to the
+    actual data of the current event while keeping the LWR physics
+    constraint (∂ρ/∂t + ∂(ρv)/∂x = 0).
 
-    Principe : le pré-entraînement a appris la physique générale du chenal
-    (forme des ondes de choc, relation fondamentale). Le fine-tuning ajuste
-    l'amplitude et la localisation spécifiques à l'événement observé.
-    LR petit (1e-4) pour ne pas écraser la physique apprise.
+    Idea: pre-training learned the general physics of the channel
+    (shock-wave shape, fundamental relation). Fine-tuning adjusts the
+    amplitude and location specific to the observed event.
+    Small LR (1e-4) so the learned physics is not overwritten.
 
     Parameters
     ----------
-    model         : LWRPINN pré-entraîné (modifié en place + retourné)
-    x_km          : positions x [km] des observations AIS
-    t_days        : temps [jours] des observations (0 = onset de l'épisode)
-    rho_physical  : densité [vessels/km] des observations
-    v_physical    : vitesse [knots] des observations
-    global_meta   : métadonnées de normalisation issues du checkpoint
-    t_max_days    : durée de l'épisode en jours (pour normaliser t_norm)
-    epochs        : nombre d'itérations (défaut: 300)
-    lr            : learning rate (défaut: 1e-4, petit pour préserver la physique)
-    lambda_pde    : poids de la contrainte LWR
-    lambda_kin    : poids de la contrainte cinématique
-    n_colloc      : points de collocation pour la contrainte physique
+    model         : pre-trained LWRPINN (modified in place + returned)
+    x_km          : x positions [km] of the AIS observations
+    t_days        : time [days] of the observations (0 = episode onset)
+    rho_physical  : density [vessels/km] of the observations
+    v_physical    : speed [knots] of the observations
+    global_meta   : normalisation metadata from the checkpoint
+    t_max_days    : episode length in days (to normalise t_norm)
+    epochs        : number of iterations (default: 300)
+    lr            : learning rate (default: 1e-4, small to preserve the physics)
+    lambda_pde    : weight of the LWR constraint
+    lambda_kin    : weight of the kinematic constraint
+    n_colloc      : collocation points for the physics constraint
 
     Returns
     -------
-    model fine-tuné (même objet, modifié en place)
+    fine-tuned model (same object, modified in place)
     """
     if len(x_km) == 0:
-        log.warning("Fine-tuning: aucune donnee AIS disponible — etape ignoree.")
+        log.warning("Fine-tuning: no AIS data available — step skipped.")
         return model
 
     device = get_device()
@@ -620,7 +620,7 @@ def fine_tune_on_episode(
     global_rho_max = global_meta["global_rho_max"]
     global_v_max   = global_meta["global_v_max"]
 
-    # Normaliser les observations vers l'espace [0, 1]² du PINN
+    # Normalise the observations into the PINN [0, 1]² space
     x_norm   = np.clip(x_km       / max(channel_len_km, 1e-8), 0, 1).astype(np.float32)
     t_norm   = np.clip(t_days     / max(t_max_days,     1e-8), 0, 1).astype(np.float32)
     rho_norm = np.clip(rho_physical / max(global_rho_max, 1e-8), 0, 1).astype(np.float32)
@@ -631,7 +631,7 @@ def fine_tune_on_episode(
     rho_t = torch.tensor(rho_norm,  device=device).unsqueeze(1)
     v_t   = torch.tensor(v_norm,    device=device).unsqueeze(1)
 
-    # Courant number pour ce fine-tuning (basé sur t_max_days de l'épisode courant)
+    # Courant number for this fine-tuning (based on the current episode t_max_days)
     v_max_kmh     = global_v_max * 1.852
     alpha_courant = v_max_kmh * (t_max_days * 24.0) / max(channel_len_km, 1e-8)
 
@@ -648,7 +648,7 @@ def fine_tune_on_episode(
     best_state: dict | None = None
 
     for epoch in range(1, epochs + 1):
-        # Rééchantillonner les points de collocation tous les 100 epochs
+        # Resample the collocation points every 100 epochs
         if (epoch - 1) % 100 == 0:
             x_col = torch.rand(n_colloc, 1, device=device, requires_grad=True)
             t_col = torch.rand(n_colloc, 1, device=device, requires_grad=True)
@@ -680,7 +680,7 @@ def fine_tune_on_episode(
     if best_state is not None:
         model.load_state_dict(best_state)
     model.eval()
-    log.info("Fine-tuning termine. best_loss=%.6f sur %d pts AIS", best_loss, len(x_km))
+    log.info("Fine-tuning done. best_loss=%.6f on %d AIS pts", best_loss, len(x_km))
     return model
 
 
@@ -693,37 +693,37 @@ def extract_physical_profiles(
     t_max_days: Optional[float] = None,
 ) -> pd.DataFrame:
     """
-    Étape 4b — Inférence dense sur un nouvel épisode en cours.
+    Step 4b — Dense inference on a new, ongoing episode.
 
-    Prend les observations des premières heures/jours d'un épisode, passe les
-    coordonnées (x, t) dans le PINN entraîné, et retourne un DataFrame propre
-    contenant les profils physiques lissés et continus de densité et de vitesse.
+    Takes the observations of the first hours/days of an episode, feeds the
+    (x, t) coordinates to the trained PINN, and returns a clean DataFrame
+    with smooth, continuous physical profiles of density and speed.
 
-    Les trous de données sont comblés intelligemment par la physique LWR intégrée
-    dans le réseau: le PINN prédit sur une grille dense même là où il n'y a pas
-    d'observation AIS.
+    Data gaps are filled by the LWR physics embedded in the network:
+    the PINN predicts on a dense grid even where there is no
+    AIS observation.
 
     Parameters
     ----------
-    model        : LWRPINN entraîné
-    episode_data : DataFrame avec colonnes [x_km, t_days]
-                     x_km   = position le long du chenal en km depuis l'entrée
-                     t_days = jours écoulés depuis le début de l'épisode (t=0 à l'onset)
-    global_meta  : métadonnées de normalisation issues de l'entraînement
+    model        : trained LWRPINN
+    episode_data : DataFrame with columns [x_km, t_days]
+                     x_km   = position along the channel in km from the entrance
+                     t_days = days elapsed since the episode start (t=0 at onset)
+    global_meta  : normalisation metadata from training
                    (channel_len_km, global_rho_max, global_v_max)
-    x_grid_points: résolution spatiale de la grille de sortie
-    t_grid_points: résolution temporelle de la grille de sortie
-    t_max_days   : horizon de prédiction en jours
-                   (défaut: fenêtre observée × 1.2 + 1 jour)
+    x_grid_points: spatial resolution of the output grid
+    t_grid_points: temporal resolution of the output grid
+    t_max_days   : prediction horizon in days
+                   (default: observed window × 1.2 + 1 day)
 
     Returns
     -------
-    DataFrame avec colonnes:
-        x_km      : position le long du chenal [km]
-        t_days    : temps depuis l'onset de l'épisode [jours]
-        rho_hat   : densité prédite [vessels/km]   — lissée par physique LWR
-        v_hat     : vitesse prédite [noeuds]       — lissée par physique LWR
-        flux_hat  : débit prédit [vessels·kn/km]   = rho_hat × v_hat
+    DataFrame with columns:
+        x_km      : position along the channel [km]
+        t_days    : time since the episode onset [days]
+        rho_hat   : predicted density [vessels/km]   — smoothed by LWR physics
+        v_hat     : predicted speed [knots]          — smoothed by LWR physics
+        flux_hat  : predicted flow [vessels·kn/km]   = rho_hat × v_hat
     """
     model.eval()
     device = get_device()
@@ -733,11 +733,11 @@ def extract_physical_profiles(
     global_rho_max = global_meta["global_rho_max"]
     global_v_max = global_meta["global_v_max"]
 
-    # Horizon de prédiction
+    # Prediction horizon
     if t_max_days is None:
         t_max_days = float(episode_data["t_days"].max()) * 1.2 + 1.0
 
-    # Grille d'évaluation dense en coordonnées physiques
+    # Dense evaluation grid in physical coordinates
     x_grid = np.linspace(0.0, channel_len_km, x_grid_points, dtype=np.float32)
     t_grid = np.linspace(0.0, t_max_days, t_grid_points, dtype=np.float32)
     xx, tt = np.meshgrid(x_grid, t_grid)  # shape: (t_grid_points, x_grid_points)
@@ -745,7 +745,7 @@ def extract_physical_profiles(
     x_flat = xx.ravel()
     t_flat = tt.ravel()
 
-    # Normalisation vers l'espace d'entrée du PINN [0, 1]²
+    # Normalise into the PINN input space [0, 1]²
     x_norm = x_flat / max(channel_len_km, 1e-8)
     t_norm = t_flat / max(t_max_days, 1e-8)
 
@@ -755,7 +755,7 @@ def extract_physical_profiles(
     with torch.no_grad():
         rho_pred_norm, v_pred_norm = model(x_tensor, t_tensor)
 
-    # Dénormalisation vers les unités physiques
+    # Denormalise back to physical units
     rho_hat = rho_pred_norm.cpu().numpy().ravel() * global_rho_max
     v_hat = v_pred_norm.cpu().numpy().ravel() * global_v_max
 
@@ -770,21 +770,21 @@ def extract_physical_profiles(
 
 def extract_pinn_summaries(profiles: pd.DataFrame) -> dict:
     """
-    Extrait des résumés scalaires du champ PINN prédit (ρ̂, v̂, flux̂).
+    Extract scalar summaries of the predicted PINN field (ρ̂, v̂, flux̂).
 
-    Ces scalaires servent de features physiques pour le XGBoost Phase 4,
-    qui prédit le TTC observé (durée d'épisode) à partir des caractéristiques
-    du champ de congestion reconstruit par le PINN.
+    These scalars are the physical features of the Phase 4 XGBoost,
+    which predicts the observed TTC (episode duration) from the characteristics
+    of the congestion field reconstructed by the PINN.
 
     Returns
     -------
-    dict avec les clés :
-        peak_rho        [vessels/km] : densité maximale sur l'épisode
-        t_to_peak_days  [jours]      : instant du pic de congestion
-        area_under_rho  [v/km * j]   : intégrale de max_x ρ(x,t) dans le temps
-        decay_rate      [v/km / j]   : pente de résorption post-pic (négatif = décroissance)
-        flux_entry_mean [v*kn/km]    : flux moyen au premier dixième du chenal
-        v_mean_global   [noeuds]     : vitesse moyenne sur tout l'épisode
+    dict with keys:
+        peak_rho        [vessels/km] : maximum density over the episode
+        t_to_peak_days  [days]       : time of the congestion peak
+        area_under_rho  [v/km * d]   : time integral of max_x ρ(x,t)
+        decay_rate      [v/km / d]   : post-peak clearing slope (negative = decay)
+        flux_entry_mean [v*kn/km]    : mean flux over the first tenth of the channel
+        v_mean_global   [knots]      : mean speed over the whole episode
     """
     t_series = (
         profiles.groupby("t_days")["rho_hat"]
@@ -835,35 +835,35 @@ def plot_physical_profiles(
     output_path: Optional[Path] = None,
 ) -> Path:
     """
-    Visualise les profils physiques du PINN sous forme de 3 heatmaps interactives:
-        - Densité   ρ(x, t)  [vessels/km]
-        - Vitesse   v(x, t)  [knots]
-        - Débit     q(x, t)  = ρ·v
+    Plot the PINN physical profiles as 3 interactive heatmaps:
+        - Density ρ(x, t)  [vessels/km]
+        - Speed   v(x, t)  [knots]
+        - Flow    q(x, t)  = ρ·v
 
-    Axe x (horizontal) = temps depuis l'onset de l'épisode [jours]
-    Axe y (vertical)   = position le long du chenal [km]
+    x axis (horizontal) = time since the episode onset [days]
+    y axis (vertical)   = position along the channel [km]
 
-    Si episode_data est fourni (colonnes [x_km, t_days]), les observations AIS
-    réelles sont superposées en scatter sur chaque panneau.
+    If episode_data is provided (columns [x_km, t_days]), the actual AIS
+    observations are overlaid as a scatter on each panel.
 
     Parameters
     ----------
-    profiles     : DataFrame issu de extract_physical_profiles
-    episode_data : observations AIS brutes à superposer (optionnel)
-    title_suffix : texte ajouté au titre (ex: nom de l'épisode)
-    output_path  : chemin du fichier HTML de sortie (défaut: outputs/figures/)
+    profiles     : DataFrame from extract_physical_profiles
+    episode_data : raw AIS observations to overlay (optional)
+    title_suffix : text appended to the title (e.g. episode name)
+    output_path  : output HTML path (default: outputs/figures/)
 
     Returns
     -------
-    Path du fichier HTML sauvegardé
+    Path of the saved HTML file
     """
     try:
         import plotly.graph_objects as go
         from plotly.subplots import make_subplots
     except ImportError:
-        raise ImportError("plotly requis pour la visualisation: pip install plotly")
+        raise ImportError("plotly required for plotting: pip install plotly")
 
-    # Pivoter le DataFrame long → grille 2D pour les heatmaps
+    # Pivot the long DataFrame → 2D grid for the heatmaps
     t_vals = np.sort(profiles["t_days"].unique())
     x_vals = np.sort(profiles["x_km"].unique())
 
@@ -879,8 +879,8 @@ def plot_physical_profiles(
     fig = make_subplots(
         rows=3, cols=1,
         subplot_titles=(
-            "Densite rho(x,t)  [vessels/km]",
-            "Vitesse v(x,t)    [knots]",
+            "Density rho(x,t)  [vessels/km]",
+            "Speed v(x,t)      [knots]",
             "Debit  q(x,t)     [vessels*kn/km]",
         ),
         shared_xaxes=True,
@@ -905,7 +905,7 @@ def plot_physical_profiles(
             row=row, col=1,
         )
 
-        # Superposer les observations AIS réelles si disponibles
+        # Overlay the actual AIS observations if available
         if episode_data is not None and "x_km" in episode_data.columns:
             fig.add_trace(
                 go.Scatter(
@@ -928,9 +928,9 @@ def plot_physical_profiles(
     fig.update_yaxes(title_text="x [km]", row=1, col=1)
     fig.update_yaxes(title_text="x [km]", row=2, col=1)
     fig.update_yaxes(title_text="x [km]", row=3, col=1)
-    fig.update_xaxes(title_text="Temps depuis l'onset [jours]", row=3, col=1)
+    fig.update_xaxes(title_text="Time since onset [days]", row=3, col=1)
 
-    title = "PINN LWR — Profils physiques"
+    title = "PINN LWR — Physical profiles"
     if title_suffix:
         title += f"  |  {title_suffix}"
 
@@ -948,12 +948,12 @@ def plot_physical_profiles(
 
     _force_unlink(output_path)
     fig.write_image(str(output_path), format="png", scale=2)
-    log.info("Visualisation sauvegardee -> %s", output_path)
+    log.info("Plot saved -> %s", output_path)
     return output_path
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# VISUALISATIONS LWR AVANCÉES
+# ADVANCED LWR PLOTS
 # ════════════════════════════════════════════════════════════════════════════
 
 def plot_shockwave_heatmap(
@@ -962,26 +962,26 @@ def plot_shockwave_heatmap(
     output_path: Optional[Path] = None,
 ) -> Path:
     """
-    Diagramme spatio-temporel LWR — onde de choc.
+    LWR space-time diagram — shock wave.
 
-    Convention des waypoints Houston (CHANNEL_AXES["houston"]) :
-      - x = 0 km  : turning basin / terminaux (intérieur, côté ville)
-      - x = max   : Galveston Bay / entrée Gulf (côté large)
-    L'ordre est défini par l'ordre des waypoints — x=0 correspond au premier.
+    Houston waypoint convention (CHANNEL_AXES["houston"]):
+      - x = 0 km : turning basin / terminals (inland, city side)
+      - x = max  : Galveston Bay / Gulf entrance (seaward)
+    The order follows the waypoints — x=0 is the first one.
 
-      - Axe X : espace x [km]
-      - Axe Y : temps t [heures] depuis le début de l'épisode
-      - Couleur : densité ρ̂  (bleu=fluide → rouge foncé=saturé)
+      - X axis : space x [km]
+      - Y axis : time t [hours] since the episode start
+      - Colour : density ρ̂  (blue=free flow → dark red=saturated)
 
-    L'onde de choc se manifeste comme une bande diagonale rouge dense
-    côté terminaux (x≈0) se propageant vers l'entrée (x grand) au fil du temps.
+    The shock wave shows up as a dense red diagonal band on the
+    terminal side (x≈0) propagating towards the entrance (large x) over time.
 
     Returns output path.
     """
     try:
         import plotly.graph_objects as go
     except ImportError:
-        raise ImportError("plotly requis: pip install plotly")
+        raise ImportError("plotly required: pip install plotly")
 
     profiles_h = profiles.copy()
     profiles_h["t_hours"] = profiles_h["t_days"] * 24.0
@@ -1022,7 +1022,7 @@ def plot_shockwave_heatmap(
         )
     )
 
-    # Contour au front de choc (50% du pic) pour matérialiser l'onde
+    # Contour at the shock front (50% of the peak) to materialise the wave
     shock_level = 0.5 * rho_max
     if shock_level > rho_mean * 0.1 and not np.isnan(shock_level):
         fig.add_trace(
@@ -1042,15 +1042,15 @@ def plot_shockwave_heatmap(
             )
         )
 
-    title = "PINN LWR — Onde de Choc  |  rho(x, t)"
+    title = "PINN LWR — Shock wave  |  rho(x, t)"
     if title_suffix:
         title += f"  |  {title_suffix}"
 
     fig.update_layout(
         title=dict(text=title, x=0.5, font=dict(size=15)),
-        xaxis=dict(title="Distance le long du chenal [km]  (entree -> port)", showgrid=False),
+        xaxis=dict(title="Distance along the channel [km]  (entrance -> port)", showgrid=False),
         yaxis=dict(
-            title="Temps depuis l'onset [heures]",
+            title="Time since onset [hours]",
             autorange="reversed",
             showgrid=False,
         ),
@@ -1059,7 +1059,7 @@ def plot_shockwave_heatmap(
         annotations=[
             dict(
                 x=0.02, y=0.97, xref="paper", yref="paper",
-                text="<b>-- Front de choc</b><br><i>se propage vers x=0 (large)</i>",
+                text="<b>-- Shock front</b><br><i>propagates towards x=0 (sea)</i>",
                 showarrow=False,
                 font=dict(color="white", size=11),
                 align="left",
@@ -1077,7 +1077,7 @@ def plot_shockwave_heatmap(
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     _force_unlink(output_path)
     fig.write_image(str(output_path), format="png", scale=2)
-    log.info("Diagramme onde de choc sauvegarde -> %s", output_path)
+    log.info("Shock-wave diagram saved -> %s", output_path)
     return output_path
 
 
@@ -1090,28 +1090,28 @@ def plot_ais_vs_pinn(
     output_path: Optional[Path] = None,
 ) -> Path:
     """
-    Comparaison cote-a-cote: donnees AIS brutes (trouees) vs sortie PINN (lisse).
+    Side-by-side comparison: raw AIS data (with gaps) vs PINN output (smooth).
 
-    Demontre la capacite du PINN a combler les lacunes de couverture satellitaire
-    via la contrainte physique LWR.
+    Shows how the PINN fills satellite coverage gaps through the
+    LWR physics constraint.
 
-    Panneau gauche: observations AIS binees sur la grille PINN — zones blanches
-                    = absence de signal AIS (trous de couverture).
-    Panneau droit : sortie dense du PINN — continue et physiquement coherente
-                    meme dans les zones sans observation.
+    Left panel : AIS observations binned on the PINN grid — white areas
+                 = no AIS signal (coverage gaps).
+    Right panel: dense PINN output — continuous and physically consistent
+                 even where there is no observation.
 
     Parameters
     ----------
-    profiles    : DataFrame issu de extract_physical_profiles (grille dense)
-    raw_x_km    : positions x [km] des observations AIS
-    raw_t_days  : temps [jours] des observations AIS (episode-relatif)
-    raw_rho     : densite [vessels/km] des observations AIS
+    profiles    : DataFrame from extract_physical_profiles (dense grid)
+    raw_x_km    : x positions [km] of the AIS observations
+    raw_t_days  : time [days] of the AIS observations (episode-relative)
+    raw_rho     : density [vessels/km] of the AIS observations
     """
     try:
         import plotly.graph_objects as go
         from plotly.subplots import make_subplots
     except ImportError:
-        raise ImportError("plotly requis: pip install plotly")
+        raise ImportError("plotly required: pip install plotly")
 
     t_u = np.sort(profiles["t_days"].unique())
     x_u = np.sort(profiles["x_km"].unique())
@@ -1122,7 +1122,7 @@ def plot_ais_vs_pinn(
         .values
     )
 
-    # Binner les observations AIS brutes sur la grille PINN
+    # Bin the raw AIS observations on the PINN grid
     raw_grid = np.full((len(t_u), len(x_u)), np.nan, dtype=np.float32)
     if len(raw_x_km) > 0:
         dx = (x_u[1] - x_u[0]) / 2 if len(x_u) > 1 else 0.5
@@ -1152,8 +1152,8 @@ def plot_ais_vs_pinn(
     fig = make_subplots(
         rows=1, cols=2,
         subplot_titles=(
-            f"Ground Truth AIS  ({coverage_pct:.0f}% de couverture)",
-            "Sortie PINN  (continu, sans lacunes)",
+            f"Ground Truth AIS  ({coverage_pct:.0f}% coverage)",
+            "PINN output  (continuous, no gaps)",
         ),
         horizontal_spacing=0.10,
     )
@@ -1178,12 +1178,12 @@ def plot_ais_vs_pinn(
             row=1, col=col,
         )
 
-    fig.update_yaxes(title_text="Temps [jours]", autorange="reversed", row=1, col=1)
+    fig.update_yaxes(title_text="Time [days]", autorange="reversed", row=1, col=1)
     fig.update_yaxes(autorange="reversed", row=1, col=2)
     fig.update_xaxes(title_text="x [km]", row=1, col=1)
     fig.update_xaxes(title_text="x [km]", row=1, col=2)
 
-    title = "PINN LWR — Lissage physique: AIS brut vs. Sortie PINN"
+    title = "PINN LWR — Physics smoothing: raw AIS vs. PINN output"
     if title_suffix:
         title += f"  |  {title_suffix}"
 
@@ -1195,8 +1195,8 @@ def plot_ais_vs_pinn(
             dict(
                 x=0.50, y=-0.14, xref="paper", yref="paper",
                 text=(
-                    "<i>Les zones blanches (gauche) = absence de signal AIS. "
-                    "Le PINN (droite) comble ces lacunes par la contrainte physique LWR.</i>"
+                    "<i>White areas (left) = no AIS signal. "
+                    "The PINN (right) fills these gaps through the LWR physics constraint.</i>"
                 ),
                 showarrow=False,
                 font=dict(color="gray", size=11),
@@ -1213,7 +1213,7 @@ def plot_ais_vs_pinn(
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     _force_unlink(output_path)
     fig.write_image(str(output_path), format="png", scale=2)
-    log.info("Comparaison AIS vs PINN sauvegardee -> %s", output_path)
+    log.info("AIS vs PINN comparison saved -> %s", output_path)
     return output_path
 
 
@@ -1224,30 +1224,30 @@ def plot_density_profiles_1d(
     output_path: Optional[Path] = None,
 ) -> Path:
     """
-    Profils 1D de densite rho(x) a differents instants d'un episode.
+    1D density profiles rho(x) at different times of an episode.
 
-    Montre l'evolution de la bosse de masse bloquee: plate au debut,
-    elle gonfle devant l'entree du port (x eleve) et se propage vers le large.
+    Shows how the blocked-mass bump evolves: flat at first, it grows
+    in front of the port entrance (high x) and propagates seaward.
 
-    Chaque courbe est une coupe transversale rho(x) a t fixe.
-    Gradient de couleur: bleu (debut) -> rouge (fin de l'episode).
+    Each curve is a cross-section rho(x) at fixed t.
+    Colour gradient: blue (start) -> red (end of the episode).
 
     Parameters
     ----------
-    profiles   : DataFrame issu de extract_physical_profiles
-    n_slices   : nombre de coupes temporelles a tracer (defaut: 6)
+    profiles   : DataFrame from extract_physical_profiles
+    n_slices   : number of time slices to plot (default: 6)
     """
     try:
         import plotly.graph_objects as go
     except ImportError:
-        raise ImportError("plotly requis: pip install plotly")
+        raise ImportError("plotly required: pip install plotly")
 
     t_all = np.sort(profiles["t_days"].unique())
 
     indices = np.round(np.linspace(0, len(t_all) - 1, n_slices)).astype(int)
     t_slices = t_all[indices]
 
-    # Gradient: bleu (hue=240) -> rouge (hue=0)
+    # Gradient: blue (hue=240) -> red (hue=0)
     colors = [
         f"hsl({int(240 - 240 * i / max(n_slices - 1, 1))}, 80%, 50%)"
         for i in range(n_slices)
@@ -1280,29 +1280,29 @@ def plot_density_profiles_1d(
             )
         )
 
-    title = "PINN LWR — Profils de densite rho(x) a differents instants"
+    title = "PINN LWR — Density profiles rho(x) at different times"
     if title_suffix:
         title += f"  |  {title_suffix}"
 
     fig.update_layout(
         title=dict(text=title, x=0.5, font=dict(size=14)),
         xaxis=dict(
-            title="Distance le long du chenal [km]  (entree -> port)",
+            title="Distance along the channel [km]  (entrance -> port)",
             showgrid=True, gridcolor="#e0e0e0",
         ),
         yaxis=dict(
-            title="Densite rho  [vessels/km]",
+            title="Density rho  [vessels/km]",
             showgrid=True, gridcolor="#e0e0e0", rangemode="tozero",
         ),
         height=520,
         template="plotly_white",
-        legend=dict(title="Instant (bleu=debut, rouge=fin)", x=1.02, y=0.5),
+        legend=dict(title="Time (blue=start, red=end)", x=1.02, y=0.5),
         annotations=[
             dict(
                 x=0.50, y=-0.14, xref="paper", yref="paper",
                 text=(
-                    "<i>La bosse se forme a x eleve (entree du port) "
-                    "et se propage vers x=0 (large) : onde cinematique LWR.</i>"
+                    "<i>The bump forms at high x (port entrance) "
+                    "and propagates towards x=0 (sea): LWR kinematic wave.</i>"
                 ),
                 showarrow=False,
                 font=dict(color="gray", size=11),
@@ -1319,7 +1319,7 @@ def plot_density_profiles_1d(
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     _force_unlink(output_path)
     fig.write_image(str(output_path), format="png", scale=2)
-    log.info("Profils 1D sauvegardes -> %s", output_path)
+    log.info("1D profiles saved -> %s", output_path)
     return output_path
 
 
@@ -1329,24 +1329,24 @@ def plot_fundamental_diagram(
     output_path: Optional[Path] = None,
 ) -> Path:
     """
-    Diagramme fondamental du trafic: flux q = rho * v en fonction de rho.
+    Fundamental traffic diagram: flow q = rho * v as a function of rho.
 
-    Selon l'equation LWR (modele de Greenshields), la relation (rho, q) forme
-    une parabole : q augmente avec rho jusqu'a la capacite maximale du chenal,
-    puis s'effondre (embouteillage — vitesse -> 0).
+    Under the LWR equation (Greenshields model), (rho, q) forms a
+    parabola: q rises with rho up to the channel capacity,
+    then collapses (jam — speed -> 0).
 
-    Si le PINN a bien appris la physique, le nuage de points reproduit
-    naturellement cette parabole sans qu'elle soit imposee explicitement.
-    C'est la preuve que le PINN agit comme un simulateur de physique,
-    pas comme une boite noire.
+    If the PINN has learned the physics, the point cloud reproduces
+    this parabola naturally, without it being imposed explicitly.
+    This shows the PINN behaves like a physics simulator,
+    not a black box.
 
-    Le nuage est colore par le temps t [jours] pour montrer l'evolution
-    chronologique de l'etat du trafic.
+    The cloud is coloured by time t [days] to show how the traffic
+    state evolves.
     """
     try:
         import plotly.graph_objects as go
     except ImportError:
-        raise ImportError("plotly requis: pip install plotly")
+        raise ImportError("plotly required: pip install plotly")
 
     rho = profiles["rho_hat"].values.astype(np.float64)
     q   = profiles["flux_hat"].values.astype(np.float64)
@@ -1375,7 +1375,7 @@ def plot_fundamental_diagram(
 
     fig = go.Figure()
 
-    # Nuage de points colore par le temps
+    # Point cloud coloured by time
     fig.add_trace(
         go.Scatter(
             x=rho, y=q,
@@ -1384,7 +1384,7 @@ def plot_fundamental_diagram(
                 size=5,
                 color=t,
                 colorscale="RdYlBu_r",
-                colorbar=dict(title="t [jours]", thickness=14),
+                colorbar=dict(title="t [days]", thickness=14),
                 opacity=0.55,
                 line=dict(width=0),
             ),
@@ -1415,25 +1415,25 @@ def plot_fundamental_diagram(
                 marker=dict(size=14, color="red", symbol="star"),
                 text=[f"  q* = {q_max_fit:.2f}<br>  rho* = {rho_opt_fit:.2f}"],
                 textposition="top right",
-                name="Capacite maximale q*",
+                name="Maximum capacity q*",
                 textfont=dict(color="red", size=12),
             )
         )
 
-    title = "PINN LWR — Diagramme Fondamental du Trafic  q = rho * v"
+    title = "PINN LWR — Fundamental traffic diagram  q = rho * v"
     if title_suffix:
         title += f"  |  {title_suffix}"
 
     caption = (
-        "<i>La parabole (Greenshields) est une consequence de l'equation LWR. "
-        "Si le PINN la reproduit naturellement, il a bien appris la physique "
-        "du trafic maritime — pas une boite noire.</i>"
+        "<i>The (Greenshields) parabola is a consequence of the LWR equation. "
+        "If the PINN reproduces it naturally, it has learned the physics "
+        "of maritime traffic — not a black box.</i>"
     )
 
     fig.update_layout(
         title=dict(text=title, x=0.5, font=dict(size=14)),
         xaxis=dict(
-            title="Densite rho  [vessels/km]",
+            title="Density rho  [vessels/km]",
             showgrid=True, gridcolor="#e0e0e0", rangemode="tozero",
         ),
         yaxis=dict(
@@ -1462,7 +1462,7 @@ def plot_fundamental_diagram(
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     _force_unlink(output_path)
     fig.write_image(str(output_path), format="png", scale=2)
-    log.info("Diagramme fondamental sauvegarde -> %s", output_path)
+    log.info("Fundamental diagram saved -> %s", output_path)
     return output_path
 
 
@@ -1474,47 +1474,47 @@ def plot_congestion_clearance(
     output_path: Optional[Path] = None,
 ) -> tuple[Path, Optional[float]]:
     """
-    Visualise la dynamique de résorption de la congestion et calcule le TTC.
+    Plot the congestion clearing dynamics and compute the TTC.
 
-    La congestion est mesurée par max_x ρ(x,t) — la densité maximale le long
-    du chenal à chaque instant. Le TTC est le premier jour où cette valeur
-    passe sous le seuil = rho_threshold_frac × pic initial.
+    Congestion is measured by a spatial aggregate of ρ(x,t) (mean or max
+    along the channel) at each time. The TTC is the first day this value
+    falls below the threshold = rho_threshold_frac × peak.
 
-    Panel 1 — Courbe de résorption:
-        max_x ρ(x,t) en fonction du temps, avec:
-        - ligne de seuil pointillée rouge
-        - zone grisée "congestion active"
-        - marqueur vertical vert au TTC
-        - annotation "TTC = X jours"
+    Panel 1 — Clearing curve:
+        aggregated ρ(x,t) over time, with:
+        - red dotted threshold line
+        - grey "active congestion" area
+        - green vertical marker at the TTC
+        - "TTC = X days" annotation
 
-    Panel 2 — Heatmap spatiale ρ(x,t):
-        Le même champ que plot_physical_profiles mais avec l'isoline rouge
-        au niveau du seuil — montre visuellement quel bout du chenal se
-        désengorge en premier et à quelle vitesse.
+    Panel 2 — Spatial heatmap ρ(x,t):
+        The same field as plot_physical_profiles, with the red isoline
+        at the threshold level — shows which end of the channel
+        clears first and how fast.
 
     Parameters
     ----------
-    profiles            : DataFrame issu de extract_physical_profiles
-    rho_threshold_frac  : fraction du niveau initial définissant le retour à la normale.
-                          Avec ttc_metric="mean" (défaut), 0.7 = congestion réduite à 70%
-                          de son niveau initial en densité moyenne.
-    ttc_metric          : 'mean' (défaut) ou 'max'.
-                          'mean' = moyenne spatiale — charge globale du canal (recommandé).
-                          'max'  = maximum spatial — correspond à la queue côté port (toujours élevé).
-    title_suffix        : texte ajouté au titre
-    output_path         : chemin de sortie
+    profiles            : DataFrame from extract_physical_profiles
+    rho_threshold_frac  : fraction of the peak defining the return to normal.
+                          With ttc_metric="mean" (default), 0.7 = congestion down to 70%
+                          of its peak in mean density.
+    ttc_metric          : 'mean' (default) or 'max'.
+                          'mean' = spatial mean — overall channel load (recommended).
+                          'max'  = spatial max — the port-side queue (always high).
+    title_suffix        : text appended to the title
+    output_path         : output path
 
     Returns
     -------
-    (path_png, ttc_days)  — ttc_days est None si non atteint dans la fenêtre
+    (path_png, ttc_days)  — ttc_days is None if not reached within the window
     """
     try:
         import plotly.graph_objects as go
         from plotly.subplots import make_subplots
     except ImportError:
-        raise ImportError("plotly requis: pip install plotly")
+        raise ImportError("plotly required: pip install plotly")
 
-    # ── Courbe de résorption ─────────────────────────────────────────────────
+    # ── Clearing curve ───────────────────────────────────────────────────────
     # Compute both max and mean across x at each t
     t_grp = profiles.groupby("t_days")["rho_hat"]
     t_max_series  = t_grp.max().reset_index().sort_values("t_days")
@@ -1541,7 +1541,7 @@ def plot_congestion_clearance(
     if len(below) > 0:
         ttc_days = float(t_vals_c[below[0]])
 
-    # ── Grille 2D pour la heatmap ────────────────────────────────────────────
+    # ── 2D grid for the heatmap ──────────────────────────────────────────────
     t_u = np.sort(profiles["t_days"].unique())
     x_u = np.sort(profiles["x_km"].unique())
     rho_grid = (
@@ -1555,14 +1555,14 @@ def plot_congestion_clearance(
         rows=2, cols=1,
         row_heights=[0.42, 0.58],
         subplot_titles=(
-            f"Courbe de résorption — {metric_label}",
-            "Champ de densité ρ(x,t)  [vessels/km]  avec isoline de seuil",
+            f"Clearing curve — {metric_label}",
+            "Density field ρ(x,t)  [vessels/km]  with threshold isoline",
         ),
         vertical_spacing=0.12,
     )
 
-    # — Panel 1 : courbe de résorption ————————————————————————————————
-    # Zone grisée "congestion active" (rho > seuil)
+    # — Panel 1: clearing curve ————————————————————————————————————————
+    # Grey "active congestion" area (rho > threshold)
     rho_clipped = np.where(rho_primary > threshold, rho_primary, threshold)
     fig.add_trace(
         go.Scatter(
@@ -1571,12 +1571,12 @@ def plot_congestion_clearance(
             fill="toself",
             fillcolor="rgba(200, 50, 50, 0.15)",
             line=dict(width=0),
-            name="Zone congestionnée",
+            name="Congested area",
             showlegend=True,
         ),
         row=1, col=1,
     )
-    # Courbe principale (metric sélectionnée)
+    # Main curve (selected metric)
     fig.add_trace(
         go.Scatter(
             x=t_vals_c,
@@ -1587,7 +1587,7 @@ def plot_congestion_clearance(
         ),
         row=1, col=1,
     )
-    # Courbe secondaire (l'autre metric, en fond)
+    # Secondary curve (the other metric, in the background)
     secondary_y = rho_mean_t if ttc_metric == "max" else rho_max_t
     secondary_label = "mean_x ρ" if ttc_metric == "max" else "max_x ρ (contextuel)"
     fig.add_trace(
@@ -1601,13 +1601,13 @@ def plot_congestion_clearance(
         ),
         row=1, col=1,
     )
-    # Ligne de seuil
+    # Threshold line
     fig.add_hline(
         y=threshold,
         line_dash="dash",
         line_color="red",
         line_width=1.5,
-        annotation_text=f"Seuil ({rho_threshold_frac*100:.0f}% niveau initial = {threshold:.1f} v/km)",
+        annotation_text=f"Threshold ({rho_threshold_frac*100:.0f}% of peak = {threshold:.1f} v/km)",
         annotation_position="top right",
         row=1, col=1,
     )
@@ -1623,7 +1623,7 @@ def plot_congestion_clearance(
         fig.add_annotation(
             x=ttc_days,
             y=rho_peak * 0.85,
-            text=f"<b>TTC = {ttc_days:.1f} jours</b>",
+            text=f"<b>TTC = {ttc_days:.1f} days</b>",
             showarrow=True,
             arrowhead=2,
             arrowcolor="green",
@@ -1635,7 +1635,7 @@ def plot_congestion_clearance(
         fig.add_annotation(
             x=t_vals_c[-1] * 0.6,
             y=rho_peak * 0.5,
-            text="TTC non atteint dans la fenetre",
+            text="TTC not reached within the window",
             font=dict(color="orange", size=12),
             showarrow=False,
             row=1, col=1,
@@ -1657,7 +1657,7 @@ def plot_congestion_clearance(
         ),
         row=2, col=1,
     )
-    # Isoline au seuil
+    # Threshold isoline
     fig.add_trace(
         go.Contour(
             z=rho_grid,
@@ -1671,11 +1671,11 @@ def plot_congestion_clearance(
             ),
             line=dict(color="red", width=2, dash="dash"),
             showscale=False,
-            name=f"Seuil {threshold:.1f} v/km",
+            name=f"Threshold {threshold:.1f} v/km",
         ),
         row=2, col=1,
     )
-    # Ligne verticale TTC sur la heatmap
+    # Vertical TTC line on the heatmap
     if ttc_days is not None:
         fig.add_vline(
             x=ttc_days,
@@ -1686,11 +1686,11 @@ def plot_congestion_clearance(
         )
 
     fig.update_yaxes(title_text="x [km]", row=2, col=1)
-    fig.update_xaxes(title_text="Temps depuis l'onset [jours]", row=2, col=1)
+    fig.update_xaxes(title_text="Time since onset [days]", row=2, col=1)
 
     # ── Mise en page ─────────────────────────────────────────────────────────
-    ttc_label = f"{ttc_days:.1f}j" if ttc_days is not None else "non atteint"
-    title = f"PINN LWR — Résorption congestion ({metric_label})  |  TTC = {ttc_label}"
+    ttc_label = f"{ttc_days:.1f}d" if ttc_days is not None else "not reached"
+    title = f"PINN LWR — Congestion clearing ({metric_label})  |  TTC = {ttc_label}"
     if title_suffix:
         title += f"  |  {title_suffix}"
 
@@ -1709,14 +1709,14 @@ def plot_congestion_clearance(
     _force_unlink(output_path)
     fig.write_image(str(output_path), format="png", scale=2)
     log.info(
-        "Clearance plot sauvegardes -> %s  (TTC=%s)",
+        "Clearance plot saved -> %s  (TTC=%s)",
         output_path, f"{ttc_days:.1f}j" if ttc_days is not None else "n/a",
     )
     return output_path, ttc_days
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# NOWCAST VALIDATION — Comparaison TTC prédit vs réel
+# NOWCAST VALIDATION — predicted vs actual TTC
 # ════════════════════════════════════════════════════════════════════════════
 
 def _compute_gt_ttc(
@@ -1725,22 +1725,22 @@ def _compute_gt_ttc(
     threshold: float,
 ) -> Optional[float]:
     """
-    Calcule le TTC réel depuis les données AIS ground truth.
+    Compute the actual TTC from the ground-truth AIS data.
 
-    Regroupe les observations AIS par journée et calcule max_x(ρ) à chaque
-    pas de temps discret. Le TTC réel est le premier jour où max_x(ρ) < threshold.
+    Groups the AIS observations by day and computes max_x(ρ) at each
+    discrete time step. The actual TTC is the first day where max_x(ρ) < threshold.
 
     Parameters
     ----------
-    gt_t_days       : temps [jours] épisode-relatifs des observations GT
-                      (t=0 = début de l'épisode, fenêtre GT commence à obs_end_days)
-    gt_rho_physical : densité [vessels/km] correspondante
-    threshold       : seuil de retour à la normale [vessels/km] — même valeur
-                      que celle utilisée pour le TTC prédit par le PINN
+    gt_t_days       : episode-relative time [days] of the GT observations
+                      (t=0 = episode start, the GT window starts at obs_end_days)
+    gt_rho_physical : corresponding density [vessels/km]
+    threshold       : return-to-normal threshold [vessels/km] — same value
+                      as the one used for the PINN-predicted TTC
 
     Returns
     -------
-    ttc_days (float) ou None si non atteint dans la fenêtre GT
+    ttc_days (float) or None if not reached within the GT window
     """
     if len(gt_t_days) == 0 or threshold <= 0:
         return None
@@ -1751,7 +1751,7 @@ def _compute_gt_ttc(
     for d in unique_days:
         mask = day_bins == d
         if float(gt_rho_physical[mask].max()) < threshold:
-            return float(d) + 0.5   # centre du jour
+            return float(d) + 0.5   # middle of the day
 
     return None
 
@@ -1768,37 +1768,37 @@ def plot_nowcast_validation(
     output_path: Optional[Path] = None,
 ) -> Path:
     """
-    Validation du nowcasting : courbe prédite (PINN) vs courbe réelle (AIS).
+    Nowcast validation: predicted curve (PINN) vs actual curve (AIS).
 
-    Affiche sur un même graphe :
-      - Zone grisée  : fenêtre d'observation [0, obs_end_days]
-      - Zone bleutée : horizon de prédiction [obs_end_days, t_max]
-      - Ligne grise verticale : séparation observation / prédiction (--nowcast-end)
-      - Trait rouge pointillé : max_x ρ̂(x,t) prédit par le PINN
-      - Trait bleu plein      : max_x ρ(x,t) réel depuis les AIS ground truth
-      - Ligne rouge horizontale : seuil TTC
-      - Trait vert  : TTC prédit (quand la courbe PINN passe sous le seuil)
-      - Trait orange : TTC réel   (quand la courbe GT passe sous le seuil)
+    Shows on the same chart:
+      - Grey area : observation window [0, obs_end_days]
+      - Blue area : prediction horizon [obs_end_days, t_max]
+      - Vertical grey line : observation / prediction split (--nowcast-end)
+      - Red dotted line    : max_x ρ̂(x,t) predicted by the PINN
+      - Solid blue line    : actual max_x ρ(x,t) from the ground-truth AIS
+      - Horizontal red line: TTC threshold
+      - Green marker : predicted TTC (when the PINN curve drops below the threshold)
+      - Orange marker: actual TTC    (when the GT curve drops below the threshold)
 
-    Principe : le PINN ne voit QUE la fenêtre d'observation lors du fine-tuning.
-    Ce graphe évalue si son extrapolation au-delà correspond à la réalité.
+    Idea: during fine-tuning the PINN ONLY sees the observation window.
+    This chart checks whether its extrapolation beyond it matches reality.
 
     Parameters
     ----------
-    profiles        : DataFrame de extract_physical_profiles (prédictions PINN)
-    gt_t_days       : temps [jours] épisode-relatifs des observations GT
-    gt_rho_physical : densité [vessels/km] des observations GT
-    obs_end_days    : durée de la fenêtre d'observation en jours
-    ttc_predicted   : TTC prédit par le PINN (jours depuis onset), ou None
-    ttc_actual      : TTC réel calculé depuis GT, ou None
-    rho_threshold   : seuil [vessels/km] définissant le retour à la normale
+    profiles        : DataFrame from extract_physical_profiles (PINN predictions)
+    gt_t_days       : episode-relative time [days] of the GT observations
+    gt_rho_physical : density [vessels/km] of the GT observations
+    obs_end_days    : length of the observation window in days
+    ttc_predicted   : TTC predicted by the PINN (days since onset), or None
+    ttc_actual      : actual TTC computed from GT, or None
+    rho_threshold   : threshold [vessels/km] defining the return to normal
     """
     try:
         import plotly.graph_objects as go
     except ImportError:
-        raise ImportError("plotly requis: pip install plotly")
+        raise ImportError("plotly required: pip install plotly")
 
-    # Courbe PINN: max_x ρ̂(x,t) à chaque pas de temps
+    # PINN curve: max_x ρ̂(x,t) at each time step
     t_series = (
         profiles.groupby("t_days")["rho_hat"]
         .max()
@@ -1808,7 +1808,7 @@ def plot_nowcast_validation(
     t_pinn   = t_series["t_days"].values
     rho_pinn = t_series["rho_hat"].values
 
-    # Courbe GT: max_x ρ(x,t) par journée
+    # GT curve: max_x ρ(x,t) per day
     gt_curve_t: np.ndarray = np.array([])
     gt_curve_rho: np.ndarray = np.array([])
     if len(gt_t_days) > 0:
@@ -1823,7 +1823,7 @@ def plot_nowcast_validation(
 
     fig = go.Figure()
 
-    # Zones colorées : observation (gris) / prédiction (bleu pale)
+    # Coloured areas: observation (grey) / prediction (light blue)
     fig.add_vrect(
         x0=0, x1=obs_end_days,
         fillcolor="rgba(120,120,120,0.10)", line_width=0,
@@ -1835,11 +1835,11 @@ def plot_nowcast_validation(
         x0=obs_end_days, x1=t_max_plot * 1.02,
         fillcolor="rgba(21,101,192,0.04)", line_width=0,
         layer="below",
-        annotation_text="<b>Prédiction PINN</b>", annotation_position="top left",
+        annotation_text="<b>PINN prediction</b>", annotation_position="top left",
         annotation_font=dict(size=12, color="#1565C0"),
     )
 
-    # Ligne verticale de coupure observation / prédiction
+    # Vertical observation / prediction split line
     fig.add_vline(
         x=obs_end_days,
         line_dash="dashdot", line_color="#555555", line_width=2,
@@ -1848,67 +1848,67 @@ def plot_nowcast_validation(
         annotation_font=dict(size=11, color="#555555"),
     )
 
-    # Seuil TTC (ligne rouge horizontale)
+    # TTC threshold (horizontal red line)
     fig.add_hline(
         y=rho_threshold,
         line_dash="dash", line_color="#C62828", line_width=1.2,
-        annotation_text=f"Seuil TTC = {rho_threshold:.1f} v/km",
+        annotation_text=f"TTC threshold = {rho_threshold:.1f} v/km",
         annotation_position="bottom right",
         annotation_font=dict(size=10, color="#C62828"),
     )
 
-    # Courbe ground truth AIS (bleu plein)
+    # Ground-truth AIS curve (solid blue)
     if len(gt_curve_t) > 0:
         fig.add_trace(go.Scatter(
             x=gt_curve_t, y=gt_curve_rho,
             mode="lines+markers",
             line=dict(color="#1565C0", width=2.5),
             marker=dict(size=6, color="#1565C0"),
-            name="Ground truth AIS (réel)",
+            name="Ground-truth AIS (actual)",
         ))
 
-    # Courbe PINN (rouge pointillé)
+    # PINN curve (red dotted)
     fig.add_trace(go.Scatter(
         x=t_pinn, y=rho_pinn,
         mode="lines",
         line=dict(color="#E53935", width=2.2, dash="dot"),
-        name="Prédiction PINN",
+        name="PINN prediction",
     ))
 
-    # TTC prédit (vert)
+    # Predicted TTC (green)
     if ttc_predicted is not None:
         fig.add_vline(
             x=ttc_predicted, line_dash="dot", line_color="#2E7D32", line_width=2,
         )
         fig.add_annotation(
             x=ttc_predicted, y=rho_threshold * 1.25,
-            text=f"<b>TTC prédit = {ttc_predicted:.1f}j</b>",
+            text=f"<b>Predicted TTC = {ttc_predicted:.1f}d</b>",
             font=dict(color="#2E7D32", size=12),
             showarrow=True, arrowcolor="#2E7D32", arrowhead=2, ax=35, ay=-30,
         )
 
-    # TTC réel (orange)
+    # Actual TTC (orange)
     if ttc_actual is not None:
         fig.add_vline(
             x=ttc_actual, line_dash="dot", line_color="#E65100", line_width=2,
         )
         fig.add_annotation(
             x=ttc_actual, y=rho_threshold * 1.55,
-            text=f"<b>TTC réel = {ttc_actual:.1f}j</b>",
+            text=f"<b>Actual TTC = {ttc_actual:.1f}d</b>",
             font=dict(color="#E65100", size=12),
             showarrow=True, arrowcolor="#E65100", arrowhead=2, ax=-35, ay=-30,
         )
 
-    # Titre avec erreur
+    # Title with error
     if ttc_predicted is not None and ttc_actual is not None:
         err = abs(ttc_predicted - ttc_actual)
-        err_str = f"  |  Erreur = {err:.1f}j"
+        err_str = f"  |  Error = {err:.1f}d"
     elif ttc_predicted is None and ttc_actual is None:
-        err_str = "  |  TTC non atteint (prédit + réel)"
+        err_str = "  |  TTC not reached (predicted + actual)"
     elif ttc_predicted is None:
-        err_str = "  |  TTC prédit : non atteint dans l'horizon"
+        err_str = "  |  Predicted TTC: not reached within the horizon"
     else:
-        err_str = "  |  TTC réel : non atteint dans la fenêtre GT"
+        err_str = "  |  Actual TTC: not reached within the GT window"
 
     title = f"PINN LWR — Validation Nowcast{err_str}"
     if title_suffix:
@@ -1917,7 +1917,7 @@ def plot_nowcast_validation(
     fig.update_layout(
         title=dict(text=title, x=0.5, font=dict(size=14)),
         xaxis=dict(
-            title="Temps depuis l'onset [jours]",
+            title="Time since onset [days]",
             showgrid=True, gridcolor="#e8e8e8",
         ),
         yaxis=dict(
@@ -1931,9 +1931,9 @@ def plot_nowcast_validation(
             dict(
                 x=0.50, y=-0.14, xref="paper", yref="paper",
                 text=(
-                    "<i>Ligne rouge pointillée = prédiction PINN (sans voir le futur). "
-                    "Trait bleu = données AIS réelles. "
-                    "Zone grise = fenêtre d'observation utilisée pour le fine-tuning.</i>"
+                    "<i>Red dotted line = PINN prediction (without seeing the future). "
+                    "Blue line = actual AIS data. "
+                    "Grey area = observation window used for fine-tuning.</i>"
                 ),
                 showarrow=False, font=dict(color="gray", size=10), align="center",
             )
@@ -1947,12 +1947,12 @@ def plot_nowcast_validation(
 
     _force_unlink(output_path)
     fig.write_image(str(output_path), format="png", scale=2)
-    log.info("Validation nowcast sauvegardee -> %s", output_path)
+    log.info("Nowcast validation saved -> %s", output_path)
     return output_path
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# NOUVELLES VISUALISATIONS — OPTIMISATION PHASE 3
+# NEW PLOTS — PHASE 3 DIAGNOSTICS
 # ════════════════════════════════════════════════════════════════════════════
 
 def plot_loss_decomposition(
@@ -1972,7 +1972,7 @@ def plot_loss_decomposition(
     try:
         import plotly.graph_objects as go
     except ImportError:
-        raise ImportError("plotly requis: pip install plotly")
+        raise ImportError("plotly required: pip install plotly")
 
     loss_path = Path(loss_path)
     # Try npz first, then npy legacy
@@ -1981,7 +1981,7 @@ def plot_loss_decomposition(
         if alt.exists():
             loss_path = alt
         else:
-            log.warning("Fichier de loss introuvable: %s", loss_path)
+            log.warning("Loss file not found: %s", loss_path)
             return None
 
     if loss_path.suffix == ".npz":
@@ -1995,7 +1995,7 @@ def plot_loss_decomposition(
     epoch_arr = np.arange(1, epochs + 1)
 
     colors = {"total": "#1A237E", "data": "#1565C0", "pde": "#E65100", "kin": "#2E7D32"}
-    labels = {"total": "L total", "data": "L data (MSE)", "pde": "L LWR (PDE)", "kin": "L cinématique"}
+    labels = {"total": "L total", "data": "L data (MSE)", "pde": "L LWR (PDE)", "kin": "L kinematic"}
 
     fig = go.Figure()
     for key in ["total", "data", "pde", "kin"]:
@@ -2027,17 +2027,17 @@ def plot_loss_decomposition(
         )
 
     fig.update_layout(
-        title=dict(text="PINN — Décomposition de la loss par composante", x=0.5, font=dict(size=14)),
-        xaxis=dict(title="Époques", showgrid=True, gridcolor="#e0e0e0"),
-        yaxis=dict(title="Loss (échelle log)", type="log", showgrid=True, gridcolor="#e0e0e0"),
+        title=dict(text="PINN — Loss decomposition by component", x=0.5, font=dict(size=14)),
+        xaxis=dict(title="Epochs", showgrid=True, gridcolor="#e0e0e0"),
+        yaxis=dict(title="Loss (log scale)", type="log", showgrid=True, gridcolor="#e0e0e0"),
         height=480,
         template="plotly_white",
         legend=dict(x=1.02, y=0.85),
         annotations=[
             dict(
                 x=0.5, y=-0.14, xref="paper", yref="paper",
-                text="<i>Lignes grises verticales = reéchantillonnage collocation. "
-                     "La L_data doit dominer en début d'entraînement.</i>",
+                text="<i>Vertical grey lines = collocation resampling. "
+                     "L_data should dominate early in training.</i>",
                 showarrow=False, font=dict(color="gray", size=10), align="center",
             )
         ],
@@ -2049,7 +2049,7 @@ def plot_loss_decomposition(
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     fig.write_image(str(output_path), format="png", scale=2)
-    log.info("Loss decomposition sauvegardee -> %s", output_path)
+    log.info("Loss decomposition saved -> %s", output_path)
     return output_path
 
 
@@ -2071,7 +2071,7 @@ def plot_lwr_residual_field(
     try:
         import plotly.graph_objects as go
     except ImportError:
-        raise ImportError("plotly requis: pip install plotly")
+        raise ImportError("plotly required: pip install plotly")
 
     device = get_device()
     model = model.to(device)
@@ -2130,25 +2130,25 @@ def plot_lwr_residual_field(
             zmin=0.0,
             zsmooth="best",
             colorbar=dict(title=dict(text="|∂ρ/∂t +<br>∂q/∂x|", side="right"), thickness=16),
-            hovertemplate="x=%{x:.1f}km  t=%{y:.1f}j<br>résidu=%{z:.5f}<extra></extra>",
+            hovertemplate="x=%{x:.1f}km  t=%{y:.1f}d<br>residual=%{z:.5f}<extra></extra>",
         )
     )
 
-    title = "PINN — Champ résiduel LWR  |∂ρ/∂t + ∂(ρv)/∂x|"
+    title = "PINN — LWR residual field  |∂ρ/∂t + ∂(ρv)/∂x|"
     if title_suffix:
         title += f"  |  {title_suffix}"
 
     fig.update_layout(
         title=dict(text=title, x=0.5, font=dict(size=14)),
-        xaxis=dict(title="Distance le long du chenal [km]", showgrid=False),
-        yaxis=dict(title="Temps depuis l'onset [jours]", autorange="reversed", showgrid=False),
+        xaxis=dict(title="Distance along the channel [km]", showgrid=False),
+        yaxis=dict(title="Time since onset [days]", autorange="reversed", showgrid=False),
         height=560,
         template="plotly_white",
         annotations=[
             dict(
                 x=0.01, y=0.03, xref="paper", yref="paper",
                 text=(
-                    f"<b>Résidu moyen: {res_mean:.5f}   |   max: {res_max:.4f}</b><br>"
+                    f"<b>Mean residual: {res_mean:.5f}   |   max: {res_max:.4f}</b><br>"
                     "<i>Blanc = conservation parfaite  |  Rouge = violation LWR</i>"
                 ),
                 showarrow=False, font=dict(color="black", size=11), align="left",
@@ -2165,7 +2165,7 @@ def plot_lwr_residual_field(
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     fig.write_image(str(output_path), format="png", scale=2)
     log.info(
-        "Champ residuel LWR sauvegarde -> %s  (mean=%.5f, max=%.4f)",
+        "LWR residual field saved -> %s  (mean=%.5f, max=%.4f)",
         output_path, res_mean, res_max,
     )
     return output_path
@@ -2192,7 +2192,7 @@ def plot_characteristic_lines(
     try:
         import plotly.graph_objects as go
     except ImportError:
-        raise ImportError("plotly requis: pip install plotly")
+        raise ImportError("plotly required: pip install plotly")
 
     device = get_device()
     model = model.eval().to(device)
@@ -2266,7 +2266,7 @@ def plot_characteristic_lines(
             zsmooth="best",
             colorbar=dict(title=dict(text="ρ<br>[v/km]", side="right"), thickness=14),
             hovertemplate="x=%{x:.1f}km  t=%{y:.1f}h  ρ=%{z:.2f}<extra></extra>",
-            name="Densité ρ(x,t)",
+            name="Density ρ(x,t)",
         )
     )
 
@@ -2280,21 +2280,21 @@ def plot_characteristic_lines(
                 mode="lines",
                 line=dict(color=palette[i], width=1.5),
                 showlegend=(i == 0),
-                name="Caractéristiques dx/dt=v",
+                name="Characteristics dx/dt=v",
                 opacity=0.85,
                 hovertemplate=f"Char {i+1}: x=%{{x:.1f}}km  t=%{{y:.1f}}h<extra></extra>",
             )
         )
 
-    title = "PINN LWR — Lignes caractéristiques dx/dt = v(x,t)"
+    title = "PINN LWR — Characteristic lines dx/dt = v(x,t)"
     if title_suffix:
         title += f"  |  {title_suffix}"
 
     fig.update_layout(
         title=dict(text=title, x=0.5, font=dict(size=14)),
-        xaxis=dict(title="Distance le long du chenal [km]", showgrid=False),
+        xaxis=dict(title="Distance along the channel [km]", showgrid=False),
         yaxis=dict(
-            title="Temps depuis l'onset [heures]",
+            title="Time since onset [hours]",
             autorange="reversed", showgrid=False,
         ),
         height=620,
@@ -2302,8 +2302,8 @@ def plot_characteristic_lines(
         annotations=[
             dict(
                 x=0.02, y=0.97, xref="paper", yref="paper",
-                text="<b>Lignes colorées = trajectoires dx/dt = v</b><br>"
-                     "<i>Convergence → formation d'un choc LWR</i>",
+                text="<b>Coloured lines = trajectories dx/dt = v</b><br>"
+                     "<i>Convergence → formation of an LWR shock</i>",
                 showarrow=False, font=dict(color="white", size=11), align="left",
                 bgcolor="rgba(0,0,0,0.5)", bordercolor="white", borderwidth=1,
             )
@@ -2317,7 +2317,7 @@ def plot_characteristic_lines(
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     fig.write_image(str(output_path), format="png", scale=2)
-    log.info("Lignes caracteristiques sauvegardees -> %s", output_path)
+    log.info("Characteristic lines saved -> %s", output_path)
     return output_path
 
 
@@ -2340,7 +2340,7 @@ def plot_episode_gallery(
         import plotly.graph_objects as go
         from plotly.subplots import make_subplots
     except ImportError:
-        raise ImportError("plotly requis: pip install plotly")
+        raise ImportError("plotly required: pip install plotly")
 
     device = get_device()
     model = model.eval().to(device)
@@ -2429,8 +2429,8 @@ def plot_episode_gallery(
     location_label = global_meta.get("location", "").upper()
     fig.update_layout(
         title=dict(
-            text=f"PINN — Galerie multi-épisodes {location_label}  "
-                 f"(Top {n_actual} par gravity score)",
+            text=f"PINN — Multi-episode gallery {location_label}  "
+                 f"(Top {n_actual} by gravity score)",
             x=0.5, font=dict(size=14),
         ),
         height=300 * n_rows + 100,
@@ -2444,7 +2444,7 @@ def plot_episode_gallery(
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     fig.write_image(str(output_path), format="png", scale=2)
-    log.info("Galerie multi-episodes sauvegardee -> %s  (%d episodes)", output_path, n_actual)
+    log.info("Multi-episode gallery saved -> %s  (%d episodes)", output_path, n_actual)
     return output_path
 
 
@@ -2454,90 +2454,90 @@ def plot_episode_gallery(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Phase 3 — PINN physical engine (Étapes 1–4)"
+        description="Phase 3 — PINN physical engine (steps 1–4)"
     )
     parser.add_argument("--location", default="houston", choices=["houston", "la"])
 
     mode = parser.add_mutually_exclusive_group(required=False)
     mode.add_argument("--train", action="store_true",
-                      help="Étapes 1+2+3+4a: détecter les épisodes et entraîner le PINN")
+                      help="Steps 1+2+3+4a: detect the episodes and train the PINN")
     mode.add_argument("--infer", action="store_true",
-                      help="Étape 4b: extraire les profils physiques depuis un checkpoint")
+                      help="Step 4b: extract the physical profiles from a checkpoint")
     mode.add_argument("--both", action="store_true",
-                      help="Entraîner puis inférer (--train puis --infer)")
+                      help="Train then infer (--train then --infer)")
     mode.add_argument("--data-only", action="store_true",
-                      help="Étape 1 uniquement: afficher les épisodes détectés")
+                      help="Step 1 only: print the detected episodes")
 
-    # Données
-    parser.add_argument("--start", help="Début de la fenêtre d'inférence (YYYY-MM-DD)")
-    parser.add_argument("--end",   help="Fin de la fenêtre d'inférence   (YYYY-MM-DD)")
+    # Data
+    parser.add_argument("--start", help="Start of the inference window (YYYY-MM-DD)")
+    parser.add_argument("--end",   help="End of the inference window   (YYYY-MM-DD)")
     parser.add_argument(
         "--nowcast-end", default=None,
         help=(
-            "Date de fin de la fenêtre d'observation stricte (YYYY-MM-DD). "
-            "Active le mode nowcast sans data leakage : "
-            "  --start → --nowcast-end : fenêtre d'observation (fine-tuning + normalisation) "
-            "  --nowcast-end → --end   : ground truth chargé APRÈS inférence pour évaluation. "
-            "Assertion : --nowcast-end doit être strictement antérieur à --end."
+            "End date of the strict observation window (YYYY-MM-DD). "
+            "Enables leakage-free nowcast mode: "
+            "  --start → --nowcast-end : observation window (fine-tuning + normalisation) "
+            "  --nowcast-end → --end   : ground truth loaded AFTER inference, for evaluation only. "
+            "Requirement: --nowcast-end must be strictly before --end."
         ),
     )
     parser.add_argument("--gravity-path", type=Path, default=None,
-                        help="Chemin vers gravity_daily.parquet")
+                        help="Path to gravity_daily.parquet")
     parser.add_argument("--gravity-threshold", type=float, default=None,
-                        help="Seuil de déclenchement des épisodes (défaut: valeur dans LOCATION_DEFAULTS)")
+                        help="Episode trigger threshold (default: value in LOCATION_DEFAULTS)")
     parser.add_argument("--min-episode-days", type=int, default=3,
-                        help="Durée minimale d'un épisode en jours (défaut: 3)")
+                        help="Minimum episode length in days (default: 3)")
     parser.add_argument("--constituent-path", type=Path, default=None)
     parser.add_argument("--dx-km", type=float, default=2.0,
-                        help="Largeur des bins spatiaux le long du chenal (km)")
+                        help="Width of the spatial bins along the channel (km)")
 
-    # Modèle
+    # Model
     parser.add_argument("--model", type=Path, default=None,
-                        help="Chemin vers le checkpoint .pt (pour --infer)")
+                        help="Path to the .pt checkpoint (for --infer)")
     parser.add_argument("--model-name", default=None,
-                        help="Nom du fichier de sortie (sans extension)")
+                        help="Output file name (without extension)")
 
-    # Hyperparamètres d'entraînement
+    # Training hyper-parameters
     parser.add_argument("--epochs", type=int, default=2000)
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--lambda-pde", type=float, default=0.1)
     parser.add_argument("--lambda-kin", type=float, default=0.05)
     parser.add_argument("--warmup-epochs", type=int, default=0,
-                        help="Curriculum learning: ramper les poids physiques de 0 à λ sur N époques (0=désactivé)")
+                        help="Curriculum learning: ramp the physics weights from 0 to λ over N epochs (0=off)")
     parser.add_argument("--n-freqs", type=int, default=0,
-                        help="Fourier Feature Embedding: nombre de fréquences (0=désactivé, rec: 16)")
+                        help="Fourier feature embedding: number of frequencies (0=off, suggested: 16)")
     parser.add_argument("--fourier-sigma", type=float, default=1.0,
-                        help="Echelle de la matrice de fréquences aléatoires (défaut: 1.0)")
+                        help="Scale of the random frequency matrix (default: 1.0)")
     parser.add_argument("--pad-days", type=int, default=0,
-                        help="Jours de récupération ajoutés après la fin de chaque épisode (rec: 30)")
+                        help="Recovery days added after the end of each episode (suggested: 30)")
 
-    # Résolution de la grille d'inférence
+    # Inference grid resolution
     parser.add_argument("--x-grid", type=int, default=100)
     parser.add_argument("--t-grid", type=int, default=100)
     parser.add_argument("--t-max-days", type=float, default=None,
-                        help="Horizon de prédiction en jours")
+                        help="Prediction horizon in days")
     parser.add_argument("--rho-threshold-frac", type=float, default=0.7,
-                        help="Fraction du niveau initial définissant le retour à la normale "
-                             "(défaut: 0.7 avec metric=mean, soit 70%% du niveau de départ)")
+                        help="Fraction of the peak defining the return to normal "
+                             "(default: 0.7 with metric=mean, i.e. 70%% of the peak)")
     parser.add_argument("--ttc-metric", default="mean", choices=["mean", "max"],
-                        help="Métrique spatiale pour TTC: 'mean' (charge globale, défaut) ou 'max' (queue port)")
+                        help="Spatial metric for the TTC: 'mean' (overall load, default) or 'max' (port queue)")
 
     # Fine-tuning
     parser.add_argument("--fine-tune", action="store_true",
-                        help="Adapter le PINN aux donnees AIS de la fenetre --start/--end avant inference")
+                        help="Fine-tune the PINN on the AIS data of the --start/--end window before inference")
     parser.add_argument("--fine-tune-epochs", type=int, default=300,
-                        help="Nombre d'epochs de fine-tuning (defaut: 300)")
+                        help="Number of fine-tuning epochs (default: 300)")
     parser.add_argument("--fine-tune-lr", type=float, default=1e-4,
-                        help="Learning rate du fine-tuning (defaut: 1e-4)")
+                        help="Fine-tuning learning rate (default: 1e-4)")
 
-    # Nowcasting : fenetre d'observation + horizon de prediction
+    # Nowcasting: observation window + prediction horizon
     parser.add_argument(
         "--obs-days", type=int, default=None,
         help=(
-            "Nombre de jours depuis --start utilises comme fenetre d'observation "
-            "pour calibrer le PINN (fine-tuning automatique). "
-            "Le modele predit ensuite la resorption jusqu'a --t-max-days. "
-            "Ex: --obs-days 7 calibre sur les 7 premiers jours, predit sur 60j par defaut."
+            "Number of days from --start used as the observation window "
+            "to calibrate the PINN (automatic fine-tuning). "
+            "The model then predicts the clearing up to --t-max-days. "
+            "E.g. --obs-days 7 calibrates on the first 7 days and predicts 60 days by default."
         ),
     )
 
@@ -2547,13 +2547,13 @@ def main():
         parser.print_help()
         return
 
-    # ── Étape 1: détection des épisodes (modes train / both / data-only) ────
+    # ── Step 1: episode detection (train / both / data-only modes) ──────────
     episodes: list[Episode] = []
     global_meta: dict = {}
 
     if args.train or args.both or args.data_only:
-        log.info("=== ÉTAPE 1: Structuration des données en épisodes ===")
-        # Résoudre le seuil : --gravity-threshold > défaut de la localisation
+        log.info("=== STEP 1: Structuring the data into episodes ===")
+        # Resolve the threshold: --gravity-threshold > location default
         loc_defaults = LOCATION_DEFAULTS.get(args.location, {})
         effective_threshold = (
             args.gravity_threshold
@@ -2584,7 +2584,7 @@ def main():
         )
 
         if args.data_only:
-            print(f"\n=== Épisodes détectés ({args.location}, threshold={effective_threshold:.0f}) ===")
+            print(f"\n=== Detected episodes ({args.location}, threshold={effective_threshold:.0f}) ===")
             for ep in episodes:
                 print(
                     f"  {ep.episode_id}  |  {ep.start_date} -> {ep.end_date}"
@@ -2596,17 +2596,17 @@ def main():
                 print(f"  v_max global:   {global_meta['global_v_max']:.2f} knots")
             return
 
-    # ── Étapes 2-3-4a: entraînement ──────────────────────────────────────────
+    # ── Steps 2-3-4a: training ───────────────────────────────────────────────
     trained_model: Optional[LWRPINN] = None
 
     if args.train or args.both:
         if not episodes:
-            log.error("Aucun épisode disponible pour l'entraînement.")
+            log.error("No episode available for training.")
             return
 
-        log.info("=== ÉTAPE 2: Architecture LWRPINN — MLP(x, t) → (ρ̂, v̂) ===")
-        log.info("=== ÉTAPE 3: Loss hybride LWR + contraintes cinématiques ===")
-        log.info("=== ÉTAPE 4a: Boucle d'entraînement épisodique ===")
+        log.info("=== STEP 2: LWRPINN architecture — MLP(x, t) → (ρ̂, v̂) ===")
+        log.info("=== STEP 3: Hybrid LWR loss + kinematic constraints ===")
+        log.info("=== STEP 4a: Episodic training loop ===")
 
         trained_model, history = train_on_episodes(
             episodes=episodes,
@@ -2625,7 +2625,7 @@ def main():
         loss_path = OUTPUT_DIR / f"{args.location}_pinn_episode_loss.npz"
         _force_unlink(loss_path)
         np.savez(str(loss_path), **{k: np.array(v) for k, v in history.items()})
-        log.info("Courbe de loss sauvegardee -> %s", loss_path)
+        log.info("Loss curve saved -> %s", loss_path)
 
         # Loss decomposition plot
         loss_decomp_path = plot_loss_decomposition(
@@ -2651,18 +2651,18 @@ def main():
         if args.both:
             args.model = MODEL_DIR / f"{args.model_name or f'pinn_{args.location}_episodes'}.pt"
 
-    # ── Étape 4b: extraction des profils physiques ────────────────────────────
+    # ── Step 4b: physical profile extraction ──────────────────────────────────
     if args.infer or args.both:
-        log.info("=== ÉTAPE 4b: extract_physical_profiles ===")
+        log.info("=== STEP 4b: extract_physical_profiles ===")
 
         if args.model is None:
-            log.error("--model requis pour --infer")
+            log.error("--model required for --infer")
             return
         if not Path(args.model).exists():
-            log.error("Checkpoint introuvable: %s", args.model)
+            log.error("Checkpoint not found: %s", args.model)
             return
 
-        # Charger modèle et métadonnées (ou réutiliser depuis --both)
+        # Load the model and metadata (or reuse them from --both)
         if args.both and trained_model is not None:
             infer_model = trained_model
             infer_meta = global_meta
@@ -2677,31 +2677,31 @@ def main():
             )
             infer_model.load_state_dict(ckpt["model_state"])
             log.info(
-                "Checkpoint chargé: %s (best_loss=%.6f, %d épisode(s))",
+                "Checkpoint loaded: %s (best_loss=%.6f, %d episode(s))",
                 args.model, ckpt["best_loss"], ckpt["n_episodes"],
             )
 
-        # Tableaux AIS bruts pour fine-tuning + plot_ais_vs_pinn
+        # Raw AIS arrays for fine-tuning + plot_ais_vs_pinn
         raw_x_km_arr: np.ndarray = np.array([], dtype=np.float32)
         raw_t_arr:    np.ndarray = np.array([], dtype=np.float32)
         raw_rho_arr:  np.ndarray = np.array([], dtype=np.float32)
         raw_v_arr:    np.ndarray = np.array([], dtype=np.float32)
 
-        # ── Chargement AIS : mode classique vs mode nowcast ──────────────────
+        # ── AIS loading: classic mode vs nowcast mode ───────────────────────
         #
-        # Mode classique  (sans --nowcast-end) :
-        #   build_rho_v_tensors(start, end) → une seule fenêtre
+        # Classic mode (without --nowcast-end):
+        #   build_rho_v_tensors(start, end) → a single window
         #
-        # Mode nowcast (avec --nowcast-end) — SANS DATA LEAKAGE :
-        #   Appel 1 (observation) : build_rho_v_tensors(start, nowcast_end)
-        #     → sert au fine-tuning ET définit la normalisation (rho_min/max, v_max)
-        #   Appel 2 (ground truth): build_rho_v_tensors(nowcast_end+1j, end)
-        #     → chargé APRÈS inférence, uniquement pour évaluation post-hoc du TTC réel
+        # Nowcast mode (with --nowcast-end) — NO DATA LEAKAGE:
+        #   Call 1 (observation) : build_rho_v_tensors(start, nowcast_end)
+        #     → used for fine-tuning AND defines the normalisation (rho_min/max, v_max)
+        #   Call 2 (ground truth): build_rho_v_tensors(nowcast_end+1d, end)
+        #     → loaded AFTER inference, only for post-hoc evaluation of the actual TTC
         #
-        # Invariant : global_rho_max/global_v_max (du checkpoint) et meta_obs
-        # (de la fenêtre d'observation) ne voient JAMAIS les données futures.
+        # Invariant: global_rho_max/global_v_max (from the checkpoint) and meta_obs
+        # (from the observation window) NEVER see future data.
 
-        # Tableaux ground truth (vides si mode classique)
+        # Ground-truth arrays (empty in classic mode)
         gt_x_km_arr: np.ndarray = np.array([], dtype=np.float32)
         gt_t_arr:    np.ndarray = np.array([], dtype=np.float32)
         gt_rho_arr:  np.ndarray = np.array([], dtype=np.float32)
@@ -2713,26 +2713,26 @@ def main():
             end_d   = date.fromisoformat(args.end)
             if end_d < start_d:
                 log.error(
-                    "Dates inversées : --start %s est postérieur à --end %s. "
-                    "Vérifiez vos arguments (ex: --end %s).",
+                    "Inverted dates: --start %s is after --end %s. "
+                    "Check your arguments (e.g. --end %s).",
                     args.start, args.end,
                     (start_d + timedelta(days=120)).isoformat()[:7] + "-28",
                 )
                 raise SystemExit(1)
 
-            # Résolution du mode nowcast
+            # Resolve nowcast mode
             if args.nowcast_end is not None:
                 nowcast_end_d = date.fromisoformat(args.nowcast_end)
                 if nowcast_end_d >= end_d:
                     log.error(
-                        "--nowcast-end (%s) doit être strictement antérieur à --end (%s) "
-                        "— il faut une fenêtre ground truth non vide.",
+                        "--nowcast-end (%s) must be strictly before --end (%s) "
+                        "— the ground-truth window must not be empty.",
                         nowcast_end_d, end_d,
                     )
                     raise SystemExit(1)
                 if nowcast_end_d <= start_d:
                     log.error(
-                        "--nowcast-end (%s) doit être postérieur à --start (%s).",
+                        "--nowcast-end (%s) must be after --start (%s).",
                         nowcast_end_d, start_d,
                     )
                     raise SystemExit(1)
@@ -2748,10 +2748,10 @@ def main():
             else:
                 obs_load_end = end_d
 
-            # Offset temps absolu (commun aux deux appels)
+            # Absolute time offset (shared by both calls)
             t_start_g = (start_d - EPOCH_DATE).days / T_DAYS_MAX
 
-            # ── Appel 1 : fenêtre d'observation ──────────────────────────────
+            # ── Call 1: observation window ───────────────────────────────────
             try:
                 X_obs, y_obs, meta_obs = build_rho_v_tensors(
                     start_d, obs_load_end, infer_meta["location"],
@@ -2762,32 +2762,32 @@ def main():
                     x_km_obs    = X_obs[:, 0] * infer_meta["channel_len_km"]
                     t_days_obs  = (X_obs[:, 1] - t_start_g) * T_DAYS_MAX
                     episode_data = pd.DataFrame({"x_km": x_km_obs, "t_days": t_days_obs})
-                    # Dénormalisation avec meta_obs uniquement (pas de leakage futur)
+                    # Denormalise with meta_obs only (no future leakage)
                     rho_range_obs = meta_obs["rho_max"] - meta_obs.get("rho_min", 0.0)
                     raw_rho_arr   = (y_obs[:, 0] * rho_range_obs + meta_obs.get("rho_min", 0.0)).astype(np.float32)
                     raw_v_arr     = (y_obs[:, 1] * max(meta_obs["v_max"], 1e-8)).astype(np.float32)
                     raw_x_km_arr  = x_km_obs.astype(np.float32)
                     raw_t_arr     = t_days_obs.astype(np.float32)
                     log.info(
-                        "Observation chargee: %d pts AIS | rho_max_obs=%.2f v/km | v_max_obs=%.2f kn",
+                        "Observation loaded: %d AIS pts | rho_max_obs=%.2f v/km | v_max_obs=%.2f kn",
                         len(X_obs), meta_obs["rho_max"], meta_obs["v_max"],
                     )
                 else:
-                    log.warning("Aucune donnée AIS dans la fenêtre d'observation. Grille par défaut.")
+                    log.warning("No AIS data in the observation window. Using the default grid.")
                     episode_data = pd.DataFrame({
                         "x_km": [0.0, infer_meta["channel_len_km"]],
                         "t_days": [0.0, float((obs_load_end - start_d).days)],
                     })
             except Exception as exc:
-                log.warning("Chargement AIS observation impossible (%s). Grille par défaut.", exc)
+                log.warning("Could not load the observation AIS (%s). Using the default grid.", exc)
                 episode_data = pd.DataFrame({
                     "x_km": [0.0, infer_meta["channel_len_km"]],
                     "t_days": [0.0, 30.0],
                 })
 
-            # ── Appel 2 : ground truth (uniquement en mode nowcast) ───────────
-            # Chargé ICI mais utilisé uniquement APRÈS l'inférence pour évaluation.
-            # global_rho_max / fine-tuning ne touchent pas à ces données.
+            # ── Call 2: ground truth (nowcast mode only) ─────────────────────
+            # Loaded HERE but used only AFTER inference, for evaluation.
+            # global_rho_max / fine-tuning never touch this data.
             if nowcast_end_d is not None:
                 gt_start_d = nowcast_end_d + timedelta(days=1)
                 if gt_start_d <= end_d:
@@ -2805,29 +2805,29 @@ def main():
                             gt_x_km_arr  = x_km_gt.astype(np.float32)
                             gt_t_arr     = t_days_gt.astype(np.float32)
                             log.info(
-                                "Ground truth charge (evaluation post-hoc): %d pts AIS | [%s, %s]",
+                                "Ground truth loaded (post-hoc evaluation): %d AIS pts | [%s, %s]",
                                 len(X_gt), gt_start_d, end_d,
                             )
                         else:
-                            log.warning("Aucune donnée AIS dans la fenêtre ground truth.")
+                            log.warning("No AIS data in the ground-truth window.")
                     except Exception as exc:
-                        log.warning("Chargement AIS ground truth impossible (%s).", exc)
+                        log.warning("Could not load the ground-truth AIS (%s).", exc)
         else:
-            # Grille par défaut: chenal complet sur 30 jours
+            # Default grid: full channel over 30 days
             episode_data = pd.DataFrame({
                 "x_km": [0.0, infer_meta["channel_len_km"]],
                 "t_days": [0.0, 30.0],
             })
 
-        # ── Fenetre d'observation (--obs-days) + horizon de prediction ──────
+        # ── Observation window (--obs-days) + prediction horizon ────────────
         #
-        # Workflow nowcasting :
-        #   1. Charger les N premiers jours de l'episode (--obs-days N)
-        #   2. Fine-tuner le PINN sur ces N jours (calibration)
-        #   3. Predire rho(x,t) jusqu'a --t-max-days (horizon futur)
-        #   4. Extraire le TTC depuis la courbe de resorption predite
+        # Nowcasting workflow:
+        #   1. Load the first N days of the episode (--obs-days N)
+        #   2. Fine-tune the PINN on these N days (calibration)
+        #   3. Predict rho(x,t) up to --t-max-days (future horizon)
+        #   4. Extract the TTC from the predicted clearing curve
         #
-        # Sans --obs-days, tout le range --start/--end est utilise (mode classique).
+        # Without --obs-days the whole --start/--end range is used (classic mode).
 
         ft_x_km  = raw_x_km_arr.copy()
         ft_t_arr = raw_t_arr.copy()
@@ -2841,36 +2841,36 @@ def main():
             ft_rho   = raw_rho_arr[obs_mask]
             ft_v     = raw_v_arr[obs_mask]
             log.info(
-                "Fenetre d'observation : %d premiers jours | %d/%d points AIS retenus pour fine-tuning",
+                "Observation window: first %d days | %d/%d AIS points kept for fine-tuning",
                 args.obs_days, int(obs_mask.sum()), len(raw_t_arr),
             )
 
-        # Horizon de prediction
+        # Prediction horizon
         t_max_days_infer = args.t_max_days
         if t_max_days_infer is None:
             if args.obs_days is not None:
-                # Nowcasting : predire sur 4x la fenetre d'observation (min 30 jours)
+                # Nowcasting: predict over 4x the observation window (min 30 days)
                 t_max_days_infer = max(float(args.obs_days) * 4.0, 30.0)
                 log.info(
-                    "Horizon de prediction : %.0f jours (4x fenetre obs. de %d j) "
-                    "— override avec --t-max-days",
+                    "Prediction horizon: %.0f days (4x obs. window of %d d) "
+                    "— override with --t-max-days",
                     t_max_days_infer, args.obs_days,
                 )
             else:
-                # Mode classique : legere extension au-dela des donnees observees
+                # Classic mode: slight extension beyond the observed data
                 ep_t_max = float(episode_data["t_days"].max()) if len(episode_data) > 0 else 0.0
                 t_max_days_infer = ep_t_max * 1.2 + 1.0
 
-        # Fine-tuning : active par --fine-tune OU automatiquement si --obs-days
+        # Fine-tuning: enabled by --fine-tune OR automatically with --obs-days
         do_fine_tune = args.fine_tune or (args.obs_days is not None) or (nowcast_end_d is not None)
         if do_fine_tune:
             if len(ft_x_km) == 0:
                 log.warning(
-                    "Fine-tuning demande mais aucune donnee AIS disponible "
-                    "(verifiez --start/--end et que les parquets AIS existent)."
+                    "Fine-tuning requested but no AIS data available "
+                    "(check --start/--end and that the AIS parquets exist)."
                 )
             else:
-                log.info("=== FINE-TUNING sur l'evenement courant ===")
+                log.info("=== FINE-TUNING on the current event ===")
                 infer_model = fine_tune_on_episode(
                     model=infer_model,
                     x_km=ft_x_km,
@@ -2897,19 +2897,19 @@ def main():
         out_path = FEATURES_DIR / f"{model_stem}_profiles.parquet"
         _force_unlink(out_path)
         profiles.to_parquet(out_path, index=False)
-        log.info("Profils physiques sauvegardes -> %s", out_path)
+        log.info("Physical profiles saved -> %s", out_path)
 
-        # Visualisation
+        # Plots
         infer_period = (
             f"{args.start}_to_{args.end}" if args.start and args.end else model_stem
         )
 
-        # Sous-dossier résultats : <location>_<start>_pinn_results/
+        # Results sub-folder: <location>_<start>_pinn_results/
         location_label = infer_meta["location"]
         date_label = (args.start or model_stem).replace("-", "")[:8]  # YYYYMMDD
         png_dir = OUTPUT_DIR / f"{location_label}_{date_label}_pinn_results"
         png_dir.mkdir(parents=True, exist_ok=True)
-        log.info("Resultats PNG -> %s", png_dir)
+        log.info("PNG results -> %s", png_dir)
 
         title_tag = f"{location_label.upper()} | {infer_period}"
 
@@ -2974,8 +2974,8 @@ def main():
             output_path=png_dir / "09_characteristic_lines.png",
         )
 
-        # ── Plot 07 : validation nowcast (uniquement en mode --nowcast-end) ──
-        # Calcul du seuil TTC en unités physiques (coherent avec plot_congestion_clearance)
+        # ── Plot 07: nowcast validation (only with --nowcast-end) ────────────
+        # TTC threshold in physical units (consistent with plot_congestion_clearance)
         _rho_peak_pinn = float(
             profiles.groupby("t_days")["rho_hat"].agg(args.ttc_metric).values.max()
         ) if len(profiles) > 0 else 1.0
@@ -2996,17 +2996,17 @@ def main():
                 output_path=png_dir / "07_nowcast_validation.png",
             )
 
-        # ── Résumé de prédiction ─────────────────────────────────────────────
+        # ── Prediction summary ───────────────────────────────────────────────
         sep = "=" * 62
         print(f"\n{sep}")
         print(f"  PINN LWR — PREDICTION DE RESORPTION | {location_label.upper()}")
         print(sep)
 
         if args.start and args.end:
-            print(f"  Periode          : {args.start}  ->  {args.end}")
+            print(f"  Period           : {args.start}  ->  {args.end}")
 
         if nowcast_end_d is not None:
-            print(f"  Mode             : NOWCAST STRICT (sans data leakage)")
+            print(f"  Mode             : STRICT NOWCAST (no data leakage)")
             print(f"  Observation      : {args.start}  ->  {nowcast_end_d}  ({obs_end_days:.0f} j)")
             print(f"  Ground truth     : {nowcast_end_d + timedelta(1)}  ->  {args.end}")
         elif args.obs_days is not None:
@@ -3014,14 +3014,14 @@ def main():
             print(f"  Mode             : nowcasting (--obs-days={args.obs_days})")
             print(f"  Observation      : {args.start}  ->  {obs_end_d_disp}  ({args.obs_days} j)")
         else:
-            print(f"  Mode             : reconstruction (periode complete observee)")
-        print(f"  Horizon          : {t_max_days_infer:.0f} jours depuis le debut")
+            print(f"  Mode             : reconstruction (full observed period)")
+        print(f"  Horizon          : {t_max_days_infer:.0f} days from the start")
 
         print(f"\n  --- Diagnostic physique ---")
         print(f"  Chenal     : {infer_meta['channel_len_km']:.1f} km")
         print(f"  rho_hat    : [{profiles['rho_hat'].min():.2f}, {profiles['rho_hat'].max():.2f}] vessels/km")
         print(f"  v_hat      : [{profiles['v_hat'].min():.2f}, {profiles['v_hat'].max():.2f}] knots")
-        print(f"  Seuil TTC  : {ttc_threshold_val:.2f} v/km  ({args.rho_threshold_frac*100:.0f}% du pic)")
+        print(f"  TTC threshold : {ttc_threshold_val:.2f} v/km  ({args.rho_threshold_frac*100:.0f}% of peak)")
 
         print(f"\n  --- Time to Clear (TTC) ---")
         if ttc_days is not None:
@@ -3029,37 +3029,37 @@ def main():
             if args.start:
                 ttc_date = date.fromisoformat(args.start) + timedelta(days=int(ttc_days))
                 ttc_abs  = f"  (date estimee : {ttc_date})"
-            print(f"  TTC predit  = {ttc_days:.1f} j depuis l'onset{ttc_abs}")
+            print(f"  Predicted TTC = {ttc_days:.1f} d since onset{ttc_abs}")
         else:
-            print(f"  TTC predit  = non atteint dans l'horizon de {t_max_days_infer:.0f} j")
-            print(f"               Relancer avec --t-max-days {int(t_max_days_infer * 2)}")
+            print(f"  Predicted TTC = not reached within the {t_max_days_infer:.0f} d horizon")
+            print(f"                  Re-run with --t-max-days {int(t_max_days_infer * 2)}")
 
         if nowcast_end_d is not None:
             if ttc_actual is not None:
                 ttc_actual_date = date.fromisoformat(args.start) + timedelta(days=int(ttc_actual))
-                print(f"  TTC reel    = {ttc_actual:.1f} j depuis l'onset  (date : {ttc_actual_date})")
+                print(f"  Actual TTC    = {ttc_actual:.1f} d since onset  (date: {ttc_actual_date})")
             else:
-                print(f"  TTC reel    = non atteint dans la fenetre ground truth")
+                print(f"  Actual TTC    = not reached within the ground-truth window")
             if ttc_days is not None and ttc_actual is not None:
                 err = abs(ttc_days - ttc_actual)
                 sign = "+" if ttc_days > ttc_actual else "-"
-                print(f"  Erreur      = {sign}{err:.1f} j  ({'sur-estime' if ttc_days > ttc_actual else 'sous-estime'})")
+                print(f"  Error         = {sign}{err:.1f} d  ({'over-estimated' if ttc_days > ttc_actual else 'under-estimated'})")
             elif ttc_days is None and ttc_actual is not None:
                 remaining_horizon = ttc_actual - t_max_days_infer
-                print(f"  (horizon trop court : TTC reel a {ttc_actual:.1f}j, horizon={t_max_days_infer:.0f}j)")
+                print(f"  (horizon too short: actual TTC at {ttc_actual:.1f}d, horizon={t_max_days_infer:.0f}d)")
 
         print(f"\n  Parquet : {out_path}")
         print(f"  Figures : {png_dir}/")
         print(f"    01_profiles_rho_v_q.png       heatmaps rho / v / debit")
-        print(f"    02_clearance_ttc.png           courbe de resorption + TTC")
-        print(f"    03_shockwave_lwr.png           onde de choc LWR")
+        print(f"    02_clearance_ttc.png           clearing curve + TTC")
+        print(f"    03_shockwave_lwr.png           LWR shock wave")
         print(f"    04_ais_vs_pinn.png             AIS brut vs PINN lisse")
         print(f"    05_profiles_1d_slices.png      coupes rho(x) a 6 instants")
-        print(f"    06_fundamental_diagram.png     diagramme fondamental")
+        print(f"    06_fundamental_diagram.png     fundamental diagram")
         if nowcast_end_d is not None:
-            print(f"    07_nowcast_validation.png     predit vs reel + erreur TTC")
+            print(f"    07_nowcast_validation.png     predicted vs actual + TTC error")
         print(f"    08_lwr_residual.png            champ residuel LWR")
-        print(f"    09_characteristic_lines.png    lignes caracteristiques dx/dt=v")
+        print(f"    09_characteristic_lines.png    characteristic lines dx/dt=v")
         print(sep)
 
 

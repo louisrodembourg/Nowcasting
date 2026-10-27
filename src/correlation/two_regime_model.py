@@ -1,27 +1,27 @@
 """
-Phase 4 — Modèle conditionnel à deux régimes.
+Phase 4 — Conditional two-regime model.
 
 Architecture
 ============
-Régime 1 (jours normaux) : Ridge entraîné sur les features AIS brutes
-Régime 2 (jours d'épisode) : Ridge entraîné sur rho_pred PINN + context AIS
+Regime 1 (normal days)  : Ridge trained on raw AIS features
+Regime 2 (episode days) : Ridge trained on PINN rho_pred + AIS context
 
-Détection d'épisode : CAUSALE — gravity_zscore60 > seuil pendant min_days consécutifs.
-Aucun look-ahead sur le timing PINN.
+Episode detection: CAUSAL — gravity_zscore60 > threshold for min_days consecutive days.
+No look-ahead on the PINN timing.
 
-rho_pred du PINN est jointé quand disponible (épisodes 2019–2022). Hors fenêtre PINN,
-on utilise les features AIS seules pour les deux régimes.
+PINN rho_pred is joined when available (episodes 2019–2022). Outside PINN windows,
+only AIS features are used for both regimes.
 
 Walk-forward
 ============
-- Fenêtre d'entraînement initiale : 252 jours
-- Blocs OOS : 63 jours (un trimestre)
-- Expansion de la fenêtre d'entraînement à chaque bloc
+- Initial training window: 252 days
+- OOS blocks: 63 days (one quarter)
+- Expanding training window at each block
 
-Métriques
+Metrics
 =========
-IC_spearman, directional accuracy, Sharpe L/S annualisé
-Comparaison : baseline (Ridge unique) vs. deux régimes
+IC_spearman, directional accuracy, annualised L/S Sharpe
+Comparison: baseline (single Ridge) vs. two regimes
 
 Usage
 =====
@@ -53,7 +53,7 @@ EQUITY_PATH  = ROOT / "data/financial/equity_proxies_wide.parquet"
 TTC_DIR      = ROOT / "outputs/pinn_yearly"
 OUT_DIR      = ROOT / "outputs/financial"
 
-# ── Colonnes features ─────────────────────────────────────────────────────────
+# ── Feature columns ───────────────────────────────────────────────────────────
 
 REGIME1_COLS = [
     "log_gravity",
@@ -67,7 +67,7 @@ REGIME1_COLS = [
 ]
 
 REGIME2_COLS = [
-    # Signal physique PINN — rho seul (delta et ma7 sont redondants sur 90j)
+    # PINN physical signal — rho only (delta and ma7 are redundant over 90 days)
     "pinn_rho",
     # Context AIS
     "gravity_zscore60",
@@ -78,7 +78,7 @@ REGIME2_COLS = [
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DONNÉES
+# DATA
 # ══════════════════════════════════════════════════════════════════════════════
 
 def load_gravity() -> pd.DataFrame:
@@ -94,9 +94,9 @@ def load_gravity() -> pd.DataFrame:
 
 def load_pinn_rho(years=(2019, 2020, 2021, 2022)) -> pd.Series:
     """
-    Série quotidienne de rho_pred PINN (dense sur les 90 jours de chaque épisode,
-    NaN le reste du temps). rho_pred est toujours valide — contrairement à TTC
-    qui est 0 ou null pour 2021 et 2022.
+    Daily PINN rho_pred series (dense over the 90 days of each episode,
+    NaN otherwise). rho_pred is always valid — unlike TTC, which is
+    0 or null for 2021 and 2022.
     """
     frames = []
     for y in years:
@@ -134,17 +134,17 @@ def load_prices(ticker: str) -> pd.Series:
 
 def build_feature_matrix(gravity: pd.DataFrame, pinn_rho: pd.Series) -> pd.DataFrame:
     """
-    Construit la matrice de features complète (régime 1 + régime 2 + flag d'épisode).
+    Build the full feature matrix (regime 1 + regime 2 + episode flag).
 
-    Détection d'épisode : disponibilité de pinn_rho.
-    NOTE : le PINN est entraîné sur la fenêtre de 90 jours complète (lookahead interne
-    au modèle physique). rho_pred au début de la fenêtre "voit" donc des données
-    futures. Ce biais est inhérent à l'utilisation d'un modèle PDE fitted offline.
-    En production, le PINN serait ré-entraîné incrémentalement (hors scope ici).
+    Episode detection: availability of pinn_rho.
+    NOTE: the PINN is trained on the full 90-day window (look-ahead inside
+    the physical model). rho_pred at the start of the window therefore "sees" future
+    data. This bias is inherent to using a PDE model fitted offline.
+    In production the PINN would be retrained incrementally (out of scope here).
     """
     f = pd.DataFrame(index=gravity.index)
 
-    # ── Features de base (régime 1) ───────────────────────────────────────────
+    # ── Base features (regime 1) ──────────────────────────────────────────────
     g = np.log1p(gravity["gravity_score"])
     f["log_gravity"]      = g
     f["gravity_ma7"]      = g.rolling(7,  min_periods=3).mean()
@@ -159,16 +159,16 @@ def build_feature_matrix(gravity: pd.DataFrame, pinn_rho: pd.Series) -> pd.DataF
     f["log_capacity"]     = np.log1p(gravity["total_capacity"])
     f["congestion_flag"]  = (f["gravity_zscore60"] > 1.5).astype(float)
 
-    # ── Feature PINN (régime 2) — rho seul, delta et ma7 redondants sur 90j ──
+    # ── PINN feature (regime 2) — rho only, delta and ma7 redundant over 90 days
     rho_aligned   = pinn_rho.reindex(f.index)
     f["pinn_rho"] = rho_aligned
 
-    # ── Indicateur de régime ──────────────────────────────────────────────────
-    # Régime 2 = PINN rho disponible (le modèle physique est actif)
-    # Régime 1 = jours hors fenêtre PINN (opération normale)
+    # ── Regime indicator ──────────────────────────────────────────────────────
+    # Regime 2 = PINN rho available (the physical model is active)
+    # Regime 1 = days outside PINN windows (normal operation)
     f["in_episode"] = f["pinn_rho"].notna().astype(float)
 
-    # Drop burn-in (60 premiers jours pour rolling stats)
+    # Drop burn-in (first 60 days, for rolling stats)
     f = f.dropna(subset=["gravity_zscore60"])
     return f
 
@@ -178,7 +178,7 @@ def forward_return(prices: pd.Series, h: int) -> pd.Series:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MODÈLE À DEUX RÉGIMES
+# TWO-REGIME MODEL
 # ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -206,16 +206,16 @@ def fit_two_regime(
     X1 = feat[regime1_cols].values
     X2 = feat[regime2_cols].values
 
-    # ── Régime 1 : entraîné sur TOUS les jours (épisodes inclus)
-    # Entraîner R1 uniquement sur les jours hors-épisode prive le modèle des
-    # observations de pic de congestion — exactement les plus informatives.
-    # R1 sert de fallback universel ; R2 override sur les jours d'épisode.
+    # ── Regime 1: trained on ALL days (episodes included)
+    # Training R1 only on non-episode days would deprive the model of the
+    # congestion-peak observations — precisely the most informative ones.
+    # R1 is the universal fallback; R2 overrides it on episode days.
     mask1 = ~np.isnan(X1).any(1) & ~np.isnan(y)
     if mask1.sum() >= 50:
         models.n_r1_train = int(mask1.sum())
         models.r1.fit(models.s1.fit_transform(X1[mask1]), y[mask1])
 
-    # ── Régime 2 : entraîné sur les jours d'épisode avec pinn_rho disponible
+    # ── Regime 2: trained on episode days with pinn_rho available
     mask2 = (in_ep == 1) & ~np.isnan(X2).any(1) & ~np.isnan(y)
     if mask2.sum() >= 15:
         models.n_r2_train = int(mask2.sum())
@@ -239,12 +239,12 @@ def predict_two_regime(
     X1 = feat[regime1_cols].values
     X2 = feat[regime2_cols].values
 
-    # Régime 1 : tous les jours normaux + fallback épisodes sans PINN
+    # Regime 1: all normal days + episode fallback without PINN
     mask1 = ~np.isnan(X1).any(1)
     if mask1.sum() > 0:
         pred[mask1] = models.r1.predict(models.s1.transform(X1[mask1]))
 
-    # Régime 2 : épisodes avec rho_pred disponible
+    # Regime 2: episodes with rho_pred available
     if models.r2_fitted:
         mask2 = (in_ep == 1) & ~np.isnan(X2).any(1)
         if mask2.sum() > 0:
@@ -314,7 +314,7 @@ def walk_forward_baseline(
     init_train: int = 252,
     test_block: int = 63,
 ) -> dict:
-    """Modèle de référence : Ridge unique entraîné sur tous les jours."""
+    """Reference model: a single Ridge trained on all days."""
     n = len(feat)
     oos_pred, oos_actual, oos_dates = [], [], []
 
@@ -351,7 +351,7 @@ def walk_forward_baseline(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MÉTRIQUES + RAPPORT
+# METRICS + REPORT
 # ══════════════════════════════════════════════════════════════════════════════
 
 def compute_metrics(pred, actual, label="") -> dict:
@@ -381,7 +381,7 @@ def compute_metrics(pred, actual, label="") -> dict:
 
 
 def episode_metrics(pred, actual, feat_slice, label="") -> dict:
-    """Métriques séparées pour jours d'épisode vs. jours normaux."""
+    """Separate metrics for episode days vs. normal days."""
     in_ep = feat_slice["in_episode"].values[:len(pred)]
     valid = ~(np.isnan(pred) | np.isnan(actual))
 
@@ -430,19 +430,19 @@ def print_summary(rows: list, title: str):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run(targets=None, horizons=None):
-    # Cibles retenues pour le modèle 2-régimes :
-    #   MATX : lien causal direct (opérateur conteneurs LA/Pacifique → port LA)
-    #   BDRY/SBLK : signal baseline AIS valide, mais la corrélation épisode PINN
-    #               est probablement confoundue par le facteur COVID 2021 (BDI et
-    #               LA congestion simultanément élevés par la même demande macro).
-    #               On les conserve pour comparaison mais sans conclusion causale.
+    # Targets kept for the two-regime model:
+    #   MATX : direct causal link (LA/Pacific container operator → LA port)
+    #   BDRY/SBLK : valid AIS baseline signal, but the PINN episode correlation
+    #               is probably confounded by the 2021 COVID factor (BDI and
+    #               LA congestion both driven up by the same macro demand).
+    #               Kept for comparison, without causal conclusion.
     if targets  is None: targets  = ["MATX", "BDRY", "SBLK"]
     if horizons is None: horizons = [5, 10, 21]
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # ── Chargement ────────────────────────────────────────────────────────────
-    log.info("Chargement gravity + PINN rho...")
+    # ── Loading ───────────────────────────────────────────────────────────────
+    log.info("Loading gravity + PINN rho...")
     gravity  = load_gravity()
     pinn_rho = load_pinn_rho(years=(2019, 2020, 2021, 2022))
     feat     = build_feature_matrix(gravity, pinn_rho)
@@ -450,19 +450,19 @@ def run(targets=None, horizons=None):
     n_episode = int(feat["in_episode"].sum())
     n_with_pinn = int(((feat["in_episode"] == 1) & feat["pinn_rho"].notna()).sum())
     log.info(
-        "Features: %d jours | épisode causaux: %d (%d%%) | "
-        "jours épisode + PINN rho: %d",
+        "Features: %d days | causal episodes: %d (%d%%) | "
+        "episode days + PINN rho: %d",
         len(feat), n_episode, int(n_episode / len(feat) * 100), n_with_pinn,
     )
 
-    # Affichage des épisodes détectés
+    # Display the detected episodes
     ep_changes = feat["in_episode"].diff().fillna(0)
     entries = feat.index[ep_changes == 1]
     exits   = feat.index[ep_changes == -1]
-    log.info("Épisodes détectés (%d) :", len(entries))
+    log.info("Detected episodes (%d):", len(entries))
     for s, e in zip(entries, list(exits) + [feat.index[-1]]):
         pinn_cover = int(feat.loc[s:e, "pinn_rho"].notna().sum())
-        log.info("  %s → %s (%d j) | PINN rho disponible: %d j",
+        log.info("  %s → %s (%d d) | PINN rho available: %d d",
                  s.date(), e.date(), (e - s).days, pinn_cover)
 
     all_rows = []
@@ -472,7 +472,7 @@ def run(targets=None, horizons=None):
         log.info("\n%s %s", "═"*60, ticker)
         prices = load_prices(ticker)
         if prices.empty:
-            log.warning("Pas de données pour %s", ticker); continue
+            log.warning("No data for %s", ticker); continue
 
         for h in horizons:
             fwd_ret = forward_return(prices, h)
@@ -483,9 +483,9 @@ def run(targets=None, horizons=None):
             dates  = combined.index
 
             if len(combined) < 300:
-                log.warning("Pas assez d'obs pour %s h=%d", ticker, h); continue
+                log.warning("Not enough obs for %s h=%d", ticker, h); continue
 
-            log.info("  h=%2dd | %d obs | épisodes: %d j",
+            log.info("  h=%2dd | %d obs | episodes: %d d",
                      h, len(combined),
                      int(combined["in_episode"].sum()))
 
@@ -500,7 +500,7 @@ def run(targets=None, horizons=None):
                      m_base["IC_spearman"], m_base["p_spearman"],
                      m_base["dir_acc"], m_base["ls_sharpe"], m_base["n_oos"])
 
-            # ── Deux régimes ──────────────────────────────────────────────
+            # ── Two regimes ───────────────────────────────────────────────
             tr_res = walk_forward_two_regime(combined, y, dates)
             m_tr   = compute_metrics(tr_res["pred"], tr_res["actual"],
                                      f"2Regime|{ticker}|h{h}")
@@ -517,7 +517,7 @@ def run(targets=None, horizons=None):
                      m_tr["dir_acc"], m_tr["ls_sharpe"],
                      delta_ic, delta_sh, sign)
 
-            # ── Métriques par régime ──────────────────────────────────────
+            # ── Per-regime metrics ────────────────────────────────────────
             ep_m = episode_metrics(tr_res["pred"], tr_res["actual"], combined,
                                    label=f"{ticker}|h{h}")
             for regime, rm in ep_m.items():
@@ -529,24 +529,24 @@ def run(targets=None, horizons=None):
                              regime, rm["IC_spearman"], rm["p_spearman"],
                              rm["dir_acc"], rm["ls_sharpe"], rm["n"])
 
-            # ── Bloc de régime détaillé ───────────────────────────────────
+            # ── Detailed regime block ─────────────────────────────────────
             if not tr_res["regime_log"].empty:
                 rl = tr_res["regime_log"]
                 ep_blocks = rl[rl["n_episode_days"] > 0]
                 if not ep_blocks.empty:
-                    log.info("  Blocs avec épisodes (%d) : r2_fitted=%s | moy r2_train=%.0f j",
+                    log.info("  Blocks with episodes (%d): r2_fitted=%s | mean r2_train=%.0f d",
                              len(ep_blocks),
                              ep_blocks["r2_fitted"].any(),
                              ep_blocks["r2_train"].mean())
 
-    # ── Tables de synthèse ────────────────────────────────────────────────────
-    print_summary(all_rows, "COMPARAISON BASELINE vs. DEUX RÉGIMES (OOS walk-forward)")
+    # ── Summary tables ────────────────────────────────────────────────────────
+    print_summary(all_rows, "BASELINE vs. TWO REGIMES (OOS walk-forward)")
 
     if ep_rows:
         print(f"\n{'='*80}")
-        print("PERFORMANCE PAR RÉGIME (jours normaux vs. jours d'épisode) — modèle 2-Régimes")
+        print("PERFORMANCE PER REGIME (normal days vs. episode days) — two-regime model")
         print(f"{'='*80}")
-        print(f"{'Target':<6} {'H':>4} {'Régime':<10} {'IC_s':>8} {'p':>6} "
+        print(f"{'Target':<6} {'H':>4} {'Regime':<10} {'IC_s':>8} {'p':>6} "
               f"{'DirAcc':>7} {'Sharpe':>8} {'n':>5}")
         print("─" * 80)
         for r in sorted(ep_rows, key=lambda x: (x["target"], x["horizon"], x["regime"])):
@@ -555,12 +555,12 @@ def run(targets=None, horizons=None):
                   f"{r['dir_acc']:>7.3f} {r['ls_sharpe']:>8.3f} {r['n']:>5}")
         print("=" * 80)
 
-    # ── Sauvegarde ────────────────────────────────────────────────────────────
+    # ── Save ──────────────────────────────────────────────────────────────────
     df_all = pd.DataFrame(all_rows)
     df_ep  = pd.DataFrame(ep_rows)
     df_all.to_csv(OUT_DIR / "two_regime_results.csv",     index=False)
     df_ep.to_csv(OUT_DIR  / "two_regime_by_regime.csv",   index=False)
-    log.info("Résultats sauvegardés dans %s", OUT_DIR)
+    log.info("Results saved in %s", OUT_DIR)
 
     return df_all, df_ep
 
@@ -570,11 +570,11 @@ def run(targets=None, horizons=None):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="Modèle conditionnel à deux régimes")
+    parser = argparse.ArgumentParser(description="Conditional two-regime model")
     parser.add_argument("--target",   nargs="+", default=["BDRY", "SBLK", "MATX"],
-                        help="Cibles equity (défaut: BDRY SBLK MATX)")
+                        help="Equity targets (default: BDRY SBLK MATX)")
     parser.add_argument("--horizon",  type=int, nargs="+", default=[5, 10, 21],
-                        help="Horizons en jours (défaut: 5 10 21)")
+                        help="Horizons in days (default: 5 10 21)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s",

@@ -1,13 +1,13 @@
 """
-Analyse de corrélation : features AIS + rho_pred PINN → rendements MATX / BDRY / SBLK.
+Correlation analysis: AIS features + PINN rho_pred → MATX / BDRY / SBLK returns.
 
-Pour chaque couple (feature, cible, horizon H, lag k) :
+For each (feature, target, horizon H, lag k):
     Spearman( feature[t-k] , fwd_return[t+H] )
 
-Produit :
-  - outputs/financial/corr_lagscan.csv   : tableau complet
-  - outputs/financial/corr_heatmap.png   : heatmap features × lags pour chaque cible/horizon
-  - outputs/financial/corr_summary.csv   : top features par cible × horizon
+Outputs:
+  - outputs/financial/corr_lagscan.csv   : full table
+  - outputs/financial/corr_heatmap.png   : features × lags heatmap per target/horizon
+  - outputs/financial/corr_summary.csv   : top features per target × horizon
 """
 
 import warnings
@@ -34,10 +34,10 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 TARGETS   = ["MATX", "BDRY", "SBLK"]
 HORIZONS  = [5, 10, 21]
 MAX_LAG   = 60
-LAG_STEP  = 1          # granularité fine pour l'analyse
+LAG_STEP  = 1          # fine granularity for the analysis
 
 
-# ── Chargement ────────────────────────────────────────────────────────────────
+# ── Loading ───────────────────────────────────────────────────────────────────
 
 def load_gravity() -> pd.DataFrame:
     df = pl.read_parquet(GRAVITY_PATH).with_columns(
@@ -136,21 +136,21 @@ def plot_heatmap(scan: pd.DataFrame, ticker: str, horizon: int, out_path: Path):
     ax.set_yticks(range(len(pivot.index)))
     ax.set_yticklabels(pivot.index, fontsize=9)
     plt.colorbar(im, ax=ax, label="Spearman ρ")
-    ax.set_title(f"Corrélation lag-scan — {ticker} fwd_return(H={horizon}j)\n"
+    ax.set_title(f"Lag-scan correlation — {ticker} fwd_return(H={horizon}d)\n"
                  f"Spearman(feature[t−lag], return[t+{horizon}])",
                  fontsize=11)
-    ax.set_xlabel("Lag (jours)")
+    ax.set_xlabel("Lag (days)")
     plt.tight_layout()
     plt.savefig(out_path, dpi=150)
     plt.close()
     print(f"  Heatmap → {out_path.name}")
 
 
-# ── Analyse épisode PINN ─────────────────────────────────────────────────────
+# ── PINN episode analysis ────────────────────────────────────────────────────
 
 def pinn_episode_corr(features: pd.DataFrame, prices: pd.Series,
                       ticker: str, horizons: list) -> pd.DataFrame:
-    """Corrélation rho_pred vs forward return sur les jours d'épisode uniquement."""
+    """rho_pred vs forward-return correlation on episode days only."""
     ep_mask = features["pinn_rho"].notna()
     rows = []
     for h in horizons:
@@ -175,7 +175,7 @@ def pinn_episode_corr(features: pd.DataFrame, prices: pd.Series,
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    print("Chargement des données...")
+    print("Loading data...")
     gravity  = load_gravity()
     pinn_rho = load_pinn_rho()
     features = build_features(gravity, pinn_rho)
@@ -195,7 +195,7 @@ def main():
         print(f"\n{'═'*60} {ticker}")
         prices = load_prices(ticker)
         if prices.empty:
-            print(f"  [!] Pas de données pour {ticker}"); continue
+            print(f"  [!] No data for {ticker}"); continue
 
         for h in HORIZONS:
             print(f"  H={h}j — lag scan 0..{MAX_LAG}d...")
@@ -210,7 +210,7 @@ def main():
             plot_heatmap(scan, ticker, h,
                          OUT_DIR / f"corr_heatmap_{ticker}_h{h}.png")
 
-            # Top 3 features au lag optimal
+            # Top 3 features at the optimal lag
             top = (scan.assign(abs_r=scan["spearman_r"].abs())
                        .sort_values("abs_r", ascending=False)
                        .head(5))
@@ -222,7 +222,7 @@ def main():
                     "p_value": row["p_value"],
                 })
 
-            # Top au lag 0 (signal instantané / nowcast)
+            # Top at lag 0 (instantaneous signal / nowcast)
             at0 = scan[scan["lag"] == 0].sort_values("spearman_r", key=abs, ascending=False)
             print(f"  Top features (lag=0) :")
             for _, r in at0.head(5).iterrows():
@@ -232,17 +232,17 @@ def main():
 
             # Lag optimal global
             best = scan.loc[scan["spearman_r"].abs().idxmax()]
-            print(f"  Meilleur lag toutes features : {best['feature']} lag={best['lag']}j "
+            print(f"  Best lag over all features: {best['feature']} lag={best['lag']}d "
                   f"ρ={best['spearman_r']:+.3f} (p={best['p_value']:.3f})")
 
-        # ── Corrélation rho_pred PINN en épisode ─────────────────────────
+        # ── PINN rho_pred correlation during episodes ────────────────────
         pinn_df = pinn_episode_corr(features, prices, ticker, HORIZONS)
         if not pinn_df.empty:
             pinn_corrs.append(pinn_df)
-            print(f"\n  Corrélation rho_pred PINN (jours d'épisode uniquement) :")
+            print(f"\n  PINN rho_pred correlation (episode days only):")
             print(pinn_df[["horizon","n_episode","spearman_r","p_value","significant"]].to_string(index=False))
 
-    # ── Sauvegarde ────────────────────────────────────────────────────────────
+    # ── Save ──────────────────────────────────────────────────────────────────
     df_scan    = pd.concat(all_scans, ignore_index=True)
     df_summary = pd.DataFrame(summaries)
     df_scan.to_csv(OUT_DIR / "corr_lagscan.csv", index=False)
@@ -250,11 +250,11 @@ def main():
     if pinn_corrs:
         pd.concat(pinn_corrs).to_csv(OUT_DIR / "corr_pinn_episode.csv", index=False)
 
-    # ── Tableau récapitulatif final ───────────────────────────────────────────
+    # ── Final summary table ───────────────────────────────────────────────────
     print(f"\n{'='*80}")
-    print("SYNTHÈSE — meilleure feature par (cible × horizon)")
+    print("SUMMARY — best feature per (target × horizon)")
     print(f"{'='*80}")
-    print(f"{'Cible':<6} {'H':>4}  {'Feature':<22} {'Lag':>5} {'ρ':>8} {'p':>7}")
+    print(f"{'Target':<6} {'H':>4}  {'Feature':<22} {'Lag':>5} {'ρ':>8} {'p':>7}")
     print("─" * 60)
     for _, r in df_summary.drop_duplicates(["ticker","horizon"]).sort_values(
             ["ticker","horizon"]).iterrows():
@@ -263,7 +263,7 @@ def main():
         print(f"{r['ticker']:<6} {int(r['horizon']):>4}  {r['feature']:<22} "
               f"{int(r['lag']):>5} {r['spearman_r']:>+8.4f} {sig:>7}")
     print(f"{'='*80}")
-    print(f"\nFichiers sauvegardés dans {OUT_DIR}")
+    print(f"\nFiles saved in {OUT_DIR}")
 
 
 if __name__ == "__main__":

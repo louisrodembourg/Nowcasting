@@ -1,14 +1,14 @@
 """
-Visualisation géométrique des clusters HDBSCAN — Phase 1.
+Geometric visualisation of the HDBSCAN clusters — Phase 1.
 
-Génère des polygones sémantiques :
-  - Rotated Bounding Boxes  -> clusters 'docked'  (navires alignés au quai)
-  - Convex Hulls            -> clusters 'waiting' (zone de mouillage dispersée)
-  - Points gris             -> bruit
+Generates semantic polygons:
+  - Rotated bounding boxes -> 'docked' clusters  (vessels aligned along the quay)
+  - Convex hulls           -> 'waiting' clusters (scattered anchorage area)
+  - Grey points            -> noise
 
-Un seul fichier HTML avec time slider pour visualiser un jour ou une période.
+A single HTML file with a time slider, for one day or a period.
 
-Usage :
+Usage:
     python src/clustering/visualize_clusters.py --date 2017-08-25 --location houston
     python src/clustering/visualize_clusters.py --start 2017-08-01 --end 2017-09-30 --location houston
     python src/clustering/visualize_clusters.py --start 2019-01-01 --end 2019-08-31 --location la --no-noise
@@ -108,7 +108,7 @@ def _rotated_min_bounding_rectangle(points: np.ndarray) -> sg.Polygon:
 
 
 def _safe_convex_hull(points: np.ndarray) -> sg.base.BaseGeometry:
-    """Convex hull robuste — gère les cas dégénérés (1 ou 2 points)."""
+    """Robust convex hull — handles degenerate cases (1 or 2 points)."""
     if len(points) == 1:
         return Point(points[0]).buffer(0.0005)
     if len(points) == 2:
@@ -126,9 +126,9 @@ def _cluster_to_geometry(
     cluster_df: pl.DataFrame, label: int
 ) -> sg.base.BaseGeometry | None:
     """
-    Polygone sémantique pour un cluster :
-      docked  -> rotated MBR  (rectangle orienté — terminal compact)
-      waiting -> convex hull  (zone de mouillage dispersée)
+    Semantic polygon for a cluster:
+      docked  -> rotated MBR  (oriented rectangle — compact terminal)
+      waiting -> convex hull  (scattered anchorage area)
     """
     rows = cluster_df.filter(pl.col("cluster_label") == label)
     if len(rows) == 0:
@@ -169,20 +169,20 @@ def build_features_and_stats(
     d: date, location: str, config: ClusteringConfig
 ) -> tuple[list[dict], str, int, int]:
     """
-    Retourne (features_geojson, stats_html, total_vessels, waiting_vessels) pour un jour.
-    Chaque feature a properties.times = [date_str] pour le time slider.
+    Return (features_geojson, stats_html, total_vessels, waiting_vessels) for one day.
+    Each feature has properties.times = [date_str] for the time slider.
     """
     loc_cfg = LOCATIONS[location]
     parquet_path = loc_cfg["out_dir"] / f"{loc_cfg['prefix']}_{d.strftime('%Y_%m_%d')}.parquet"
 
     if not parquet_path.exists():
-        raise FileNotFoundError(f"Parquet introuvable : {parquet_path}")
+        raise FileNotFoundError(f"Parquet not found: {parquet_path}")
 
     vessel_df = pl.read_parquet(parquet_path)
     cluster_df, _ = cluster_day(parquet_path, config=config)
 
     if cluster_df is None:
-        log.warning("Pas de clusters pour %s", d)
+        log.warning("No clusters for %s", d)
         cluster_df = pl.DataFrame(schema=vessel_df.schema)
 
     if "cluster_type" not in cluster_df.columns:
@@ -191,7 +191,7 @@ def build_features_and_stats(
     date_str = d.strftime("%Y-%m-%d")
     features: list[dict] = []
 
-    # --- Clusters valides : polygones sémantiques ----------------------------
+    # --- Valid clusters: semantic polygons -----------------------------------
     valid_labels = (
         cluster_df.filter(pl.col("cluster_label") >= 0)["cluster_label"]
         .unique().sort().to_list()
@@ -220,7 +220,7 @@ def build_features_and_stats(
             f'<span style="color:{COLORS[ctype]};font-weight:bold">{ctype.upper()}</span>'
             f'<hr style="margin:4px 0">'
             f'<table style="font-size:11px;width:100%">'
-            f'<tr><td><b>Navires</b></td><td>{n_vessels}</td></tr>'
+            f'<tr><td><b>Vessels</b></td><td>{n_vessels}</td></tr>'
             f'<tr><td><b>Membership score</b></td><td>{avg_score:.3f}</td></tr>'
             + (f'<tr><td><b>Heading std</b></td><td>{heading_std:.1f}°</td></tr>'
                if heading_std is not None else "")
@@ -246,12 +246,12 @@ def build_features_and_stats(
             },
         })
 
-    # --- Points bruit --------------------------------------------------------
+    # --- Noise points --------------------------------------------------------
     noise_rows = cluster_df.filter(pl.col("cluster_label") == -1)
     for row in noise_rows.iter_rows(named=True):
         popup_html = (
             f'<div style="font-family:sans-serif;width:160px;">'
-            f'<b>Bruit — MMSI {row["MMSI"]}</b>'
+            f'<b>Noise — MMSI {row["MMSI"]}</b>'
             f'<hr style="margin:4px 0">'
             f'<span style="font-size:11px;">Draft : {row.get("Draft", "N/A")}</span>'
             f"</div>"
@@ -296,13 +296,13 @@ def build_features_and_stats(
         f'<b style="font-size:14px;">{location.upper()} — {d.strftime("%d %b %Y")}</b>'
         f'<hr style="margin:6px 0;border:none;border-top:1px solid #eee">'
         f'<div><span style="color:{COLORS["docked"]}">&#9632;</span>'
-        f' Terminaux : <b>{docked_count}</b></div>'
+        f' Terminals : <b>{docked_count}</b></div>'
         f'<div><span style="color:{COLORS["waiting"]}">&#9632;</span>'
         f' Congestion : <b>{waiting_count}</b></div>'
         f'<div><span style="color:{COLORS["noise"]}">&#9632;</span>'
-        f' Bruit : <b>{noise_count}</b></div>'
+        f' Noise : <b>{noise_count}</b></div>'
         f'<hr style="margin:6px 0;border:none;border-top:1px solid #eee">'
-        f'<div><b>Navires totaux :</b> {total_vessels}</div>'
+        f'<div><b>Total vessels:</b> {total_vessels}</div>'
         f"</div>"
     )
 
@@ -325,9 +325,9 @@ def visualize_day(
     m = folium.Map(location=[center_lat, center_lon], zoom_start=12, tiles="CartoDB positron")
     _add_satellite_layer(m)
 
-    docked_group  = folium.FeatureGroup(name="Terminaux (docked)",    show=True)
+    docked_group  = folium.FeatureGroup(name="Terminals (docked)",    show=True)
     waiting_group = folium.FeatureGroup(name="Congestion (waiting)",  show=True)
-    noise_group   = folium.FeatureGroup(name="Bruit",                 show=False)
+    noise_group   = folium.FeatureGroup(name="Noise",                 show=False)
 
     for feat in features:
         props = feat["properties"]
@@ -355,7 +355,7 @@ def visualize_day(
                     popup=popup,
                     tooltip=(
                         f"Cluster {props['cluster_label']} — "
-                        f"{ctype} ({props['n_vessels']} navires)"
+                        f"{ctype} ({props['n_vessels']} vessels)"
                     ),
                     color=style["color"],
                     fill_color=style["fillColor"],
@@ -376,7 +376,7 @@ def visualize_day(
     noise_group.add_to(m)
 
     if config.waiting_allowed_polygons:
-        wz_group = folium.FeatureGroup(name="Zones d'attente", show=True)
+        wz_group = folium.FeatureGroup(name="Waiting zones", show=True)
         for poly in config.waiting_allowed_polygons:
             folium.Polygon(
                 locations=poly, color="#FF6F00", weight=2,
@@ -405,7 +405,7 @@ def visualize_period(
     out_path: Path,
     show_noise: bool = True,
 ) -> None:
-    """Un seul HTML avec time slider — un frame par jour."""
+    """Single HTML with a time slider — one frame per day."""
     loc_cfg = LOCATIONS[location]
     center_lat = (loc_cfg.get("lat_min", 29.0) + loc_cfg.get("lat_max", 30.0)) / 2
     center_lon = (loc_cfg.get("lon_min", -95.0) + loc_cfg.get("lon_max", -94.0)) / 2
@@ -441,7 +441,7 @@ def visualize_period(
                     noise_features.append(feat)
             log.info("Processed %s (%d/%d)", d, i + 1, total_days)
         except FileNotFoundError:
-            log.warning("Parquet manquant pour %s — ignoré", d)
+            log.warning("Missing parquet for %s — skipped", d)
         except Exception as exc:
             log.warning("%s : %s", d, exc)
 
@@ -465,7 +465,7 @@ def visualize_period(
                 fill=True, fill_color="#FF6F00", fill_opacity=0.08,
             ).add_to(m)
 
-    # --- Légende + boutons toggle --------------------------------------------
+    # --- Legend + toggle buttons ---------------------------------------------
     legend_html = (
         f'<div style="position:fixed;top:10px;right:10px;z-index:9999;'
         f'background:white;padding:14px 18px;border-radius:10px;'
@@ -479,7 +479,7 @@ def visualize_period(
         f'padding:3px 0;font-size:12px;font-family:sans-serif;">'
         f'<span style="display:inline-block;width:12px;height:12px;'
         f'background:{COLORS["docked"]};border-radius:2px;vertical-align:middle;"></span>'
-        f'&nbsp;Terminaux (docked)</button></div>'
+        f'&nbsp;Terminals (docked)</button></div>'
         f'<div style="margin-bottom:6px;">'
         f'<button id="btn-waiting" onclick="toggleLayer(\'waiting\')" '
         f'style="width:100%;text-align:left;background:none;border:none;cursor:pointer;'
@@ -493,7 +493,7 @@ def visualize_period(
         f'padding:3px 0;font-size:12px;font-family:sans-serif;opacity:0.4;" data-visible="false">'
         f'<span style="display:inline-block;width:12px;height:12px;'
         f'background:{COLORS["noise"]};border-radius:2px;vertical-align:middle;"></span>'
-        f'&nbsp;Bruit (masqué)</button></div>'
+        f'&nbsp;Noise (hidden)</button></div>'
         f"</div>"
     )
 
@@ -520,18 +520,18 @@ def visualize_period(
         if (btn) btn.style.opacity = visible ? '0.4' : '1.0';
     }
 
-    // Masquer le bruit dès le chargement
+    // Hide noise on load
     document.body.classList.add('hide-noise');
     </script>"""
     )
 
-    # --- Gauge de congestion dynamique ---------------------------------------
+    # --- Dynamic congestion gauge --------------------------------------------
     gauge_html = (
         '<div id="congestion-gauge" style="position:fixed;top:10px;left:60px;z-index:9999;'
         'background:white;padding:12px 16px;border-radius:10px;'
         'border:1px solid #ddd;font-family:sans-serif;font-size:12px;'
         'box-shadow:2px 2px 8px rgba(0,0,0,.18);min-width:230px;">'
-        '<b>Niveau de congestion</b>'
+        '<b>Congestion level</b>'
         '<div id="gauge-text" style="margin:6px 0;color:#666;">—</div>'
         '<div style="width:100%;background:#eee;border-radius:4px;height:14px;">'
         '<div id="gauge-bar" style="height:100%;background:#E65100;'
@@ -554,7 +554,7 @@ def visualize_period(
         var pct = Math.round(data.waiting_vessels / maxWaiting * 100);
         document.getElementById('gauge-text').innerHTML =
             '<b>' + dateStr + '</b><br>' +
-            data.waiting_vessels + ' navires en attente (' +
+            data.waiting_vessels + ' waiting vessels (' +
             data.waiting_clusters + ' clusters)';
         document.getElementById('gauge-bar').style.width = pct + '%';
     }}
@@ -601,7 +601,7 @@ def visualize_period(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Visualisation géométrique des clusters HDBSCAN"
+        description="Geometric visualisation of the HDBSCAN clusters"
     )
     parser.add_argument(
         "--location", default="houston", choices=list(LOCATIONS.keys())
@@ -609,17 +609,17 @@ def main() -> None:
     parser.add_argument("--out", default=None, metavar="PATH")
 
     mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--date",  metavar="YYYY-MM-DD", help="Carte pour un seul jour")
+    mode.add_argument("--date",  metavar="YYYY-MM-DD", help="Map for a single day")
     mode.add_argument(
-        "--start", metavar="YYYY-MM-DD", help="Debut de periode (avec --end)"
+        "--start", metavar="YYYY-MM-DD", help="Period start (with --end)"
     )
     parser.add_argument(
-        "--end", metavar="YYYY-MM-DD", help="Fin de periode (requis avec --start)"
+        "--end", metavar="YYYY-MM-DD", help="Period end (required with --start)"
     )
     args = parser.parse_args()
 
     if args.start and not args.end:
-        parser.error("--end est requis avec --start")
+        parser.error("--end is required with --start")
 
     config = _load_config(args.location)
 

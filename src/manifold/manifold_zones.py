@@ -1,10 +1,10 @@
 """
-Phase 2 — Manifold géospatial : LBO sur les zones géographiques.
+Phase 2 — Geospatial manifold: LBO over geographic zones.
 
-Au lieu de traiter les jours, on traite les ZONES géographiques :
-  - Chaque zone = un cluster HDBSCAN (ou un groupe de clusters proches)
-  - Chaque jour = une dimension temporelle
-  - Les vecteurs propres = les zones "constituantes" les plus importantes
+Instead of treating days, we treat geographic ZONES:
+  - Each zone = one HDBSCAN cluster (or a group of nearby clusters)
+  - Each day  = one temporal dimension
+  - Eigenvectors = the most important "constituent" zones
 
 Usage:
     python src/manifold/manifold_zones.py --start 2020-01-01 --end 2020-01-08 --location la
@@ -36,14 +36,14 @@ DEFAULT_N_EIGENVECTORS = 5
 
 
 def normalize_features(X: np.ndarray) -> np.ndarray:
-    """Normalisation L2 par ligne (chaque zone / sa norme)."""
+    """Row-wise L2 normalisation (each zone divided by its norm)."""
     norms = np.linalg.norm(X, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
     return X / norms
 
 
 def build_weight_matrix(X_norm: np.ndarray, k: int) -> sparse.csr_matrix:
-    """Graphe KNN + noyau gaussien."""
+    """KNN graph + Gaussian kernel."""
     n = len(X_norm)
     k_safe = min(k, n - 1)
 
@@ -65,7 +65,7 @@ def build_weight_matrix(X_norm: np.ndarray, k: int) -> sparse.csr_matrix:
 
 
 def compute_eigenvectors(W: sparse.csr_matrix, n_eigenvectors: int):
-    """Décomposition spectrale LBO."""
+    """LBO spectral decomposition."""
     degree = np.array(W.sum(axis=1)).ravel()
     degree[degree == 0] = 1e-10
     A = sparse.diags(degree)
@@ -85,7 +85,7 @@ def find_constituent_zones(
     W: sparse.csr_matrix,
     n_components: int = 3,
 ) -> np.ndarray:
-    """Trouve les zones qui sont des extremums locaux dans les vecteurs propres."""
+    """Find the zones that are local extrema of the eigenvectors."""
     phi = eigenvectors[:, 1 : n_components + 1]
     n = phi.shape[0]
 
@@ -115,14 +115,14 @@ def build_zone_features_matrix(
     location: str = "la",
 ) -> tuple[pl.DataFrame, np.ndarray]:
     """
-    Construit la matrice (zones × jours) pour le manifold.
+    Build the (zones × days) matrix for the manifold.
 
-    Chaque ligne = une zone géographique unique (cluster HDBSCAN)
-    Chaque colonne = un jour
+    Each row    = one unique geographic zone (HDBSCAN cluster)
+    Each column = one day
 
     Returns:
-        zone_df: DataFrame avec info sur chaque zone (lat, lon, centroid, etc.)
-        X: matrice (n_zones, n_days) des features (occupation rate)
+        zone_df: DataFrame with info on each zone (lat, lon, centroid, etc.)
+        X: (n_zones, n_days) feature matrix (occupation rate)
     """
     loc_cfg = LOCATIONS[location]
     prefix = loc_cfg["prefix"]
@@ -142,12 +142,12 @@ def build_zone_features_matrix(
 
             if cluster_df is not None and len(cluster_df) > 0:
                 for row in cluster_df.iter_rows(named=True):
-                    # Créer une clé de zone basée sur la position (arrondie)
+                    # Zone key based on the (rounded) position
                     lat_r = round(row["LAT"], 3)
                     lon_r = round(row["LON"], 3)
                     zone_key = f"{lat_r}_{lon_r}"
 
-                    # _info sur la zone
+                    # Zone info
                     if zone_key not in all_zones:
                         all_zones[zone_key] = {
                             "lat": row["LAT"],
@@ -159,7 +159,7 @@ def build_zone_features_matrix(
                     else:
                         all_zones[zone_key]["mmsi"].append(row["MMSI"])
 
-                    # Occupation de la zone ce jour
+                    # Zone occupation on this day
                     key = (zone_key, d)
                     if key not in zone_day_data:
                         zone_day_data[key] = 0
@@ -168,10 +168,10 @@ def build_zone_features_matrix(
         d += timedelta(days=1)
 
     if len(all_zones) == 0:
-        log.warning("Aucune zone trouvée entre %s et %s", start, end)
+        log.warning("No zone found between %s and %s", start, end)
         return pl.DataFrame(), np.array([])
 
-    # Créer le DataFrame des zones
+    # Build the zone DataFrame
     zone_rows = []
     for zone_key, info in all_zones.items():
         n_vessels = len(set(info["mmsi"]))
@@ -187,9 +187,9 @@ def build_zone_features_matrix(
         )
 
     zone_df = pl.DataFrame(zone_rows)
-    log.info("Trouvé %d zones géographiques uniques", len(zone_df))
+    log.info("Found %d unique geographic zones", len(zone_df))
 
-    # Construire la matrice (zones × jours)
+    # Build the (zones × days) matrix
     n_zones = len(zone_df)
     n_days = len(dates)
     X = np.zeros((n_zones, n_days))
@@ -200,7 +200,7 @@ def build_zone_features_matrix(
             key = (zkey, day)
             X[i, j] = zone_day_data.get(key, 0)
 
-    # Normaliser par zone (occupation rate)
+    # Normalise per zone (occupation rate)
     max_per_zone = X.max(axis=1, keepdims=True)
     max_per_zone[max_per_zone == 0] = 1
     X = X / max_per_zone
@@ -216,12 +216,12 @@ def run_zone_manifold(
     n_eigenvectors: int = DEFAULT_N_EIGENVECTORS,
 ) -> tuple[pl.DataFrame, np.ndarray, np.ndarray]:
     """
-    Pipeline principal : construit la matrice zones×jours et applique LBO.
+    Main pipeline: build the zones × days matrix and apply LBO.
 
     Returns:
-        zone_df: info sur chaque zone
-        X: matrice normalisée (zones × jours)
-        constituents: masque booléen des zones constituantes
+        zone_df: info on each zone
+        X: normalised matrix (zones × days)
+        constituents: boolean mask of the constituent zones
     """
     zone_df, X = build_zone_features_matrix(start, end, location)
 
@@ -234,14 +234,14 @@ def run_zone_manifold(
     eigenvalues, eigenvectors = compute_eigenvectors(W, n_eigenvectors)
     constituents = find_constituent_zones(eigenvectors, W)
 
-    log.info("Zones constituantes trouvées: %d / %d", constituents.sum(), len(zone_df))
-    log.info("Valeurs propres: %s", np.round(eigenvalues, 4))
+    log.info("Constituent zones found: %d / %d", constituents.sum(), len(zone_df))
+    log.info("Eigenvalues: %s", np.round(eigenvalues, 4))
 
     return zone_df, X, constituents
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Manifold géospatial sur les zones")
+    parser = argparse.ArgumentParser(description="Geospatial manifold over zones")
     parser.add_argument("--location", default="la")
     parser.add_argument("--start", required=True)
     parser.add_argument("--end", required=True)

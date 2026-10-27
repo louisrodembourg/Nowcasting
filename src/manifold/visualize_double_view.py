@@ -1,11 +1,11 @@
 """
-Figure composite 2 panneaux pour le rapport :
-  - Gauche : jours dans l'espace (phi_1, phi_2), colores par mois,
-             jours caracteristiques annotes
-  - Droite : carte geospatiale des zones colorees par phi_1
-             (docked = carre, waiting = triangle)
+Two-panel composite figure for the report:
+  - Left : days in the (phi_1, phi_2) space, coloured by month,
+           characteristic days annotated
+  - Right: geospatial map of the zones coloured by phi_1
+           (docked = square, waiting = triangle)
 
-Usage (depuis Nowcasting/) :
+Usage (from the repository root):
     python src/manifold/visualize_double_view.py
     python src/manifold/visualize_double_view.py --year 2020 --out outputs/figures/la_manifold_2020.png
 """

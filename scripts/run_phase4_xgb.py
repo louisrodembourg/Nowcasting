@@ -1,8 +1,8 @@
 """
-Script de lancement Phase 4 — XGBoost TTC
-Résumés physiques extraits depuis les champs PINN interpolés (grille dense).
-Modèles PINN annuels (1 sortie rho) chargés via LWRPINN_v1.
-Dataset multi-années LA 2019-2024.
+Phase 4 runner — XGBoost time-to-clear regression.
+Physical summaries extracted from the interpolated PINN fields (dense grid).
+Yearly PINN models (single rho output) loaded via LWRPINN_v1.
+Multi-year LA dataset 2019-2024.
 """
 import logging
 import sys
@@ -43,7 +43,7 @@ X_GRID         = 80
 T_GRID         = 80
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# Modèles PINN disponibles par année (architecture 1-sortie)
+# Available PINN models per year (single-output architecture)
 YEAR_MODELS = {
     2019: Path("outputs/models/la_2019_lwr_pinn.pt"),
     2020: Path("outputs/models/la_2020_lwr_pinn.pt"),
@@ -54,9 +54,9 @@ YEAR_MODELS = {
 }
 
 
-# ── PINN legacy (1 sortie rho) ────────────────────────────────────────────────
+# ── Legacy PINN (single rho output) ───────────────────────────────────────────
 class LWRPINN_v1(nn.Module):
-    """Architecture originale des checkpoints annuels : (x,t) → rho uniquement."""
+    """Original architecture of the yearly checkpoints: (x,t) → rho only."""
     def __init__(self, hidden_layers: int = 4, hidden_size: int = 64):
         super().__init__()
         layers = [nn.Linear(2, hidden_size), nn.Tanh()]
@@ -85,8 +85,8 @@ def load_pinn_v1(path: Path) -> tuple[LWRPINN_v1, dict]:
 
 def pinn_summaries_v1(model: LWRPINN_v1, ep, meta: dict) -> dict:
     """
-    Prédit rho sur grille dense via PINN, extrait les résumés scalaires.
-    v n'est pas disponible (ancienne architecture 1 sortie).
+    Predict rho on a dense grid with the PINN and extract scalar summaries.
+    v is not available (legacy single-output architecture).
     """
     device = get_device()
     model  = model.to(device)
@@ -108,9 +108,9 @@ def pinn_summaries_v1(model: LWRPINN_v1, ep, meta: dict) -> dict:
     with torch.no_grad():
         rho_pred = model(x_t, t_t).cpu().numpy().ravel() * rho_max
 
-    # Résumés sur max_x rho(x,t) par instant t
+    # Summaries of max_x rho(x,t) at each time t
     rho_grid  = rho_pred.reshape(T_GRID, X_GRID)   # (t, x)
-    rho_max_t = rho_grid.max(axis=1)                # max spatial par instant
+    rho_max_t = rho_grid.max(axis=1)                # spatial max at each time
 
     peak_idx      = int(np.argmax(rho_max_t))
     peak_rho      = float(rho_max_t[peak_idx])
@@ -129,21 +129,21 @@ def pinn_summaries_v1(model: LWRPINN_v1, ep, meta: dict) -> dict:
     }
 
 
-# ── Chargement PINN annuels ───────────────────────────────────────────────────
+# ── Load yearly PINNs ─────────────────────────────────────────────────────────
 loaded_models: dict[int, tuple] = {}
 for year, path in YEAR_MODELS.items():
     if path.exists():
         try:
             m, meta = load_pinn_v1(path)
             loaded_models[year] = (m, meta)
-            log.info("PINN %d chargé (%s)", year, path.name)
+            log.info("PINN %d loaded (%s)", year, path.name)
         except Exception as e:
-            log.warning("PINN %d échoué: %s", year, e)
+            log.warning("PINN %d failed: %s", year, e)
     else:
-        log.warning("PINN %d absent: %s", year, path)
+        log.warning("PINN %d missing: %s", year, path)
 
-# ── Détection des épisodes (toutes années) ────────────────────────────────────
-log.info("Détection des épisodes 2017-2024 (threshold=%d)...", GRAVITY_THRESH)
+# ── Episode detection (all years) ─────────────────────────────────────────────
+log.info("Detecting episodes 2017-2024 (threshold=%d)...", GRAVITY_THRESH)
 episodes, _ = structure_episodes(
     location=LOCATION,
     gravity_path=GRAVITY_PATH,
@@ -152,9 +152,9 @@ episodes, _ = structure_episodes(
     start_date=date(2017, 1, 1),
     end_date=date(2024, 10, 31),
 )
-log.info("%d épisodes détectés", len(episodes))
+log.info("%d episodes detected", len(episodes))
 
-# ── Construction du dataset avec résumés PINN ─────────────────────────────────
+# ── Build the dataset with PINN summaries ─────────────────────────────────────
 records = []
 n_pinn_ok, n_pinn_fail = 0, 0
 for ep in episodes:
@@ -169,7 +169,7 @@ for ep in episodes:
             summaries = pinn_summaries_v1(pinn_model, ep, pinn_meta)
             n_pinn_ok += 1
         except Exception as e:
-            log.warning("  PINN %s échoué: %s", ep.episode_id, e)
+            log.warning("  PINN %s failed: %s", ep.episode_id, e)
             n_pinn_fail += 1
     else:
         n_pinn_fail += 1
@@ -188,18 +188,18 @@ for ep in episodes:
         **summaries,
     })
 
-log.info("Résumés PINN: %d OK / %d fallback", n_pinn_ok, n_pinn_fail)
+log.info("PINN summaries: %d OK / %d fallback", n_pinn_ok, n_pinn_fail)
 
 df_episodes = pd.DataFrame(records)
-log.info("\nDataset épisodes:\n%s", df_episodes[["episode_id","duration_days","gravity_score","peak_rho","decay_rate"]].to_string())
+log.info("\nEpisode dataset:\n%s", df_episodes[["episode_id","duration_days","gravity_score","peak_rho","decay_rate"]].to_string())
 
-# Supprimer les épisodes avec NaN sur les features PINN
+# Drop episodes with NaN PINN features
 n_before = len(df_episodes)
 df_clean = df_episodes.dropna(subset=FEATURE_COLS).reset_index(drop=True)
-log.info("%d/%d épisodes avec toutes les features PINN disponibles", len(df_clean), n_before)
+log.info("%d/%d episodes with all PINN features available", len(df_clean), n_before)
 
 if len(df_clean) < 4:
-    log.error("Pas assez d'épisodes complets (%d) — on utilise gravity+n_ais seulement", len(df_clean))
+    log.error("Not enough complete episodes (%d) — using gravity+n_ais only", len(df_clean))
     FEATURE_COLS_USED = ["gravity_score", "n_ais_points"]
     df_clean = df_episodes.dropna(subset=FEATURE_COLS_USED).reset_index(drop=True)
 else:
@@ -218,7 +218,7 @@ y_test  = df_test[TARGET_COL].values.astype(float)
 
 log.info("Split: train=%d  test=%d", n_train, n_test)
 
-# ── Entraînement XGBoost ──────────────────────────────────────────────────────
+# ── XGBoost training ──────────────────────────────────────────────────────────
 try:
     from xgboost import XGBRegressor
 except ImportError:
@@ -227,7 +227,7 @@ except ImportError:
 model = XGBRegressor(**XGB_PARAMS)
 model.fit(X_train, y_train)
 
-# ── Métriques ─────────────────────────────────────────────────────────────────
+# ── Metrics ───────────────────────────────────────────────────────────────────
 y_pred_train = model.predict(X_train)
 y_pred_test  = model.predict(X_test)
 
@@ -238,7 +238,7 @@ def metrics(y_true, y_pred, label):
     ss_res = np.sum((y_true - y_pred)**2)
     ss_tot = np.sum((y_true - np.mean(y_true))**2)
     r2 = 1 - ss_res/ss_tot if ss_tot > 0 else float("nan")
-    # Baseline MAE (moyenne train)
+    # Baseline MAE (train mean)
     baseline_pred = np.full_like(y_pred, np.mean(y_train))
     mae_baseline  = float(np.mean(np.abs(y_true - baseline_pred)))
     log.info("%s | MSE=%.2f  MAE=%.2f j  R²=%.3f  MAE_baseline=%.2f j",
@@ -250,18 +250,18 @@ results = [
     metrics(y_test,  y_pred_test,  "TEST"),
 ]
 
-# ── Importance des features ───────────────────────────────────────────────────
+# ── Feature importance ────────────────────────────────────────────────────────
 importances = dict(zip(FEATURE_COLS_USED, model.feature_importances_))
-log.info("\nFeature importances (gain normalisé):")
+log.info("\nFeature importances (normalised gain):")
 for feat, imp in sorted(importances.items(), key=lambda x: -x[1]):
     bar = "#" * int(imp * 40)
     log.info("  %-20s %.4f  %s", feat, imp, bar)
 
-# ── Détail épisodes test ──────────────────────────────────────────────────────
+# ── Test episode details ──────────────────────────────────────────────────────
 df_test = df_test.copy()
 df_test["ttc_predicted"] = y_pred_test
 df_test["error_days"]    = y_pred_test - y_test
-log.info("\nDétail épisodes test:")
+log.info("\nTest episode details:")
 log.info(df_test[["episode_id","duration_days","ttc_predicted","error_days","gravity_score"]].to_string())
 
 # ── SHAP ─────────────────────────────────────────────────────────────────────
@@ -282,15 +282,15 @@ try:
     plt.close()
     log.info("SHAP summary → %s", shap_path)
 except Exception as e:
-    log.warning("SHAP échoué: %s", e)
+    log.warning("SHAP failed: %s", e)
 
-# ── Sauvegarde ────────────────────────────────────────────────────────────────
+# ── Save ──────────────────────────────────────────────────────────────────────
 df_episodes.to_csv(OUTPUT_CSV, index=False)
-log.info("Dataset épisodes → %s", OUTPUT_CSV)
+log.info("Episode dataset → %s", OUTPUT_CSV)
 
-log.info("\n=== RÉSUMÉ FINAL ===")
-log.info("Épisodes total: %d | avec features PINN: %d", n_before, len(df_clean))
-log.info("Features utilisées: %s", FEATURE_COLS_USED)
+log.info("\n=== FINAL SUMMARY ===")
+log.info("Total episodes: %d | with PINN features: %d", n_before, len(df_clean))
+log.info("Features used: %s", FEATURE_COLS_USED)
 log.info("Target: %s", TARGET_COL)
 for r in results:
     log.info("%s | MAE=%.1f j | R²=%.3f | vs baseline MAE=%.1f j",

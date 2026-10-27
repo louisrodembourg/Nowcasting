@@ -1,12 +1,12 @@
 """
-Phase 4 — PINN features add-on: est-ce que rho_pred + TTC améliorent les prédictions ?
+Phase 4 — PINN feature add-on: do rho_pred + TTC improve the predictions?
 
-Compare deux jeux de features en walk-forward OOS pour les cibles BDRY et SBLK :
-  A) Baseline  : gravity + AIS bruts uniquement
+Compares two feature sets in walk-forward OOS for the BDRY and SBLK targets:
+  A) Baseline : gravity + raw AIS only
   B) PINN-aug  : baseline + rho_pred (PINN) + ttc_days + in_episode flag
 
-Les TTC sont disponibles uniquement pendant les fenêtres d'épisodes PINN
-(90j autour du pic annuel de congestion, années 2019–2022).
+TTC values are only available inside the PINN episode windows
+(90 days around the yearly congestion peak, 2019–2022).
 
 Usage:
     python src/correlation/pinn_vs_baseline.py
@@ -36,7 +36,7 @@ OUT_DIR      = ROOT / "outputs/financial"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CHARGEMENT
+# LOADING
 # ══════════════════════════════════════════════════════════════════════════════
 
 def load_gravity() -> pd.DataFrame:
@@ -52,9 +52,9 @@ def load_gravity() -> pd.DataFrame:
 
 def load_ttc_series(years=(2019, 2020, 2021, 2022)) -> pd.DataFrame:
     """
-    Concat les fichiers TTC PINN par année.
-    Colonnes utiles : rho_pred, v_pred, time_to_clear_days, in_episode (flag).
-    En dehors des fenêtres d'épisodes, tout est NaN.
+    Concatenate the yearly PINN TTC files.
+    Useful columns: rho_pred, v_pred, time_to_clear_days, in_episode (flag).
+    Outside episode windows everything is NaN.
     """
     frames = []
     for pattern in [TTC_DIR / f"la_{y}_time_to_clear.parquet" for y in years]:
@@ -63,7 +63,7 @@ def load_ttc_series(years=(2019, 2020, 2021, 2022)) -> pd.DataFrame:
         df = pl.read_parquet(pattern).to_pandas()
         df["date"] = pd.to_datetime(df["date"])
         frames.append(df)
-        log.info("TTC %s: %d jours", pattern.stem, len(df))
+        log.info("TTC %s: %d days", pattern.stem, len(df))
 
     if not frames:
         return pd.DataFrame()
@@ -74,7 +74,7 @@ def load_ttc_series(years=(2019, 2020, 2021, 2022)) -> pd.DataFrame:
 
 
 def load_prices(ticker: str) -> pd.Series:
-    """Charge depuis le parquet cache ou yfinance."""
+    """Load from the cached parquet or from yfinance."""
     if ticker in ("BDRY", "MATX", "DAC", "CMRE", "GSL"):
         cached = (
             pl.read_parquet(EQUITY_PATH)
@@ -114,10 +114,10 @@ def build_baseline_features(gravity: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_pinn_features(gravity_features: pd.DataFrame, ttc: pd.DataFrame) -> pd.DataFrame:
-    """Fusionne baseline + PINN features (sparse)."""
+    """Merge baseline + PINN features (sparse)."""
     aug = gravity_features.copy()
 
-    # Merge PINN data — inner reindex sur l'index gravity (quotidien)
+    # Merge PINN data — inner reindex on the (daily) gravity index
     full_idx = gravity_features.index
     ttc_reindexed = ttc.reindex(full_idx)
 
@@ -126,8 +126,8 @@ def build_pinn_features(gravity_features: pd.DataFrame, ttc: pd.DataFrame) -> pd
     aug["pinn_v"]          = ttc_reindexed["v_pred"]
     aug["in_episode"]      = ttc_reindexed["in_episode"].fillna(0.0)
 
-    # TTC normalisé (0 quand hors épisode, valeur réelle pendant l'épisode)
-    # On représente "hors épisode" par TTC = 0 pour donner un signal continu au modèle
+    # Normalised TTC (0 outside episodes, actual value during the episode)
+    # "Outside episode" is encoded as TTC = 0 to give the model a continuous signal
     aug["pinn_ttc_filled"] = aug["pinn_ttc"].fillna(0.0)
     aug["pinn_rho_filled"] = aug["pinn_rho"].fillna(aug["pinn_rho"].mean())
 
@@ -213,7 +213,7 @@ def walk_forward_xgb(X: np.ndarray, y: np.ndarray, dates: pd.DatetimeIndex,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MÉTRIQUES
+# METRICS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def metrics(pred, actual, label=""):
@@ -241,7 +241,7 @@ def metrics(pred, actual, label=""):
 
 
 def delta_ic(m_aug, m_base, key="IC_spearman"):
-    """Différence IC augmenté vs baseline, en absolu et en %."""
+    """Augmented vs baseline IC difference, absolute and in %."""
     base = m_base.get(key, np.nan)
     aug  = m_aug.get(key, np.nan)
     if np.isnan(base) or np.isnan(aug):
@@ -258,16 +258,16 @@ def delta_ic(m_aug, m_base, key="IC_spearman"):
 def run():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    log.info("Chargement gravity...")
+    log.info("Loading gravity...")
     gravity  = load_gravity()
     baseline = build_baseline_features(gravity)
 
-    log.info("Chargement TTC PINN 2019–2022...")
+    log.info("Loading PINN TTC 2019–2022...")
     ttc      = load_ttc_series(years=(2019, 2020, 2021, 2022))
     aug_feat = build_pinn_features(baseline, ttc)
 
-    log.info("Jours en épisode PINN: %d / %d total", int(aug_feat["in_episode"].sum()), len(aug_feat))
-    log.info("TTC non-null: %d jours", aug_feat["pinn_ttc"].notna().sum())
+    log.info("Days in PINN episode: %d / %d total", int(aug_feat["in_episode"].sum()), len(aug_feat))
+    log.info("Non-null TTC: %d days", aug_feat["pinn_ttc"].notna().sum())
 
     targets = {
         "BDRY": "Breakwave Dry Bulk ETF",
@@ -298,7 +298,7 @@ def run():
             mb_ridge = metrics(ridge_b["pred"], ridge_b["actual"], f"Ridge·base|{ticker}|h{h}")
             mb_xgb   = metrics(xgb_b["pred"],  xgb_b["actual"],   f"XGB·base|{ticker}|h{h}")
 
-            # ── PINN-augmenté ─────────────────────────────────────────────
+            # ── PINN-augmented ────────────────────────────────────────────
             merged_a = aug_feat[PINN_COLS].join(
                 fwd.rename("fwd"), how="inner").dropna(subset=["fwd"])
             Xa = merged_a[PINN_COLS].values
@@ -311,7 +311,7 @@ def run():
             ma_ridge = metrics(ridge_a["pred"], ridge_a["actual"], f"Ridge·PINN|{ticker}|h{h}")
             ma_xgb   = metrics(xgb_a["pred"],  xgb_a["actual"],   f"XGB·PINN|{ticker}|h{h}")
 
-            # ── Calcul du delta ───────────────────────────────────────────
+            # ── Delta ─────────────────────────────────────────────────────
             diff_ridge_ic, diff_ridge_pct = delta_ic(ma_ridge, mb_ridge)
             diff_xgb_ic,   diff_xgb_pct  = delta_ic(ma_xgb,   mb_xgb)
             diff_ridge_sh, _              = delta_ic(ma_ridge, mb_ridge, "ls_sharpe")
@@ -364,7 +364,7 @@ def run():
     df = pd.DataFrame(all_rows)
 
     print("\n" + "="*100)
-    print("COMPARAISON : Baseline (AIS brut) vs. PINN-augmenté (rho + TTC)")
+    print("COMPARISON: Baseline (raw AIS) vs. PINN-augmented (rho + TTC)")
     print("="*100)
     print(f"{'Target':<6} {'H':>4} {'Model':<8} "
           f"{'IC_s Base':>10} {'IC_s PINN':>10} {'Δ IC_s':>8} {'Δ%':>6} "
@@ -384,17 +384,17 @@ def run():
         )
 
     print("="*100)
-    print("▲ = PINN améliore IC_s de >0.005  |  ▼ = PINN détériore IC_s de >0.005")
+    print("▲ = PINN improves IC_s by >0.005  |  ▼ = PINN worsens IC_s by >0.005")
 
     out = OUT_DIR / "pinn_vs_baseline.csv"
     df.to_csv(out, index=False)
-    log.info("Résultats sauvegardés -> %s", out)
+    log.info("Results saved -> %s", out)
 
-    # ── Corrélation directe de rho_pred et TTC avec les rendements ───────────
+    # ── Direct correlation of rho_pred and TTC with returns ──────────────────
     print("\n" + "═"*70)
-    print("CORRÉLATION DIRECTE : rho_pred + TTC vs. rendements (lag scan)")
+    print("DIRECT CORRELATION: rho_pred + TTC vs. returns (lag scan)")
     print("═"*70)
-    print("(sur les ~360 jours d'épisodes PINN disponibles 2019–2022)\n")
+    print("(on the ~360 PINN episode days available 2019–2022)\n")
 
     for ticker in ["BDRY", "SBLK", "MATX"]:
         prices = load_prices(ticker)

@@ -1,21 +1,21 @@
 """
-correlation_pipeline.py — Analyse de correlation macroeconomique continue.
+correlation_pipeline.py — Continuous macro correlation analysis.
 
-Approche : serie temporelle continue (ex. 2021-2024), sans episodes ni PINN.
-Le Gravity Score quotidien (issu de manifold_pipeline.py) est utilise comme
-signal avance des rendements financiers futurs.
+Approach: continuous time series (e.g. 2021-2024), without episodes or PINN.
+The daily gravity score (from manifold_pipeline.py) is used as a leading
+signal of future financial returns.
 
-Etape 1 : Chargement et fusion des series continues (gravity + prix financiers)
-Etape 2 : Feature engineering (lags, rolling means, rendements forward)
-Etape 3 : Cross-correlogramme Pearson/Spearman (lag 0 -> max_lag)
-Etape 4 : XGBoost continu avec TimeSeriesSplit (out-of-fold predictions)
+Step 1: Load and merge the continuous series (gravity + financial prices)
+Step 2: Feature engineering (lags, rolling means, forward returns)
+Step 3: Pearson/Spearman cross-correlogram (lag 0 -> max_lag)
+Step 4: Continuous XGBoost with TimeSeriesSplit (out-of-fold predictions)
 
-Commandes de lancement (PowerShell, une seule ligne) :
+Commands:
 
-  Houston 2021-2024 avec BOAT ETF :
+  Houston 2021-2024 with the BOAT ETF:
     python src/correlation/correlation_pipeline.py --gravity data/features/houston_gravity_daily.parquet --financial data/financial/BOAT.csv --start 2021-08-01 --end 2024-11-17 --lags 1 3 5 7 14 21 --horizons 5 10 15 30 --target return_10d
 
-  LA 2021-2024 avec S&P 500 :
+  LA 2021-2024 with the S&P 500:
     python src/correlation/correlation_pipeline.py --gravity data/features/la_gravity_daily.parquet --financial data/financial/SP500.csv --start 2021-08-01 --end 2024-11-17 --lags 1 3 5 7 14 21 --horizons 5 10 15 30 --target return_10d
 """
 
@@ -37,7 +37,7 @@ DEFAULT_ROLLING   = [7, 14, 21]
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# ETAPE 1 — Chargement
+# STEP 1 — Loading
 # ════════════════════════════════════════════════════════════════════════════
 
 def load_gravity(
@@ -46,13 +46,13 @@ def load_gravity(
     end_date:   str | None = None,
 ) -> pd.DataFrame:
     """
-    Charge le gravity score quotidien (Parquet ou CSV).
-    Colonnes attendues : date, gravity_score.
+    Load the daily gravity score (Parquet or CSV).
+    Expected columns: date, gravity_score.
     """
     path = Path(path)
     df = pd.read_parquet(path) if path.suffix == ".parquet" else pd.read_csv(path)
 
-    # Detecte la colonne date (insensible a la casse)
+    # Detect the date column (case-insensitive)
     date_col = next(
         (c for c in df.columns if c.lower() in ("date", "ds")),
         df.columns[0],
@@ -62,8 +62,8 @@ def load_gravity(
 
     if "gravity_score" not in df.columns:
         raise ValueError(
-            f"Colonne 'gravity_score' introuvable dans {path}. "
-            f"Colonnes disponibles : {list(df.columns)}"
+            f"Column 'gravity_score' not found in {path}. "
+            f"Available columns: {list(df.columns)}"
         )
 
     df = df[["date", "gravity_score"]].dropna().sort_values("date").reset_index(drop=True)
@@ -74,7 +74,7 @@ def load_gravity(
         df = df[df["date"] <= pd.Timestamp(end_date)]
 
     log.info(
-        "Gravity score : %d jours | %s -> %s | non-zero : %d jours",
+        "Gravity score: %d days | %s -> %s | non-zero: %d days",
         len(df),
         df["date"].min().date(), df["date"].max().date(),
         (df["gravity_score"] > 0).sum(),
@@ -87,13 +87,13 @@ def load_financial(
     date_col:  str = "Date",
     price_col: str = "Close",
 ) -> pd.DataFrame:
-    """Charge un CSV de prix financiers. Retourne date + price."""
+    """Load a CSV of financial prices. Returns date + price."""
     df = pd.read_csv(path, parse_dates=[date_col])
     if price_col not in df.columns:
         available = [c for c in df.columns if c != date_col]
         raise ValueError(
-            f"Colonne '{price_col}' introuvable dans {path}. "
-            f"Colonnes disponibles : {available}"
+            f"Column '{price_col}' not found in {path}. "
+            f"Available columns: {available}"
         )
     df = df[[date_col, price_col]].dropna()
     df = df.rename(columns={date_col: "date", price_col: "price"})
@@ -101,7 +101,7 @@ def load_financial(
     df = df.sort_values("date").reset_index(drop=True)
 
     log.info(
-        "Donnees financieres : %d jours | %s -> %s | col='%s'",
+        "Financial data: %d days | %s -> %s | col='%s'",
         len(df),
         df["date"].min().date(), df["date"].max().date(), price_col,
     )
@@ -109,7 +109,7 @@ def load_financial(
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# ETAPE 2 — Feature engineering
+# STEP 2 — Feature engineering
 # ════════════════════════════════════════════════════════════════════════════
 
 def build_continuous_dataset(
@@ -120,19 +120,19 @@ def build_continuous_dataset(
     rolling_windows: list[int],
 ) -> pd.DataFrame:
     """
-    Fusionne gravity + prix et construit features / targets.
+    Merge gravity + prices and build features / targets.
 
-    Features (passees, pas de leakage) :
-      gravity_lag_Nd  : gravity score N jours avant t
-      gravity_roll_Kd : moyenne mobile du gravity sur K jours (calculee sur t-1 en arriere)
+    Features (past only, no leakage):
+      gravity_lag_Nd  : gravity score N days before t
+      gravity_roll_Kd : K-day rolling mean of gravity (computed from t-1 backwards)
 
-    Targets (futures) :
-      return_Nd : rendement forward = (price[t+N] - price[t]) / price[t] * 100
+    Targets (future):
+      return_Nd : forward return = (price[t+N] - price[t]) / price[t] * 100
 
-    Les prix manquants (week-ends, feries) sont forward-filles depuis la
-    derniere cotation disponible.
+    Missing prices (weekends, holidays) are forward-filled from the
+    last available quote.
     """
-    # Calendrier continu
+    # Continuous calendar
     full_idx = pd.date_range(
         min(gravity_df["date"].min(), financial_df["date"].min()),
         max(gravity_df["date"].max(), financial_df["date"].max()),
@@ -152,7 +152,7 @@ def build_continuous_dataset(
     for lag in lags:
         df[f"gravity_lag_{lag}d"] = df["gravity_score"].shift(lag)
 
-    # Rolling means (utilise shift(1) pour eviter le leakage du jour J)
+    # Rolling means (shift(1) to avoid same-day leakage)
     for w in rolling_windows:
         df[f"gravity_roll_{w}d"] = df["gravity_score"].shift(1).rolling(w).mean()
 
@@ -160,7 +160,7 @@ def build_continuous_dataset(
     for h in horizons:
         df[f"return_{h}d"] = (df["price"].shift(-h) / df["price"] - 1) * 100.0
 
-    # Garder uniquement les jours avec gravity disponible
+    # Keep only days with gravity available
     df = df[df["gravity_score"].notna()].copy().reset_index(drop=True)
 
     feat_cols = (
@@ -170,14 +170,14 @@ def build_continuous_dataset(
     tgt_cols = [f"return_{h}d" for h in horizons]
 
     log.info(
-        "Dataset continu : %d jours | %d features | %d horizons cibles",
+        "Continuous dataset: %d days | %d features | %d target horizons",
         len(df), len(feat_cols), len(tgt_cols),
     )
     return df
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# ETAPE 3 — Cross-correlogramme
+# STEP 3 — Cross-correlogram
 # ════════════════════════════════════════════════════════════════════════════
 
 def run_cross_correlation(
@@ -186,14 +186,14 @@ def run_cross_correlation(
     horizons: list[int],
 ) -> pd.DataFrame:
     """
-    Calcule corr(gravity[t - lag], return[t + horizon]) pour toutes les
-    combinaisons (lag, horizon).
+    Compute corr(gravity[t - lag], return[t + horizon]) for every
+    (lag, horizon) combination.
 
-    Interprete comme : "le gravity score d'il y a LAG jours predit-il le
-    rendement dans HORIZON jours ?"
+    Read as: "does the gravity score from LAG days ago predict the
+    return in HORIZON days?"
 
-    Retourne un DataFrame avec pearson_r, pearson_p, spearman_r, spearman_p,
-    n_obs, et un indicateur de significativite a 5% (*).
+    Returns a DataFrame with pearson_r, pearson_p, spearman_r, spearman_p,
+    n_obs, and a 5% significance flag (*).
     """
     rows = []
     for lag in lags:
@@ -227,7 +227,7 @@ def run_cross_correlation(
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# ETAPE 4 — XGBoost sur serie continue
+# STEP 4 — XGBoost on the continuous series
 # ════════════════════════════════════════════════════════════════════════════
 
 def train_xgboost_continuous(
@@ -238,22 +238,22 @@ def train_xgboost_continuous(
     n_splits:        int = 5,
 ) -> tuple:
     """
-    XGBoost avec TimeSeriesSplit sur la serie temporelle continue.
+    XGBoost with TimeSeriesSplit on the continuous time series.
 
-    Features : gravity_lag_Nd + gravity_roll_Kd
-    Target   : return_Nd (rendement forward)
+    Features: gravity_lag_Nd + gravity_roll_Kd
+    Target  : return_Nd (forward return)
 
-    Retourne (model_final, metrics_dict, feat_importance_df, oof_predictions_df).
-    Les predictions out-of-fold (OOF) permettent un backtest propre sans
-    data leakage : chaque prediction est faite sur des donnees jamais vues
-    lors de l'entrainement.
+    Returns (model_final, metrics_dict, feat_importance_df, oof_predictions_df).
+    Out-of-fold (OOF) predictions allow a clean backtest without
+    data leakage: each prediction is made on data never seen
+    during training.
     """
     try:
         from xgboost import XGBRegressor
         from sklearn.model_selection import TimeSeriesSplit
         from sklearn.metrics import mean_squared_error, mean_absolute_error
     except ImportError:
-        raise ImportError("Requis : pip install xgboost scikit-learn")
+        raise ImportError("Required: pip install xgboost scikit-learn")
 
     features = (
         [f"gravity_lag_{lag}d"  for lag in lags          if f"gravity_lag_{lag}d"  in dataset.columns] +
@@ -265,8 +265,8 @@ def train_xgboost_continuous(
 
     if len(sub) < 20:
         raise ValueError(
-            f"Pas assez de donnees ({len(sub)} lignes apres dropna). "
-            f"Elargissez la periode ou reduisez les lags."
+            f"Not enough data ({len(sub)} rows after dropna). "
+            f"Widen the period or reduce the lags."
         )
 
     X         = sub[features].values
@@ -278,7 +278,7 @@ def train_xgboost_continuous(
     tscv = TimeSeriesSplit(n_splits=n_splits)
 
     log.info(
-        "=== XGBoost continu | target=%s | %d features | %d obs | %d folds",
+        "=== Continuous XGBoost | target=%s | %d features | %d obs | %d folds",
         target_col, len(features), len(X), n_splits,
     )
 
@@ -303,7 +303,7 @@ def train_xgboost_continuous(
             fold + 1, n_splits, len(train_idx), len(test_idx), rmse, mae,
         )
 
-    # Modele final sur l'ensemble des donnees
+    # Final model on the full dataset
     final_model = XGBRegressor(
         n_estimators=300, max_depth=3, learning_rate=0.03,
         subsample=0.8, colsample_bytree=0.8, random_state=42, verbosity=0,
@@ -326,7 +326,7 @@ def train_xgboost_continuous(
         "importance": final_model.feature_importances_,
     }).sort_values("importance", ascending=False).reset_index(drop=True)
 
-    # DataFrame OOF : predictions vs realise (uniquement les folds de test)
+    # OOF DataFrame: predicted vs realised (test folds only)
     mask = ~np.isnan(oof_preds)
     oof_df = pd.DataFrame({
         "date":       pd.to_datetime(dates[mask]),
@@ -337,7 +337,7 @@ def train_xgboost_continuous(
     })
 
     log.info(
-        "XGBoost final : RMSE=%.3f+-%.3f%% | MAE=%.3f+-%.3f%% | OOF : %d/%d jours",
+        "Final XGBoost: RMSE=%.3f+-%.3f%% | MAE=%.3f+-%.3f%% | OOF: %d/%d days",
         metrics["rmse_mean"], metrics["rmse_std"],
         metrics["mae_mean"],  metrics["mae_std"],
         mask.sum(), len(X),
@@ -356,34 +356,34 @@ def main() -> None:
 
     # Inputs
     parser.add_argument("--gravity",   type=Path, required=True,
-                        help="Parquet ou CSV avec colonnes date + gravity_score")
+                        help="Parquet or CSV with columns date + gravity_score")
     parser.add_argument("--financial", type=Path, required=True,
-                        help="CSV avec prix historiques quotidiens")
+                        help="CSV with daily historical prices")
     parser.add_argument("--price-col", default="Close",
-                        help="Colonne prix dans le CSV financier (defaut: Close)")
+                        help="Price column in the financial CSV (default: Close)")
     parser.add_argument("--date-col",  default="Date",
-                        help="Colonne date dans le CSV financier (defaut: Date)")
-    parser.add_argument("--start",     help="Date de debut (YYYY-MM-DD)")
-    parser.add_argument("--end",       help="Date de fin (YYYY-MM-DD)")
+                        help="Date column in the financial CSV (default: Date)")
+    parser.add_argument("--start",     help="Start date (YYYY-MM-DD)")
+    parser.add_argument("--end",       help="End date (YYYY-MM-DD)")
 
     # Feature engineering
     parser.add_argument("--lags",     type=int, nargs="+", default=DEFAULT_LAGS,
-                        help="Lags du gravity score en jours (defaut: 1 3 5 7 14 21)")
+                        help="Gravity score lags in days (default: 1 3 5 7 14 21)")
     parser.add_argument("--horizons", type=int, nargs="+", default=DEFAULT_HORIZONS,
-                        help="Horizons de rendement forward en jours (defaut: 5 10 15 30)")
+                        help="Forward return horizons in days (default: 5 10 15 30)")
     parser.add_argument("--rolling",  type=int, nargs="+", default=DEFAULT_ROLLING,
-                        help="Fenetres de rolling mean du gravity (defaut: 7 14 21)")
+                        help="Gravity rolling-mean windows (default: 7 14 21)")
 
     # XGBoost
     parser.add_argument("--target",   default="return_10d",
-                        help="Colonne cible XGBoost (defaut: return_10d)")
+                        help="XGBoost target column (default: return_10d)")
     parser.add_argument("--n-splits", type=int, default=5,
-                        help="Folds TimeSeriesSplit (defaut: 5)")
+                        help="TimeSeriesSplit folds (default: 5)")
 
-    # Sortie
+    # Output
     parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR)
     parser.add_argument("--save-model", action="store_true",
-                        help="Sauvegarder le modele XGBoost (.json)")
+                        help="Save the XGBoost model (.json)")
 
     args = parser.parse_args()
 
@@ -399,13 +399,13 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     asset_label = args.financial.stem.upper()
 
-    # ── ETAPE 1 ───────────────────────────────────────────────────────────
-    log.info("=== ETAPE 1 : Chargement des series ===")
+    # ── STEP 1 ────────────────────────────────────────────────────────────
+    log.info("=== STEP 1: Loading the series ===")
     gravity_df   = load_gravity(args.gravity, args.start, args.end)
     financial_df = load_financial(args.financial, args.date_col, args.price_col)
 
-    # ── ETAPE 2 ───────────────────────────────────────────────────────────
-    log.info("=== ETAPE 2 : Feature engineering ===")
+    # ── STEP 2 ────────────────────────────────────────────────────────────
+    log.info("=== STEP 2: Feature engineering ===")
     dataset = build_continuous_dataset(
         gravity_df, financial_df,
         lags=args.lags, horizons=args.horizons, rolling_windows=args.rolling,
@@ -413,26 +413,26 @@ def main() -> None:
 
     dataset_path = args.output_dir / f"continuous_dataset_{asset_label}.csv"
     dataset.to_csv(dataset_path, index=False)
-    log.info("Dataset sauvegarde -> %s", dataset_path)
+    log.info("Dataset saved -> %s", dataset_path)
 
-    # ── ETAPE 3 : Cross-correlogramme ─────────────────────────────────────
-    log.info("=== ETAPE 3 : Cross-correlogramme ===")
+    # ── STEP 3: cross-correlogram ─────────────────────────────────────────
+    log.info("=== STEP 3: Cross-correlogram ===")
     corr_df = run_cross_correlation(dataset, lags=args.lags, horizons=args.horizons)
 
     print(f"\n{'='*72}")
     print(f"  CROSS-CORRELOGRAMME  gravity_score(t-lag) -> return(t+horizon)")
-    print(f"  Actif : {asset_label}  |  * = significatif a 5%")
+    print(f"  Asset : {asset_label}  |  * = significant at 5%")
     print(f"{'='*72}")
     print(corr_df.to_string(index=False))
 
     corr_path = args.output_dir / f"crosscorr_{asset_label}.csv"
     corr_df.to_csv(corr_path, index=False)
-    log.info("Cross-correlogramme sauvegarde -> %s", corr_path)
+    log.info("Cross-correlogram saved -> %s", corr_path)
 
-    # ── ETAPE 4 : XGBoost ─────────────────────────────────────────────────
+    # ── STEP 4: XGBoost ───────────────────────────────────────────────────
     if args.target not in dataset.columns:
         available = [c for c in dataset.columns if c.startswith("return_")]
-        log.error("Target '%s' absente. Disponibles : %s", args.target, available)
+        log.error("Target '%s' missing. Available: %s", args.target, available)
         sys.exit(1)
 
     try:
@@ -445,7 +445,7 @@ def main() -> None:
         )
 
         print(f"\n{'='*72}")
-        print(f"  XGBOOST CONTINU | cible : {args.target} | actif : {asset_label}")
+        print(f"  CONTINUOUS XGBOOST | target: {args.target} | asset: {asset_label}")
         print(f"{'='*72}")
         print(f"  Observations  : {metrics['n_obs']}")
         print(f"  RMSE (OOF CV) : {metrics['rmse_mean']:.3f} +- {metrics['rmse_std']:.3f} %")
@@ -461,25 +461,25 @@ def main() -> None:
         rmse_oof = float(np.sqrt((errs**2).mean()))
         n_ok     = int((errs.abs() < 1.5).sum())
 
-        print(f"\n  Backtest OOF ({len(oof_df)} jours) :")
+        print(f"\n  OOF backtest ({len(oof_df)} days):")
         print(f"    MAE  = {mae_oof:.3f}%  |  RMSE = {rmse_oof:.3f}%")
-        print(f"    |erreur| < 1.5% : {n_ok}/{len(oof_df)} jours ({100*n_ok/len(oof_df):.0f}%)")
+        print(f"    |error| < 1.5% : {n_ok}/{len(oof_df)} days ({100*n_ok/len(oof_df):.0f}%)")
 
-        # Sauvegarde
+        # Save
         metrics_path = args.output_dir / f"xgb_metrics_{asset_label}.csv"
         pd.DataFrame([metrics]).to_csv(metrics_path, index=False)
 
         oof_path = args.output_dir / f"oof_predictions_{asset_label}.csv"
         oof_df.to_csv(oof_path, index=False)
-        log.info("Predictions OOF sauvegardees -> %s", oof_path)
+        log.info("OOF predictions saved -> %s", oof_path)
 
         if args.save_model:
             try:
                 mp = args.output_dir / f"xgb_{asset_label}_{args.target}.json"
                 xgb_model.save_model(str(mp))
-                log.info("Modele XGBoost sauvegarde -> %s", mp)
+                log.info("XGBoost model saved -> %s", mp)
             except Exception as exc:
-                log.warning("Sauvegarde modele impossible : %s", exc)
+                log.warning("Could not save the model: %s", exc)
 
         print(f"{'='*72}")
 

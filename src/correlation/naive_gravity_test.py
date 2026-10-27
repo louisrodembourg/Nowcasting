@@ -1,12 +1,12 @@
 """
-Reproduit le test naïf du collègue :
+Naive baseline test:
   Spearman / Pearson ( gravity_score[t - lag] , fwd_return[t + horizon] )
-  lags    : 1, 3, 5, 7, 14, 21 jours
-  horizons: 5, 10, 15, 30 jours
+  lags    : 1, 3, 5, 7, 14, 21 days
+  horizons: 5, 10, 15, 30 days
 
-Deux ports :
-  - LA    (2017–2022) → cible MATX
-  - Houston (2017–2022) → cible XOM (proxy port pétrolier)
+Two ports:
+  - LA      (2017–2022) → target MATX
+  - Houston (2017–2022) → target XOM (oil-port proxy)
 """
 
 import glob
@@ -30,7 +30,7 @@ LAGS     = [1, 3, 5, 7, 14, 21]
 HORIZONS = [5, 10, 15, 30]
 
 
-# ── Chargement ────────────────────────────────────────────────────────────────
+# ── Loading ───────────────────────────────────────────────────────────────────
 
 def load_la_gravity() -> pd.DataFrame:
     df = pl.read_parquet(FEAT_DIR / "la_gravity_2017_2022.parquet").to_pandas()
@@ -68,7 +68,7 @@ def fwd_return(prices: pd.Series, h: int) -> pd.Series:
     return np.log(prices.shift(-h) / prices)
 
 
-# ── Test naïf ────────────────────────────────────────────────────────────────
+# ── Naive test ────────────────────────────────────────────────────────────────
 
 def naive_lag_test(gravity: pd.DataFrame, prices: pd.Series,
                    port: str, ticker: str) -> pd.DataFrame:
@@ -102,7 +102,7 @@ def naive_lag_test(gravity: pd.DataFrame, prices: pd.Series,
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    print("Chargement des données...")
+    print("Loading data...")
     la_grav  = load_la_gravity()
     hou_grav = load_houston_gravity()
 
@@ -124,7 +124,7 @@ def main():
         sub = results[results["port"] == port]
         ticker = sub["ticker"].iloc[0]
         print(f"\n{'='*75}")
-        print(f"PORT : {port}  |  Cible : {ticker}  |  Feature : gravity_score brut")
+        print(f"PORT : {port}  |  Target : {ticker}  |  Feature : raw gravity_score")
         print(f"{'='*75}")
         print(f"{'lag':>5} {'H':>5}  {'pearson_r':>10} {'pearson_p':>10} "
               f"{'spearman_r':>11} {'spearman_p':>11} {'n_obs':>6} {'sig':>5}")
@@ -138,9 +138,9 @@ def main():
 
     n_sig = results["sig_5pct"].sum()
     n_tot = len(results)
-    print(f"\n→ {n_sig}/{n_tot} tests significatifs à 5%  "
-          f"(attendu par hasard : {n_tot*0.05:.1f})")
-    print(f"Résultats sauvegardés : {OUT_DIR / 'naive_gravity_test.csv'}")
+    print(f"\n→ {n_sig}/{n_tot} tests significant at 5%  "
+          f"(expected by chance: {n_tot*0.05:.1f})")
+    print(f"Results saved: {OUT_DIR / 'naive_gravity_test.csv'}")
 
 
 if __name__ == "__main__":

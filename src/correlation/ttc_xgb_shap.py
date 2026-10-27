@@ -1,42 +1,42 @@
 """
-ttc_xgb_shap.py — Estimateur du Time-to-Clear par XGBoost + explicabilité SHAP.
+ttc_xgb_shap.py — Time-to-clear estimator with XGBoost + SHAP explanations.
 
-Position dans la chaîne d'analyse :
+Position in the analysis chain:
     pinn_pipeline.py  →  extract_physical_profiles()  →  extract_pinn_summaries()
         ↓  (peak_rho, t_to_peak_days, area_under_rho, decay_rate, …)
     financial_pipeline.py  →  build_events_dataset()
         ↓  (episode_id, start_date, gravity_score, duration_days, pinn_summaries, …)
-    [ttc_xgb_shap.py]            ← CE MODULE
-        ↓  XGBRegressor entraîné + PNG SHAP (summary + waterfall)
+    [ttc_xgb_shap.py]            ← THIS MODULE
+        ↓  trained XGBRegressor + SHAP PNGs (summary + waterfall)
     financial_pipeline.py → generate_trading_signal()
 
-Features physiques d'entrée (une ligne = un épisode de disruption) :
-    gravity_score   (float) : Score topologique d'anomalie issu du Manifold Learning
+Physical input features (one row = one disruption episode):
+    gravity_score   (float) : Topological anomaly score from manifold learning
                               (Phase 2 — manifold_pipeline.py).
-    n_ais_points    (int)   : Nombre de points AIS observés sur l'épisode.
-    peak_rho        (float) : Densité maximale [vessels/km] issue du champ PINN ρ̂(x,t).
-    t_to_peak_days  (float) : Temps [jours] pour atteindre le pic de congestion.
-    area_under_rho  (float) : Intégrale temporelle de max_x ρ(x,t) — charge totale.
-    decay_rate      (float) : Pente de décroissance post-pic [v/km/j].
-    flux_entry_mean (float) : Flux moyen à l'entrée du chenal [vessels·kn/km].
+    n_ais_points    (int)   : Number of AIS points observed during the episode.
+    peak_rho        (float) : Maximum density [vessels/km] from the PINN field ρ̂(x,t).
+    t_to_peak_days  (float) : Time [days] to reach the congestion peak.
+    area_under_rho  (float) : Time integral of max_x ρ(x,t) — total load.
+    decay_rate      (float) : Post-peak decay slope [v/km/d].
+    flux_entry_mean (float) : Mean flux at the channel entrance [vessels·kn/km].
 
-Cible supervisée :
-    duration_days   (float) : Durée observée de l'épisode en jours, dérivée du
-                              gravity score (durée du run au-dessus du seuil).
-                              Proxy empirique du TTC — plus robuste que le seuillage
-                              arbitraire sur ρ̂(x,t).
+Supervised target:
+    duration_days   (float) : Observed episode duration in days, derived from the
+                              gravity score (length of the run above the threshold).
+                              Empirical TTC proxy — more robust than an arbitrary
+                              threshold on ρ̂(x,t).
 
-Usage CLI :
+CLI usage:
     python src/correlation/ttc_xgb_shap.py \\
         --input outputs/financial/houston_events.csv \\
         --output-dir outputs/figures/ttc_shap \\
         --test-frac 0.20 \\
         --save-model
 
-Usage programmatique :
+Programmatic usage:
     from src.correlation.ttc_xgb_shap import run_full_pipeline
     results = run_full_pipeline(df=events_df, output_dir=Path("outputs/figures/ttc_shap"))
-    xgb_model = results["model"]  # injectables dans generate_trading_signal()
+    xgb_model = results["model"]  # can be injected into generate_trading_signal()
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ from pathlib import Path
 from typing import Optional
 
 import matplotlib
-matplotlib.use("Agg")  # backend non-interactif — obligatoire en production (pas de GUI)
+matplotlib.use("Agg")  # non-interactive backend — required in production (no GUI)
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -59,43 +59,43 @@ log = logging.getLogger(__name__)
 # CONSTANTES
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Features physiques : gravity score (Phase 2) + résumés scalaires du champ PINN (Phase 3).
+# Physical features: gravity score (Phase 2) + scalar summaries of the PINN field (Phase 3).
 FEATURE_COLS: list[str] = [
-    "gravity_score",    # anomalie topologique Manifold (Phase 2)
-    "n_ais_points",     # couverture AIS de l'épisode
-    "peak_rho",         # densité maximale [vessels/km] — champ PINN
-    "t_to_peak_days",   # temps au pic de congestion [jours] — champ PINN
-    "area_under_rho",   # charge totale de congestion [v/km·j] — champ PINN
-    "decay_rate",       # pente de résorption post-pic [v/km/j] — champ PINN
-    "flux_entry_mean",  # flux moyen à l'entrée du chenal [v·kn/km] — champ PINN
+    "gravity_score",    # topological anomaly from the manifold (Phase 2)
+    "n_ais_points",     # AIS coverage of the episode
+    "peak_rho",         # maximum density [vessels/km] — PINN field
+    "t_to_peak_days",   # time to congestion peak [days] — PINN field
+    "area_under_rho",   # total congestion load [v/km·d] — PINN field
+    "decay_rate",       # post-peak clearing slope [v/km/d] — PINN field
+    "flux_entry_mean",  # mean flux at the channel entrance [v·kn/km] — PINN field
 ]
 
-# Cible : durée observée de l'épisode (proxy TTC empirique, plus robuste que seuillage ρ̂).
+# Target: observed episode duration (empirical TTC proxy, more robust than thresholding ρ̂).
 TARGET_COL: str = "duration_days"
 
-# Colonne de date utilisée pour le tri chronologique (plusieurs alias tolérés).
+# Date column used for chronological sorting (several aliases accepted).
 DATE_COL_CANDIDATES: tuple[str, ...] = ("start_date", "date", "Date")
 
-# Hyperparamètres XGBoost : conservatifs pour petits datasets (< 100 épisodes).
-# max_depth=3 + min_child_weight=5 + reg_lambda=2 combattent l'overfitting
-# plus efficacement que d'augmenter n_estimators.
+# XGBoost hyper-parameters: conservative for small datasets (< 100 episodes).
+# max_depth=3 + min_child_weight + reg_lambda=2 fight overfitting
+# more effectively than increasing n_estimators.
 XGB_PARAMS: dict = {
     "n_estimators":    300,
     "max_depth":       3,
     "learning_rate":   0.03,
     "subsample":       0.8,
     "colsample_bytree": 0.8,
-    "min_child_weight": 3,   # nombre minimal d'obs dans une feuille
-    "gamma":           0.1,   # réduction minimale de perte pour un split
-    "reg_alpha":       0.1,   # L1 — pénalise les poids proches de zéro
-    "reg_lambda":      2.0,   # L2 — réduit la magnitude des poids
+    "min_child_weight": 3,   # minimum number of observations in a leaf
+    "gamma":           0.1,   # minimum loss reduction for a split
+    "reg_alpha":       0.1,   # L1 — penalises weights close to zero
+    "reg_lambda":      2.0,   # L2 — shrinks weight magnitude
     "random_state":    42,
     "verbosity":       0,
 }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ÉTAPE 1 — Chargement des données
+# STEP 1 — Data loading
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_episode_features(
@@ -105,31 +105,31 @@ def load_episode_features(
     alias_map: Optional[dict[str, str]] = None,
 ) -> pd.DataFrame:
     """
-    Charge le CSV ou Parquet d'épisodes et vérifie la présence des colonnes requises.
+    Load the episode CSV or Parquet and check that the required columns exist.
 
-    Compatible avec la sortie de build_events_dataset() (financial_pipeline.py).
-    Dans ce cas, renommer "ttc_days" → "time_to_clear" est automatique.
+    Compatible with the output of build_events_dataset() (financial_pipeline.py).
+    In that case, renaming "ttc_days" → "time_to_clear" is automatic.
 
     Parameters
     ----------
-    path        : fichier CSV ou Parquet (détection automatique par extension)
-    feature_cols: liste des colonnes features attendues
-    target_col  : colonne cible (time_to_clear)
-    alias_map   : mapping optionnel {colonne_source → colonne_cible}
-                  ex: {"ttc_days": "time_to_clear", "waiting_vessels": "anchorage_queue"}
+    path        : CSV or Parquet file (detected from the extension)
+    feature_cols: list of expected feature columns
+    target_col  : target column
+    alias_map   : optional mapping {source_column → target_column}
+                  e.g. {"ttc_days": "time_to_clear", "waiting_vessels": "anchorage_queue"}
 
     Returns
     -------
-    DataFrame trié chronologiquement, sans NaN sur features + target.
+    DataFrame sorted chronologically, without NaN in features + target.
     """
     path = Path(path)
     if not path.exists():
-        raise FileNotFoundError(f"Fichier introuvable : {path}")
+        raise FileNotFoundError(f"File not found: {path}")
 
     df = pd.read_parquet(path) if path.suffix == ".parquet" else pd.read_csv(path)
-    log.info("Chargement : %d lignes depuis %s | colonnes : %s", len(df), path.name, list(df.columns))
+    log.info("Loading: %d rows from %s | columns: %s", len(df), path.name, list(df.columns))
 
-    # Renommages automatiques (sortie build_events_dataset → format attendu)
+    # Automatic renames (build_events_dataset output → expected format)
     default_aliases: dict[str, str] = {
         "waiting_vessels": "anchorage_queue",
     }
@@ -139,38 +139,38 @@ def load_episode_features(
     for src, dst in default_aliases.items():
         if src in df.columns and dst not in df.columns:
             df = df.rename(columns={src: dst})
-            log.info("Alias appliqué : %s → %s", src, dst)
+            log.info("Alias applied: %s → %s", src, dst)
 
-    # Tri chronologique (évite le data leakage dans le split)
+    # Chronological sort (avoids data leakage in the split)
     date_col = next((c for c in DATE_COL_CANDIDATES if c in df.columns), None)
     if date_col:
         df[date_col] = pd.to_datetime(df[date_col])
         df = df.sort_values(date_col).reset_index(drop=True)
 
-    # Vérification des colonnes requises
+    # Check the required columns
     missing_features = [c for c in feature_cols if c not in df.columns]
     if missing_features:
         raise ValueError(
-            f"Colonnes features manquantes : {missing_features}. "
-            f"Colonnes disponibles : {list(df.columns)}\n"
-            f"Conseil : utilisez alias_map pour mapper vos colonnes existantes."
+            f"Missing feature columns: {missing_features}. "
+            f"Available columns: {list(df.columns)}\n"
+            f"Tip: use alias_map to map your existing columns."
         )
     if target_col not in df.columns:
         raise ValueError(
-            f"Colonne cible '{target_col}' introuvable. "
-            f"Colonnes disponibles : {list(df.columns)}\n"
-            f"Conseil : renommez 'ttc_days' → 'time_to_clear' ou passez alias_map."
+            f"Target column '{target_col}' not found. "
+            f"Available columns: {list(df.columns)}\n"
+            f"Tip: rename 'ttc_days' → 'time_to_clear' or pass alias_map."
         )
 
-    # Suppression des lignes incomplètes (NaN sur features ou cible)
+    # Drop incomplete rows (NaN in features or target)
     n_before = len(df)
     df = df.dropna(subset=feature_cols + [target_col]).reset_index(drop=True)
     n_dropped = n_before - len(df)
     if n_dropped:
-        log.warning("%d lignes supprimées (NaN sur features/target)", n_dropped)
+        log.warning("%d rows dropped (NaN in features/target)", n_dropped)
 
     log.info(
-        "Dataset final : %d épisodes | features=%s | target=%s | range TTC=[%.1f, %.1f] j",
+        "Final dataset: %d episodes | features=%s | target=%s | TTC range=[%.1f, %.1f] d",
         len(df), feature_cols, target_col,
         df[target_col].min(), df[target_col].max(),
     )
@@ -178,7 +178,7 @@ def load_episode_features(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ÉTAPE 2 — Séparation Train / Test
+# STEP 2 — Train / test split
 # ─────────────────────────────────────────────────────────────────────────────
 
 def split_train_test_chronological(
@@ -188,20 +188,20 @@ def split_train_test_chronological(
     test_frac: float = 0.20,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, pd.DataFrame, pd.DataFrame]:
     """
-    Séparation chronologique strict : les N derniers épisodes forment le test.
+    Strict chronological split: the last N episodes form the test set.
 
-    Logique temporelle (pas de shuffle) : simuler un vrai nowcasting où le modèle
-    est entraîné sur des crises passées et évalué sur des crises futures inédites.
+    Temporal logic (no shuffle): simulates real nowcasting, where the model
+    is trained on past crises and evaluated on unseen future ones.
 
     Returns
     -------
     X_train, X_test, y_train, y_test, df_train, df_test
-    (les deux derniers permettent de récupérer les métadonnées, ex: episode_id)
+    (the last two give access to metadata, e.g. episode_id)
     """
     if len(df) < 4:
         raise ValueError(
-            f"Données insuffisantes : {len(df)} épisodes (minimum 4 requis). "
-            "Élargissez la fenêtre temporelle ou abaissez le gravity_threshold."
+            f"Not enough data: {len(df)} episodes (minimum 4 required). "
+            "Widen the time window or lower gravity_threshold."
         )
 
     n_test  = max(1, int(len(df) * test_frac))
@@ -216,14 +216,14 @@ def split_train_test_chronological(
     y_test  = df_test[target_col].values.astype(np.float32)
 
     log.info(
-        "Split chronologique : train=%d épisodes | test=%d épisodes (%.0f%%)",
+        "Chronological split: train=%d episodes | test=%d episodes (%.0f%%)",
         n_train, n_test, 100 * n_test / len(df),
     )
     return X_train, X_test, y_train, y_test, df_train, df_test
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ÉTAPE 3 — Entraînement XGBoost
+# STEP 3 — XGBoost training
 # ─────────────────────────────────────────────────────────────────────────────
 
 def train_ttc_model(
@@ -233,29 +233,29 @@ def train_ttc_model(
     xgb_params: dict = XGB_PARAMS,
 ):
     """
-    Instancie et entraîne un XGBRegressor pour prédire le Time-to-Clear.
+    Instantiate and train an XGBRegressor to predict the time-to-clear.
 
-    Les hyperparamètres par défaut (XGB_PARAMS) sont conçus pour des petits
-    datasets (< 100 épisodes) : arbres peu profonds, régularisation forte,
-    taux d'apprentissage bas.
+    The default hyper-parameters (XGB_PARAMS) are designed for small
+    datasets (< 100 episodes): shallow trees, strong regularisation,
+    low learning rate.
 
     Returns
     -------
-    XGBRegressor entraîné (injectables dans generate_trading_signal de financial_pipeline.py)
+    Trained XGBRegressor (can be injected into generate_trading_signal of financial_pipeline.py)
     """
     try:
         from xgboost import XGBRegressor
     except ImportError:
         raise ImportError(
-            "XGBoost non installé. Installez avec : pip install xgboost"
+            "XGBoost not installed. Install with: pip install xgboost"
         )
 
     model = XGBRegressor(**xgb_params)
     model.fit(X_train, y_train)
 
-    # Log de l'importance des features (gain normalisé)
+    # Log feature importance (normalised gain)
     importances = dict(zip(feature_cols, model.feature_importances_))
-    log.info("Feature importance (gain normalisé) :")
+    log.info("Feature importance (normalised gain):")
     for feat, imp in sorted(importances.items(), key=lambda x: -x[1]):
         bar = "#" * int(imp * 40)
         log.info("  %-20s %.4f  %s", feat, imp, bar)
@@ -264,7 +264,7 @@ def train_ttc_model(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ÉTAPE 4 — Évaluation
+# STEP 4 — Evaluation
 # ─────────────────────────────────────────────────────────────────────────────
 
 def evaluate_model(
@@ -276,18 +276,18 @@ def evaluate_model(
     target_col: str = TARGET_COL,
 ) -> dict:
     """
-    Calcule RMSE, MAE et R² sur le jeu de test.
+    Compute RMSE, MAE and R² on the test set.
 
-    Retourne aussi un DataFrame détaillé par épisode pour le rapport LaTeX.
+    Also returns a per-episode DataFrame for the LaTeX report.
 
     Returns
     -------
-    dict avec clés : rmse, mae, r2, n_obs, predictions_df
+    dict with keys: rmse, mae, r2, n_obs, predictions_df
     """
     try:
         from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
     except ImportError:
-        raise ImportError("Requis : pip install scikit-learn")
+        raise ImportError("Required: pip install scikit-learn")
 
     y_pred = model.predict(X_test)
 
@@ -295,12 +295,12 @@ def evaluate_model(
     mae  = float(mean_absolute_error(y_test, y_pred))
     r2   = float(r2_score(y_test, y_pred))
 
-    log.info("=== Évaluation sur test set (%d épisodes) ===", len(y_test))
-    log.info("  RMSE  = %.2f jours", rmse)
-    log.info("  MAE   = %.2f jours", mae)
+    log.info("=== Evaluation on the test set (%d episodes) ===", len(y_test))
+    log.info("  RMSE  = %.2f days", rmse)
+    log.info("  MAE   = %.2f days", mae)
     log.info("  R²    = %.4f", r2)
 
-    # Tableau par épisode (utile pour le rapport)
+    # Per-episode table (useful for the report)
     pred_df = df_test[["episode_id", "start_date", target_col]].copy() if "episode_id" in df_test.columns \
         else df_test[[target_col]].copy()
     pred_df["ttc_predit_j"] = np.round(y_pred, 2)
@@ -318,7 +318,7 @@ def evaluate_model(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ÉTAPE 5 — Moteur SHAP
+# STEP 5 — SHAP engine
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_shap_explanation(
@@ -327,38 +327,38 @@ def compute_shap_explanation(
     feature_cols: list[str] = FEATURE_COLS,
 ) -> tuple:
     """
-    Calcule les SHAP values pour tout le dataset X.
+    Compute SHAP values for the whole dataset X.
 
-    Utilise TreeExplainer (optimisé pour XGBoost) qui garantit des valeurs
-    de Shapley exactes via l'algorithme TreeSHAP (Lundberg et al., 2020).
+    Uses TreeExplainer (optimised for XGBoost), which gives exact Shapley
+    values through the TreeSHAP algorithm (Lundberg et al., 2020).
 
     Returns
     -------
     (shap_explanation, shap_values_np, X_df)
-      - shap_explanation : objet Explanation (API moderne, pour waterfall_plot)
-      - shap_values_np   : ndarray (N, n_features) (API legacy, pour summary_plot)
-      - X_df             : DataFrame avec noms de colonnes (requis par summary_plot)
+      - shap_explanation : Explanation object (modern API, for waterfall_plot)
+      - shap_values_np   : ndarray (N, n_features) (legacy API, for summary_plot)
+      - X_df             : DataFrame with column names (required by summary_plot)
     """
     try:
         import shap
     except ImportError:
         raise ImportError(
-            "SHAP non installé. Installez avec : pip install shap"
+            "SHAP not installed. Install with: pip install shap"
         )
 
     explainer = shap.TreeExplainer(model)
 
-    # API moderne → objet Explanation (nécessaire pour waterfall_plot)
+    # Modern API → Explanation object (needed for waterfall_plot)
     shap_explanation = explainer(X)
 
-    # API legacy → numpy array (nécessaire pour summary_plot avec feature_names)
+    # Legacy API → numpy array (needed for summary_plot with feature_names)
     shap_values_np = explainer.shap_values(X)
 
     X_df = pd.DataFrame(X, columns=feature_cols)
 
     log.info(
-        "SHAP values calculées : %d épisodes × %d features | "
-        "valeur absolue moyenne par feature : %s",
+        "SHAP values computed: %d episodes × %d features | "
+        "mean absolute value per feature: %s",
         X.shape[0], X.shape[1],
         {f: f"{float(np.abs(shap_values_np[:, i]).mean()):.3f}"
          for i, f in enumerate(feature_cols)},
@@ -370,16 +370,16 @@ def plot_shap_summary(
     shap_values_np: np.ndarray,
     X_df: pd.DataFrame,
     output_path: Path,
-    title: str = "SHAP — Impact global des features sur le Time-to-Clear",
+    title: str = "SHAP — Global feature impact on the time-to-clear",
     dpi: int = 150,
 ) -> None:
     """
-    Génère le SHAP summary_plot (beeswarm) et le sauvegarde en PNG.
+    Generate the SHAP summary_plot (beeswarm) and save it as PNG.
 
-    Lecture du graphique :
-      - Axe X  : contribution SHAP (positif = allonge le TTC, négatif = réduit le TTC)
-      - Couleur : valeur de la feature (rouge = haute, bleu = basse)
-      - Chaque point = un épisode de disruption
+    How to read it:
+      - X axis : SHAP contribution (positive = longer TTC, negative = shorter TTC)
+      - Colour : feature value (red = high, blue = low)
+      - Each point = one disruption episode
     """
     try:
         import shap
@@ -387,7 +387,7 @@ def plot_shap_summary(
         raise ImportError("pip install shap")
 
     fig, ax = plt.subplots(figsize=(10, 5))
-    # show=False : SHAP dessine sur la figure matplotlib courante sans ouvrir de fenêtre
+    # show=False: SHAP draws on the current matplotlib figure without opening a window
     shap.summary_plot(shap_values_np, X_df, show=False, plot_size=None)
     plt.title(title, fontsize=12, pad=12)
     plt.tight_layout()
@@ -405,32 +405,32 @@ def plot_worst_crisis_waterfall(
     dpi: int = 150,
 ) -> int:
     """
-    Génère un SHAP waterfall_plot pour l'épisode avec le gravity_score maximum.
+    Generate a SHAP waterfall_plot for the episode with the highest gravity_score.
 
-    Le waterfall_plot décompose visuellement la prédiction XGBoost en contributions
-    individuelles de chaque feature pour CE cas précis :
-      - Baseline (E[f(X)]) : prédiction moyenne du modèle sur toutes les crises
-      - Barre rouge : feature qui AUGMENTE le TTC prédit
-      - Barre bleue : feature qui DIMINUE le TTC prédit
-      - f(x)        : TTC final prédit pour cet épisode
+    The waterfall_plot visually breaks the XGBoost prediction down into the
+    individual contribution of each feature for THIS specific case:
+      - Baseline (E[f(X)]) : mean model prediction over all crises
+      - Red bar  : feature that INCREASES the predicted TTC
+      - Blue bar : feature that DECREASES the predicted TTC
+      - f(x)     : final predicted TTC for this episode
 
     Parameters
     ----------
-    shap_explanation : objet shap.Explanation calculé sur le même X que df
-    df               : DataFrame source (doit contenir gravity_col)
-    output_path      : fichier PNG de sortie
-    gravity_col      : colonne utilisée pour localiser la pire crise
+    shap_explanation : shap.Explanation computed on the same X as df
+    df               : source DataFrame (must contain gravity_col)
+    output_path      : output PNG file
+    gravity_col      : column used to locate the worst crisis
 
     Returns
     -------
-    idx_worst (int) : indice de la pire crise dans df (pour log / rapport)
+    idx_worst (int) : index of the worst crisis in df (for log / report)
     """
     try:
         import shap
     except ImportError:
         raise ImportError("pip install shap")
 
-    # Localiser la pire crise (gravity_score maximum = disruption la plus intense)
+    # Locate the worst crisis (maximum gravity_score = most intense disruption)
     idx_worst = int(df[gravity_col].idxmax()) if gravity_col in df.columns else 0
     worst_episode_id = df.get("episode_id", pd.Series(["?"])).iloc[idx_worst] \
         if "episode_id" in df.columns else f"idx={idx_worst}"
@@ -438,15 +438,15 @@ def plot_worst_crisis_waterfall(
     worst_ttc        = float(df[target_col].iloc[idx_worst]) if target_col in df.columns else np.nan
 
     log.info(
-        "Waterfall pour la pire crise : idx=%d | id=%s | gravity=%.0f | TTC réel=%.1f j",
+        "Waterfall for the worst crisis: idx=%d | id=%s | gravity=%.0f | actual TTC=%.1f d",
         idx_worst, worst_episode_id, worst_gravity, worst_ttc,
     )
 
     fig, ax = plt.subplots(figsize=(10, 5))
     shap.plots.waterfall(shap_explanation[idx_worst], show=False)
     plt.title(
-        f"SHAP Waterfall — Pire crise : {worst_episode_id}\n"
-        f"gravity_score={worst_gravity:,.0f}  |  TTC réel={worst_ttc:.1f} j",
+        f"SHAP Waterfall — Worst crisis: {worst_episode_id}\n"
+        f"gravity_score={worst_gravity:,.0f}  |  actual TTC={worst_ttc:.1f} d",
         fontsize=11, pad=10,
     )
     plt.tight_layout()
@@ -463,10 +463,10 @@ def plot_predictions_vs_actual(
     dpi: int = 150,
 ) -> None:
     """
-    Scatter plot TTC prédit vs TTC réel (jeu de test) avec ligne de parfaite prédiction.
+    Scatter plot of predicted vs actual TTC (test set) with the perfect-prediction line.
 
-    Utile pour visualiser les biais systématiques du modèle (ex: sous-estimation
-    des crises extrêmes).
+    Useful to spot systematic model biases (e.g. underestimation
+    of extreme crises).
     """
     fig, ax = plt.subplots(figsize=(7, 6))
 
@@ -475,20 +475,20 @@ def plot_predictions_vs_actual(
 
     ax.scatter(x, y, alpha=0.7, edgecolors="k", linewidths=0.5, s=60, color="steelblue")
 
-    # Ligne parfaite y = x
+    # Perfect line y = x
     lims = [min(x.min(), y.min()) * 0.9, max(x.max(), y.max()) * 1.1]
-    ax.plot(lims, lims, "r--", linewidth=1.2, label="Prédiction parfaite")
+    ax.plot(lims, lims, "r--", linewidth=1.2, label="Perfect prediction")
 
-    ax.set_xlabel("TTC réel (jours)", fontsize=11)
-    ax.set_ylabel("TTC prédit par XGBoost (jours)", fontsize=11)
-    ax.set_title("Time-to-Clear : prédit vs réel (test set)", fontsize=12)
+    ax.set_xlabel("Actual TTC (days)", fontsize=11)
+    ax.set_ylabel("TTC predicted by XGBoost (days)", fontsize=11)
+    ax.set_title("Time-to-clear: predicted vs actual (test set)", fontsize=12)
     ax.legend()
     ax.grid(alpha=0.3)
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=dpi, bbox_inches="tight")
     plt.close()
-    log.info("Scatter prédit vs réel → %s", output_path)
+    log.info("Predicted vs actual scatter → %s", output_path)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -505,40 +505,40 @@ def run_full_pipeline(
     save_model:   bool = False,
 ) -> dict:
     """
-    Orchestrateur principal : entraîne XGBoost + génère les 3 PNG SHAP.
+    Main orchestrator: train XGBoost + generate the 3 SHAP PNGs.
 
-    Conçu pour être appelé depuis financial_pipeline.py après build_events_dataset() :
+    Designed to be called from financial_pipeline.py after build_events_dataset():
         events_df["time_to_clear"] = events_df["ttc_days"]
-        # Enrichir avec approach_speed, anchorage_queue, complexity_p depuis les AIS...
+        # Enrich with features computed from AIS...
         results = run_full_pipeline(df=events_df, output_dir=output_dir)
-        xgb_model = results["model"]  # injecter dans generate_trading_signal()
+        xgb_model = results["model"]  # inject into generate_trading_signal()
 
     Parameters
     ----------
-    df          : DataFrame enrichi avec features + target (voir load_episode_features)
-    output_dir  : dossier de sortie pour les PNG et le modèle
-    feature_cols: liste des colonnes features
-    target_col  : colonne cible (time_to_clear)
-    test_frac   : fraction du dataset pour le test (défaut: 20% des derniers épisodes)
-    xgb_params  : hyperparamètres XGBoost (défaut: XGB_PARAMS)
-    save_model  : sauvegarder le modèle XGBoost en JSON
+    df          : DataFrame with features + target (see load_episode_features)
+    output_dir  : output folder for the PNGs and the model
+    feature_cols: list of feature columns
+    target_col  : target column
+    test_frac   : fraction of the dataset kept for testing (default: last 20% of episodes)
+    xgb_params  : XGBoost hyper-parameters (default: XGB_PARAMS)
+    save_model  : save the XGBoost model as JSON
 
     Returns
     -------
-    dict avec clés :
-        model           : XGBRegressor entraîné sur les données complètes
-        metrics         : {rmse, mae, r2, n_obs} sur le test set
-        predictions_df  : DataFrame par épisode (test set) avec TTC prédit vs réel
-        shap_summary_path    : Path vers le PNG summary_plot
-        shap_waterfall_path  : Path vers le PNG waterfall de la pire crise
-        scatter_path         : Path vers le PNG scatter prédit vs réel
-        idx_worst_crisis     : indice de la pire crise dans df
+    dict with keys:
+        model           : XGBRegressor trained on the full data
+        metrics         : {rmse, mae, r2, n_obs} on the test set
+        predictions_df  : per-episode DataFrame (test set) with predicted vs actual TTC
+        shap_summary_path    : Path to the summary_plot PNG
+        shap_waterfall_path  : Path to the waterfall PNG of the worst crisis
+        scatter_path         : Path to the predicted-vs-actual scatter PNG
+        idx_worst_crisis     : index of the worst crisis in df
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     log.info("=" * 60)
-    log.info("  TTC XGBoost + SHAP — %d épisodes | %d features", len(df), len(feature_cols))
+    log.info("  TTC XGBoost + SHAP — %d episodes | %d features", len(df), len(feature_cols))
     log.info("=" * 60)
 
     # ── 1. Split chronologique ────────────────────────────────────────────────
@@ -546,22 +546,22 @@ def run_full_pipeline(
         df, feature_cols, target_col, test_frac,
     )
 
-    # ── 2. Entraînement ──────────────────────────────────────────────────────
+    # ── 2. Training ──────────────────────────────────────────────────────────
     model = train_ttc_model(X_train, y_train, feature_cols, xgb_params)
 
-    # ── 3. Évaluation ────────────────────────────────────────────────────────
+    # ── 3. Evaluation ────────────────────────────────────────────────────────
     eval_results = evaluate_model(model, X_test, y_test, df_test, feature_cols, target_col)
     metrics       = {k: v for k, v in eval_results.items() if k != "predictions_df"}
     predictions_df = eval_results["predictions_df"]
 
-    # ── 4. Ré-entraînement sur l'ensemble complet (modèle de production) ─────
-    # Après évaluation out-of-sample, on entraîne sur tout pour maximiser la
-    # robustesse du modèle déployé dans generate_trading_signal().
+    # ── 4. Retrain on the full set (production model) ────────────────────────
+    # After out-of-sample evaluation, train on everything to maximise the
+    # robustness of the model used in generate_trading_signal().
     X_full = df[feature_cols].values.astype(np.float32)
     y_full = df[target_col].values.astype(np.float32)
     model_full = train_ttc_model(X_full, y_full, feature_cols, xgb_params)
 
-    # ── 5. SHAP (calculé sur le dataset complet pour couvrir toutes les crises) ─
+    # ── 5. SHAP (computed on the full dataset to cover every crisis) ──────────
     shap_explanation, shap_values_np, X_df = compute_shap_explanation(
         model_full, X_full, feature_cols,
     )
@@ -574,31 +574,31 @@ def run_full_pipeline(
     idx_worst = plot_worst_crisis_waterfall(shap_explanation, df, waterfall_path, target_col=target_col)
     plot_predictions_vs_actual(predictions_df, scatter_path, target_col)
 
-    # ── 6. Sauvegarde optionnelle du modèle ───────────────────────────────────
+    # ── 6. Optional model saving ──────────────────────────────────────────────
     model_path = None
     if save_model:
         model_path = output_dir / "xgb_ttc_model.json"
         model_full.save_model(str(model_path))
-        log.info("Modèle XGBoost sauvegardé → %s", model_path)
+        log.info("XGBoost model saved → %s", model_path)
 
-    # ── 7. Rapport synthétique ────────────────────────────────────────────────
+    # ── 7. Summary report ─────────────────────────────────────────────────────
     print(f"\n{'='*60}")
-    print(f"  XGBoost TTC Estimator — Résultats (test set : {metrics['n_obs']} épisodes)")
+    print(f"  XGBoost TTC Estimator — Results (test set: {metrics['n_obs']} episodes)")
     print(f"{'='*60}")
-    print(f"  RMSE  = {metrics['rmse']:.2f} jours")
-    print(f"  MAE   = {metrics['mae']:.2f} jours")
+    print(f"  RMSE  = {metrics['rmse']:.2f} days")
+    print(f"  MAE   = {metrics['mae']:.2f} days")
     print(f"  R²    = {metrics['r2']:.4f}")
-    print(f"\n  Fichiers générés dans {output_dir} :")
-    print(f"    shap_summary.png                  — importance globale des 4 features")
-    print(f"    shap_waterfall_worst_crisis.png   — décomposition SHAP de la pire crise")
-    print(f"    ttc_predicted_vs_actual.png       — prédit vs réel sur le test set")
+    print(f"\n  Files generated in {output_dir}:")
+    print(f"    shap_summary.png                  — global feature importance")
+    print(f"    shap_waterfall_worst_crisis.png   — SHAP breakdown of the worst crisis")
+    print(f"    ttc_predicted_vs_actual.png       — predicted vs actual on the test set")
     if model_path:
-        print(f"    xgb_ttc_model.json                — modèle exportable")
+        print(f"    xgb_ttc_model.json                — exportable model")
     print(f"{'='*60}\n")
 
     pred_path = output_dir / "ttc_predictions_test.csv"
     predictions_df.to_csv(pred_path, index=False)
-    log.info("Prédictions test set → %s", pred_path)
+    log.info("Test-set predictions → %s", pred_path)
 
     return {
         "model":               model_full,
@@ -614,30 +614,30 @@ def run_full_pipeline(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DONNÉES SYNTHÉTIQUES — pour tests et démo rapide
+# SYNTHETIC DATA — for tests and quick demos
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _make_synthetic_dataset(n_episodes: int = 60, seed: int = 42) -> pd.DataFrame:
     """
-    Génère un DataFrame synthétique réaliste pour tester le pipeline sans données AIS.
+    Generate a realistic synthetic DataFrame to test the pipeline without AIS data.
 
-    Relations simulées (inspirées de la littérature) :
-      - anchorage_queue élevé → TTC long (files d'attente prolongent la résorption)
-      - gravity_score élevé  → TTC long (amplitude de la disruption)
-      - approach_speed faible → TTC long (précongestion, navires qui ralentissent)
-      - complexity_p élevé   → TTC légèrement plus long (trafic dense = résorption lente)
+    Simulated relationships (inspired by the literature):
+      - high anchorage_queue → long TTC (queues extend the clearing)
+      - high gravity_score   → long TTC (disruption magnitude)
+      - low approach_speed   → long TTC (pre-congestion, slowing vessels)
+      - high complexity_p    → slightly longer TTC (dense traffic clears slowly)
 
-    Ne remplace PAS les vraies données AIS — usage test uniquement.
+    Does NOT replace real AIS data — test use only.
     """
     rng = np.random.default_rng(seed)
 
     n = n_episodes
-    approach_speed  = rng.uniform(3.0, 15.0, n)     # nœuds
-    anchorage_queue = rng.integers(20, 200, n)       # navires
+    approach_speed  = rng.uniform(3.0, 15.0, n)     # knots
+    anchorage_queue = rng.integers(20, 200, n)       # vessels
     complexity_p    = rng.uniform(0.1, 0.9,  n)     # [0,1]
     gravity_score   = rng.uniform(5_000, 400_000, n) # a.u.
 
-    # TTC = signal réaliste (relation non-linéaire + bruit)
+    # TTC = realistic signal (non-linear relationship + noise)
     time_to_clear = (
         5.0
         + 0.05  * anchorage_queue
@@ -667,71 +667,71 @@ def _make_synthetic_dataset(n_episodes: int = 60, seed: int = 42) -> pd.DataFram
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Estimateur Time-to-Clear par XGBoost + explicabilité SHAP. "
-            "Couche intermédiaire entre la sortie PINN et financial_pipeline.py."
+            "Time-to-clear estimator with XGBoost + SHAP explanations. "
+            "Intermediate layer between the PINN output and financial_pipeline.py."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Exemples :
+Examples:
 
-  # Données réelles (sortie de build_events_dataset)
+  # Real data (output of build_events_dataset)
   python src/correlation/ttc_xgb_shap.py \\
       --input outputs/financial/houston_events.csv \\
       --alias-map ttc_days=time_to_clear waiting_vessels=anchorage_queue \\
       --output-dir outputs/figures/ttc_shap \\
       --save-model
 
-  # Mode synthétique (test rapide sans données)
+  # Synthetic mode (quick test without data)
   python src/correlation/ttc_xgb_shap.py --synthetic --n-synthetic 80
         """,
     )
 
-    # ── Données d'entrée ──────────────────────────────────────────────────────
+    # ── Input data ────────────────────────────────────────────────────────────
     grp_in = parser.add_mutually_exclusive_group(required=True)
     grp_in.add_argument(
         "--input", type=Path,
-        help="CSV ou Parquet d'épisodes (doit contenir les 4 features + time_to_clear). "
-             "Sortie compatible avec build_events_dataset() de financial_pipeline.py.",
+        help="Episode CSV or Parquet (must contain the features + target). "
+             "Compatible with build_events_dataset() from financial_pipeline.py.",
     )
     grp_in.add_argument(
         "--synthetic", action="store_true",
-        help="Génère des données synthétiques réalistes pour tester le pipeline.",
+        help="Generate realistic synthetic data to test the pipeline.",
     )
 
     parser.add_argument(
         "--n-synthetic", type=int, default=60,
-        help="Nombre d'épisodes synthétiques (uniquement avec --synthetic, défaut=60)",
+        help="Number of synthetic episodes (only with --synthetic, default=60)",
     )
     parser.add_argument(
         "--alias-map", nargs="+", metavar="SRC=DST",
         help=(
-            "Renommages de colonnes au format SRC=DST (plusieurs acceptés). "
+            "Column renames in SRC=DST format (several allowed). "
             "Ex: --alias-map ttc_days=time_to_clear waiting_vessels=anchorage_queue"
         ),
     )
 
-    # ── Entraînement ─────────────────────────────────────────────────────────
+    # ── Training ─────────────────────────────────────────────────────────────
     parser.add_argument(
         "--test-frac", type=float, default=0.20,
-        help="Fraction du dataset réservée au test (défaut: 0.20 = 20%% des derniers épisodes)",
+        help="Fraction of the dataset kept for testing (default: 0.20 = last 20%% of episodes)",
     )
     parser.add_argument(
         "--features", nargs="+", default=FEATURE_COLS,
-        help=f"Colonnes features (défaut: {FEATURE_COLS})",
+        help=f"Feature columns (default: {FEATURE_COLS})",
     )
     parser.add_argument(
         "--target", default=TARGET_COL,
-        help=f"Colonne cible (défaut: {TARGET_COL})",
+        help=f"Target column (default: {TARGET_COL})",
     )
 
-    # ── Sortie ───────────────────────────────────────────────────────────────
+    # ── Output ───────────────────────────────────────────────────────────────
     parser.add_argument(
         "--output-dir", type=Path, default=Path("outputs/figures/ttc_shap"),
-        help="Dossier de sortie pour les PNG SHAP et le CSV de prédictions",
+        help="Output folder for the SHAP PNGs and the predictions CSV",
     )
     parser.add_argument(
         "--save-model", action="store_true",
-        help="Sauvegarder le modèle XGBoost final en JSON (réutilisable dans financial_pipeline.py)",
+        help="Save the final XGBoost model as JSON (reusable in financial_pipeline.py)",
     )
 
     args = parser.parse_args()
@@ -745,17 +745,17 @@ Exemples :
         datefmt="%H:%M:%S",
     )
 
-    # ── Chargement ───────────────────────────────────────────────────────────
+    # ── Loading ──────────────────────────────────────────────────────────────
     if args.synthetic:
-        log.info("Mode --synthetic : génération de %d épisodes fictifs", args.n_synthetic)
+        log.info("--synthetic mode: generating %d fake episodes", args.n_synthetic)
         df = _make_synthetic_dataset(n_episodes=args.n_synthetic)
-        log.info("Dataset synthétique créé : %d lignes | colonnes : %s", len(df), list(df.columns))
+        log.info("Synthetic dataset created: %d rows | columns: %s", len(df), list(df.columns))
     else:
         alias_map: dict[str, str] = {}
         if args.alias_map:
             for pair in args.alias_map:
                 if "=" not in pair:
-                    log.warning("alias-map ignoré (format invalide, attenu SRC=DST) : %s", pair)
+                    log.warning("alias-map ignored (invalid format, expected SRC=DST): %s", pair)
                     continue
                 src, dst = pair.split("=", 1)
                 alias_map[src.strip()] = dst.strip()
@@ -768,7 +768,7 @@ Exemples :
         )
 
     if len(df) < 4:
-        log.error("Trop peu d'épisodes (%d). Minimum 4 requis.", len(df))
+        log.error("Too few episodes (%d). Minimum 4 required.", len(df))
         sys.exit(1)
 
     # ── Pipeline complet ─────────────────────────────────────────────────────
@@ -781,8 +781,8 @@ Exemples :
         save_model=args.save_model,
     )
 
-    # Affichage du tableau des prédictions sur le test set
-    print("\n── Prédictions sur le test set ──")
+    # Display the test-set prediction table
+    print("\n── Test-set predictions ──")
     print(results["predictions_df"].to_string(index=False))
     print(f"\nResultats → {args.output_dir}/")
 

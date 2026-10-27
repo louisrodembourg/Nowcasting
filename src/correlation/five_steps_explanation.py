@@ -1,15 +1,15 @@
 """
-Phase 4 — Les 5 étapes de transformation du signal AIS.
+Phase 4 — The 5 transformation steps of the AIS signal.
 
-Ce script reproduit et explique chaque étape de la progression :
+This script reproduces and explains each step of the progression:
 
-  Étape 1 : Gravity score brut (lag=7j)            → ρs ≈ +0.069
-  Étape 2 : Log-transformation                      → ρs ≈ +0.110
-  Étape 3 : Lissage MA21                            → ρs ≈ +0.154
-  Étape 4 : Composante directe log_waiting (lag=4j) → ρs ≈ +0.184
-  Étape 5 : Modèle 2-régimes + PINN                 → ρs ≈ +0.248
+  Step 1: Raw gravity score (lag=7d)               → ρs ≈ +0.069
+  Step 2: Log transform                            → ρs ≈ +0.110
+  Step 3: MA21 smoothing                           → ρs ≈ +0.154
+  Step 4: Direct log_waiting component (lag=4d)    → ρs ≈ +0.184
+  Step 5: Two-regime model + PINN                  → ρs ≈ +0.248
 
-Usage :
+Usage:
     python src/correlation/five_steps_explanation.py
     python src/correlation/five_steps_explanation.py --target SBLK
     python src/correlation/five_steps_explanation.py --target MATX --horizon 10
@@ -50,7 +50,7 @@ REGIME2_COLS = [
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CHARGEMENT
+# LOADING
 # ══════════════════════════════════════════════════════════════════════════════
 
 def load_gravity() -> pd.DataFrame:
@@ -96,7 +96,7 @@ def forward_return(prices: pd.Series, horizon: int) -> pd.Series:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CORRÉLATION SIMPLE (Spearman sur séries alignées)
+# SIMPLE CORRELATION (Spearman on aligned series)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def spearman(signal: pd.Series, target: pd.Series) -> tuple[float, float, int]:
@@ -108,7 +108,7 @@ def spearman(signal: pd.Series, target: pd.Series) -> tuple[float, float, int]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# WALK-FORWARD RIDGE (étape 5 — régime normal)
+# WALK-FORWARD RIDGE (step 5 — normal regime)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def walk_forward_ridge(
@@ -142,7 +142,7 @@ def walk_forward_ridge(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ÉTAPES
+# STEPS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run(ticker: str = "SBLK", horizon: int = 10) -> None:
@@ -155,7 +155,7 @@ def run(ticker: str = "SBLK", horizon: int = 10) -> None:
 
     results = []
 
-    # ── Étape 1 : Gravity score brut, lag 7j ─────────────────────────────────
+    # ── Step 1: raw gravity score, lag 7d ────────────────────────────────────
     signal1 = gravity["gravity_score"].shift(7)
     r, p, n = spearman(signal1, fwd_ret)
     results.append({
@@ -165,13 +165,13 @@ def run(ticker: str = "SBLK", horizon: int = 10) -> None:
         "rho_s": r, "p_value": p, "n_obs": n,
         "gain": None,
         "interpretation": (
-            "Signal brut : le gravity score = Σ(capacity × temps_attente × |φ₁|) "
-            "décalé de 7 jours. Distribution très asymétrique (0 la plupart des jours, "
-            "spikes extrêmes en crise) → corrélation instable."
+            "Raw signal: gravity score = Σ(capacity × waiting_time × |φ₁|) "
+            "shifted by 7 days. Very skewed distribution (0 most days, "
+            "extreme spikes during crises) → unstable correlation."
         ),
     })
 
-    # ── Étape 2 : Log-transformation ─────────────────────────────────────────
+    # ── Step 2: log transform ────────────────────────────────────────────────
     log_gravity = np.log1p(gravity["gravity_score"])
     signal2 = log_gravity
     r, p, n = spearman(signal2, fwd_ret)
@@ -182,13 +182,13 @@ def run(ticker: str = "SBLK", horizon: int = 10) -> None:
         "rho_s": r, "p_value": p, "n_obs": n,
         "gain": round(r - results[-1]["rho_s"], 4),
         "interpretation": (
-            "log1p(x) = log(1+x) compresse les valeurs extrêmes et symétrise la "
-            "distribution. Les marchés perçoivent les variations relatives de congestion "
-            "(+10% vs +1000%), pas les valeurs absolues."
+            "log1p(x) = log(1+x) compresses extreme values and symmetrises the "
+            "distribution. Markets react to relative changes in congestion "
+            "(+10% vs +1000%), not to absolute levels."
         ),
     })
 
-    # ── Étape 3 : Lissage MA21 ───────────────────────────────────────────────
+    # ── Step 3: MA21 smoothing ───────────────────────────────────────────────
     signal3 = log_gravity.rolling(21, min_periods=7).mean()
     r, p, n = spearman(signal3, fwd_ret)
     results.append({
@@ -198,29 +198,29 @@ def run(ticker: str = "SBLK", horizon: int = 10) -> None:
         "rho_s": r, "p_value": p, "n_obs": n,
         "gain": round(r - results[-1]["rho_s"], 4),
         "interpretation": (
-            "Moyenne mobile sur 21 jours de trading (~1 mois). Filtre le bruit "
-            "quotidien : les marchés réagissent à une congestion qui s'installe dans "
-            "la durée, pas à un pic isolé d'un jour."
+            "21-trading-day moving average (~1 month). Filters daily noise: "
+            "markets react to congestion that persists over time, "
+            "not to an isolated one-day spike."
         ),
     })
 
-    # ── Étape 4 : Composante directe log_waiting, lag=4j ─────────────────────
+    # ── Step 4: direct log_waiting component, lag=4d ─────────────────────────
     signal4 = np.log1p(gravity["waiting_vessels"]).shift(4)
     r, p, n = spearman(signal4, fwd_ret)
     results.append({
         "etape": "04",
-        "label": "Composante directe log_waiting (lag=4j)",
+        "label": "Direct log_waiting component (lag=4d)",
         "transformation": "log1p(waiting_vessels)[t-4]",
         "rho_s": r, "p_value": p, "n_obs": n,
         "gain": round(r - results[-1]["rho_s"], 4),
         "interpretation": (
-            "On décompose le gravity score et on isole le nombre brut de navires en "
-            "attente. Retire le bruit multiplicatif de (temps_attente × |φ₁|). "
-            "Lag=4j : délai empirique de réaction du marché au signal AIS."
+            "Decompose the gravity score and isolate the raw number of waiting "
+            "vessels. Removes the multiplicative noise of (waiting_time × |φ₁|). "
+            "Lag=4d: empirical market reaction delay to the AIS signal."
         ),
     })
 
-    # ── Étape 5 : Modèle 2-régimes + PINN ────────────────────────────────────
+    # ── Step 5: two-regime model + PINN ──────────────────────────────────────
     roll60_mean = log_gravity.rolling(60, min_periods=20).mean()
     roll60_std  = log_gravity.rolling(60, min_periods=20).std().replace(0, np.nan)
 
@@ -242,7 +242,7 @@ def run(ticker: str = "SBLK", horizon: int = 10) -> None:
     y_all  = merged_all["fwd_ret"].values
     dates_all = merged_all.index
 
-    # Walk-forward 2-régimes (même logique que two_regime_model.py)
+    # Two-regime walk-forward (same logic as two_regime_model.py)
     init_train, test_block = 252, 63
     n = len(feat_aligned)
     oos_pred, oos_actual = [], []
@@ -255,7 +255,7 @@ def run(ticker: str = "SBLK", horizon: int = 10) -> None:
         feat_te = feat_aligned.iloc[start:end]
         y_te    = y_all[start:end]
 
-        # Entraîner Régime 1 sur tous les jours
+        # Train regime 1 on all days
         X1_tr = feat_tr[REGIME1_COLS].values
         m1_mask = ~np.isnan(X1_tr).any(1) & ~np.isnan(y_tr)
         r1_model, s1 = Ridge(alpha=1.0), StandardScaler()
@@ -264,7 +264,7 @@ def run(ticker: str = "SBLK", horizon: int = 10) -> None:
             r1_model.fit(s1.fit_transform(X1_tr[m1_mask]), y_tr[m1_mask])
             r1_fitted = True
 
-        # Entraîner Régime 2 sur les jours d'épisode PINN
+        # Train regime 2 on PINN episode days
         X2_tr = feat_tr[REGIME2_COLS].values
         in_ep_tr = feat_tr["in_episode"].values
         m2_mask = (in_ep_tr == 1) & ~np.isnan(X2_tr).any(1) & ~np.isnan(y_tr)
@@ -274,7 +274,7 @@ def run(ticker: str = "SBLK", horizon: int = 10) -> None:
             r2_model.fit(s2.fit_transform(X2_tr[m2_mask]), y_tr[m2_mask])
             r2_fitted = True
 
-        # Prédire
+        # Predict
         preds = np.full(end - start, np.nan)
         X1_te = feat_te[REGIME1_COLS].values
         X2_te = feat_te[REGIME2_COLS].values
@@ -302,31 +302,31 @@ def run(ticker: str = "SBLK", horizon: int = 10) -> None:
 
     results.append({
         "etape": "05",
-        "label": "Modèle 2-régimes + PINN",
+        "label": "Two-regime model + PINN",
         "transformation": (
-            "Régime 1 (hors crise) : Ridge sur 8 features AIS\n"
-            "                        Régime 2 (épisode PINN) : Ridge sur pinn_rho + AIS"
+            "Regime 1 (normal days)  : Ridge on 8 AIS features\n"
+            "                        Regime 2 (PINN episode): Ridge on pinn_rho + AIS"
         ),
         "rho_s": round(float(r5), 4), "p_value": round(float(p5), 4), "n_obs": int(n5),
         "gain": round(float(r5) - results[-1]["rho_s"], 4),
         "interpretation": (
-            "Architecture conditionnelle : deux modèles distincts selon le régime. "
-            "En régime de crise, pinn_rho (densité LWR prédite par le PINN via les "
-            "équations de conservation) remplace les features AIS empiriques par un "
-            "signal physique calibré. C'est la jonction Phase 3 → Phase 4."
+            "Conditional architecture: two distinct models depending on the regime. "
+            "During a crisis, pinn_rho (LWR density predicted by the PINN through the "
+            "conservation law) replaces the empirical AIS features with a calibrated "
+            "physical signal. This is the Phase 3 → Phase 4 junction."
         ),
     })
 
     # ── Affichage ─────────────────────────────────────────────────────────────
     print(f"\n{'═'*80}")
-    print(f"  LES 5 ÉTAPES DE TRANSFORMATION — {ticker} | horizon {horizon}j")
+    print(f"  THE 5 TRANSFORMATION STEPS — {ticker} | horizon {horizon}d")
     print(f"{'═'*80}")
 
     for i, res in enumerate(results):
         gain_str = f"  (+{res['gain']:.3f})" if res["gain"] is not None else ""
         sig = "★" if res["p_value"] < 0.05 else " "
         print(f"\n{'─'*80}")
-        print(f"  ÉTAPE {res['etape']} — {res['label']}")
+        print(f"  STEP {res['etape']} — {res['label']}")
         print(f"  Transformation : {res['transformation']}")
         print(f"  ρs = {res['rho_s']:+.4f}{gain_str}   p={res['p_value']:.4f}  n={res['n_obs']} {sig}")
         print(f"\n  → {res['interpretation']}")
@@ -336,8 +336,8 @@ def run(ticker: str = "SBLK", horizon: int = 10) -> None:
           f"(+{results[-1]['rho_s'] - results[0]['rho_s']:.3f})")
     print(f"{'═'*80}")
 
-    # ── Tableau synthèse ──────────────────────────────────────────────────────
-    print(f"\n  {'Étape':<6} {'Label':<42} {'ρs':>7}  {'gain':>7}  {'p':>8}  {'n':>6}")
+    # ── Summary table ─────────────────────────────────────────────────────────
+    print(f"\n  {'Step':<6} {'Label':<42} {'ρs':>7}  {'gain':>7}  {'p':>8}  {'n':>6}")
     print(f"  {'─'*6} {'─'*42} {'─'*7}  {'─'*7}  {'─'*8}  {'─'*6}")
     prev_rho = None
     for res in results:
@@ -348,7 +348,7 @@ def run(ticker: str = "SBLK", horizon: int = 10) -> None:
 
     print(f"\n  ★ = p < 0.05\n")
 
-    # ── Sauvegarder CSV ──────────────────────────────────────────────────────
+    # ── Save CSV ─────────────────────────────────────────────────────────────
     out = pd.DataFrame([{
         "etape": r["etape"], "label": r["label"],
         "rho_s": r["rho_s"], "gain": r["gain"],
@@ -356,8 +356,8 @@ def run(ticker: str = "SBLK", horizon: int = 10) -> None:
     } for r in results])
     path = OUT_DIR / f"five_steps_{ticker}_{horizon}d.csv"
     out.to_csv(path, index=False)
-    log.info("Résultats sauvegardés → %s", path)
-    print(f"  Résultats CSV → {path}\n")
+    log.info("Results saved → %s", path)
+    print(f"  CSV results → {path}\n")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -366,12 +366,12 @@ def run(ticker: str = "SBLK", horizon: int = 10) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Les 5 étapes de transformation du signal AIS → rendement fret"
+        description="The 5 transformation steps of the AIS signal → freight returns"
     )
     parser.add_argument("--target",  default="SBLK",
-                        help="Ticker cible (défaut: SBLK)")
+                        help="Target ticker (default: SBLK)")
     parser.add_argument("--horizon", type=int, default=10,
-                        help="Horizon de rendement en jours (défaut: 10)")
+                        help="Return horizon in days (default: 10)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")

@@ -48,15 +48,15 @@ def download_xle(
             group_by="ticker"
         )
 
-        # 🔥 sélection propre du ticker (évite MultiIndex galère)
+        # Select the ticker explicitly (avoids a MultiIndex)
         df = df[TICKER]
 
         df = df.reset_index()
 
-        # normalisation
+        # Normalize column names
         df.columns = [str(c).lower().replace(" ", "_") for c in df.columns]
 
-        # vérification sécurité
+        # Sanity check
         expected_cols = ["date", "open", "high", "low", "close", "adj_close", "volume"]
 
         missing = [c for c in expected_cols if c not in df.columns]

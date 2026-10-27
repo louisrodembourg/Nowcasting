@@ -1,15 +1,15 @@
 """
-Étape 3 complète — Reconstruction et compression des trajectoires AIS.
+Step 3 — AIS trajectory reconstruction and compression.
 
-Pour chaque MMSI+traj_id issu de kinematic_filter :
-  1. Fragmentation : gap > GAP_THRESHOLD_MIN → déjà fait via traj_id (hérité)
-  2. Interpolation intelligente :
-       - Canal quasi-linéaire (|Δcap| < 30°) → interpolation linéaire
-       - Changement de cap marqué               → Cubic Hermite spline
+For each MMSI + traj_id produced by kinematic_filter:
+  1. Fragmentation: gap > GAP_THRESHOLD_MIN → already done via traj_id (inherited)
+  2. Adaptive interpolation:
+       - Quasi-linear channel (|Δheading| < 30°) → linear interpolation
+       - Marked heading change                  → cubic Hermite spline
   3. Compression Douglas-Peucker (ε = 0.0001° ≈ 11 m)
 
-Produit un DataFrame de trajectoires reconstruites à résolution uniforme,
-utilisé par les PINNs pour disposer d'un champ de vitesse (x, t, ρ, v) continu.
+Produces a DataFrame of trajectories resampled at uniform resolution,
+used by the PINNs to obtain a continuous (x, t, ρ, v) field.
 
 Usage (standalone):
     python src/ingestion/trajectory.py data/parquet/houston/houston_2017_08_24.parquet

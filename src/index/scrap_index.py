@@ -1,21 +1,21 @@
 """
-Scraper d'indices financiers fret : BDI, FBX, WCI, SCFI.
+Freight index scraper: BDI, FBX, WCI, SCFI.
 
-Strategies disponibles :
-  1 (fred)      - FRED (Federal Reserve) via API key gratuite
-                  BDI disponible sous le code DBDI
-                  Cle gratuite : https://fred.stlouisfed.org/docs/api/api_key.html
+Available strategies:
+  1 (fred)      - FRED (Federal Reserve) through a free API key
+                  BDI available under the code DBDI
+                  Free key: https://fred.stlouisfed.org/docs/api/api_key.html
   2 (yfinance)  - Yahoo Finance via yfinance (pip install yfinance)
-                  Tickers : BDI=F, ^BDI selon disponibilite Yahoo
-  3 (barchart)  - HTML scraping, ~2 ans gratuit sans compte
-  4 (selenium)  - TradingEconomics via Selenium (Chrome + chromedriver requis)
+                  Tickers: BDI=F, ^BDI depending on Yahoo availability
+  3 (barchart)  - HTML scraping, ~2 years free without an account
+  4 (selenium)  - TradingEconomics via Selenium (Chrome + chromedriver required)
 
-Output : data/parquet/market/<ticker>_<start>_<end>.csv
-         colonnes : Date (YYYY-MM-DD), Close
+Output: data/parquet/market/<ticker>_<start>_<end>.csv
+        columns: Date (YYYY-MM-DD), Close
 
-Usage :
+Usage:
     python src/index/scrap_index.py --ticker bdi --start 2017-01-01 --end 2020-12-31
-    python src/index/scrap_index.py --ticker bdi --start 2017-01-01 --strategy 1 --fred-key VOTRE_CLE
+    python src/index/scrap_index.py --ticker bdi --start 2017-01-01 --strategy 1 --fred-key YOUR_KEY
     python src/index/scrap_index.py --ticker bdi --strategy 2
 """
 
@@ -34,24 +34,24 @@ log = logging.getLogger(__name__)
 
 OUT_DIR = Path("data/parquet/market")
 
-# Correspondances ticker -> code FRED
+# Ticker -> FRED code mapping
 FRED_CODES = {
     "bdi":  "DBDI",       # Baltic Dry Index (daily)
-    "wci":  "DWCI",       # World Container Index (si disponible)
+    "wci":  "DWCI",       # World Container Index (if available)
 }
 
-# Correspondances ticker -> symbole Yahoo Finance
+# Ticker -> Yahoo Finance symbol mapping
 YAHOO_TICKERS = {
     "bdi":  "^BDI",
 }
 
-# Correspondances ticker -> URL Barchart
+# Ticker -> Barchart URL mapping
 BARCHART_URLS = {
     "bdi": "https://www.barchart.com/stocks/quotes/BDI.BI/price-history/historical",
     "fbx": "https://www.barchart.com/stocks/quotes/FBX/price-history/historical",
 }
 
-# Correspondances ticker -> URL TradingEconomics
+# Ticker -> TradingEconomics URL mapping
 TE_URLS = {
     "bdi": "https://tradingeconomics.com/commodity/baltic",
     "fbx": "https://tradingeconomics.com/commodity/freightos-baltic-index",
@@ -66,15 +66,15 @@ TE_URLS = {
 
 def scrape_fred(ticker: str, start: str, end: str, api_key: str) -> pd.DataFrame:
     """
-    Telecharge un indice depuis FRED via l'API officielle.
-    Cle gratuite : https://fred.stlouisfed.org/docs/api/api_key.html
+    Download an index from FRED through the official API.
+    Free key: https://fred.stlouisfed.org/docs/api/api_key.html
     """
     fred_code = FRED_CODES.get(ticker.lower())
     if fred_code is None:
         raise ValueError(
-            f"Ticker '{ticker}' non configure pour FRED.\n"
-            f"Codes disponibles : {FRED_CODES}\n"
-            f"Cherchez le code sur https://fred.stlouisfed.org"
+            f"Ticker '{ticker}' not configured for FRED.\n"
+            f"Available codes: {FRED_CODES}\n"
+            f"Look up the code on https://fred.stlouisfed.org"
         )
 
     url = "https://api.stlouisfed.org/fred/series/observations"
@@ -86,13 +86,13 @@ def scrape_fred(ticker: str, start: str, end: str, api_key: str) -> pd.DataFrame
         "file_type":         "json",
     }
 
-    log.info("[FRED] Telechargement %s (%s)...", ticker.upper(), fred_code)
+    log.info("[FRED] Downloading %s (%s)...", ticker.upper(), fred_code)
     r = requests.get(url, params=params, timeout=15)
     r.raise_for_status()
 
     data = r.json()
     if "observations" not in data:
-        raise ValueError(f"Reponse FRED inattendue : {data.get('error_message', data)}")
+        raise ValueError(f"Unexpected FRED response: {data.get('error_message', data)}")
 
     rows = [
         {"Date": pd.to_datetime(obs["date"]), "Close": float(obs["value"])}
@@ -100,10 +100,10 @@ def scrape_fred(ticker: str, start: str, end: str, api_key: str) -> pd.DataFrame
         if obs["value"] != "."
     ]
     if not rows:
-        raise ValueError(f"FRED n'a retourne aucune donnee pour '{fred_code}'.")
+        raise ValueError(f"FRED returned no data for '{fred_code}'.")
 
     df = pd.DataFrame(rows).sort_values("Date").reset_index(drop=True)
-    log.info("[FRED] %d lignes (%s -> %s)", len(df), df["Date"].min().date(), df["Date"].max().date())
+    log.info("[FRED] %d rows (%s -> %s)", len(df), df["Date"].min().date(), df["Date"].max().date())
     return df
 
 
@@ -120,26 +120,26 @@ def scrape_yfinance(ticker: str, start: str, end: str) -> pd.DataFrame:
     try:
         import yfinance as yf
     except ImportError:
-        raise ImportError("yfinance non installe. Lancez : pip install yfinance")
+        raise ImportError("yfinance not installed. Run: pip install yfinance")
 
     yahoo_sym = YAHOO_TICKERS.get(ticker.lower())
     if yahoo_sym is None:
         raise ValueError(
-            f"Ticker '{ticker}' non configure pour Yahoo Finance.\n"
-            f"Symboles disponibles : {YAHOO_TICKERS}"
+            f"Ticker '{ticker}' not configured for Yahoo Finance.\n"
+            f"Available symbols: {YAHOO_TICKERS}"
         )
 
-    log.info("[yfinance] Telechargement %s (%s)...", ticker.upper(), yahoo_sym)
+    log.info("[yfinance] Downloading %s (%s)...", ticker.upper(), yahoo_sym)
     raw = yf.download(yahoo_sym, start=start, end=end, progress=False)
 
     if raw.empty:
-        raise ValueError(f"Yahoo Finance n'a retourne aucune donnee pour '{yahoo_sym}'.")
+        raise ValueError(f"Yahoo Finance returned no data for '{yahoo_sym}'.")
 
     df = raw[["Close"]].reset_index()
     df.columns = ["Date", "Close"]
     df["Close"] = df["Close"].astype(float)
     df = df.dropna().sort_values("Date").reset_index(drop=True)
-    log.info("[yfinance] %d lignes (%s -> %s)", len(df), df["Date"].min().date(), df["Date"].max().date())
+    log.info("[yfinance] %d rows (%s -> %s)", len(df), df["Date"].min().date(), df["Date"].max().date())
     return df
 
 
@@ -150,12 +150,12 @@ def scrape_yfinance(ticker: str, start: str, end: str) -> pd.DataFrame:
 
 def scrape_barchart(ticker: str) -> pd.DataFrame:
     """
-    Scrape la table de prix historiques sur Barchart (~2 ans gratuit).
+    Scrape the historical price table from Barchart (~2 years free).
     """
     url = BARCHART_URLS.get(ticker.lower())
     if url is None:
         raise ValueError(
-            f"URL Barchart non configuree pour '{ticker}'.\n"
+            f"Barchart URL not configured for '{ticker}'.\n"
             f"Disponibles : {list(BARCHART_URLS)}"
         )
 
@@ -170,7 +170,7 @@ def scrape_barchart(ticker: str) -> pd.DataFrame:
         "Referer": "https://www.barchart.com/",
     }
 
-    log.info("[Barchart] Chargement %s...", ticker.upper())
+    log.info("[Barchart] Loading %s...", ticker.upper())
     r = requests.Session().get(url, headers=req_headers, timeout=15)
     r.raise_for_status()
 
@@ -179,14 +179,14 @@ def scrape_barchart(ticker: str) -> pd.DataFrame:
     if table is None:
         table = soup.find("table")
     if table is None:
-        raise ValueError("Table introuvable sur Barchart. La structure HTML a peut-etre change.")
+        raise ValueError("Table not found on Barchart. The HTML structure may have changed.")
 
     thead = table.find("thead")
     cols = [th.get_text(strip=True) for th in thead.find_all("th")] if thead else []
 
     tbody = table.find("tbody")
     if tbody is None:
-        raise ValueError("tbody introuvable dans la table Barchart.")
+        raise ValueError("tbody not found in the Barchart table.")
 
     rows = [
         [td.get_text(strip=True) for td in tr.find_all("td")]
@@ -194,7 +194,7 @@ def scrape_barchart(ticker: str) -> pd.DataFrame:
         if tr.find_all("td")
     ]
     if not rows:
-        raise ValueError("Aucune ligne de donnees dans la table Barchart.")
+        raise ValueError("No data rows in the Barchart table.")
 
     df = pd.DataFrame(rows, columns=cols if cols else list(range(len(rows[0]))))
 
@@ -213,7 +213,7 @@ def scrape_barchart(ticker: str) -> pd.DataFrame:
         .sort_values("Date")
         .reset_index(drop=True)
     )
-    log.info("[Barchart] %d lignes (%s -> %s)", len(df), df["Date"].min().date(), df["Date"].max().date())
+    log.info("[Barchart] %d rows (%s -> %s)", len(df), df["Date"].min().date(), df["Date"].max().date())
     return df
 
 
@@ -224,8 +224,8 @@ def scrape_barchart(ticker: str) -> pd.DataFrame:
 
 def scrape_tradingeconomics(ticker: str) -> pd.DataFrame:
     """
-    Capture les donnees JSON du graphique TradingEconomics via Selenium.
-    Necessite : pip install selenium + Chrome + chromedriver
+    Capture the JSON chart data from TradingEconomics via Selenium.
+    Requires: pip install selenium + Chrome + chromedriver
     """
     import json
     import re
@@ -238,7 +238,7 @@ def scrape_tradingeconomics(ticker: str) -> pd.DataFrame:
     url = TE_URLS.get(ticker.lower())
     if url is None:
         raise ValueError(
-            f"URL TradingEconomics non configuree pour '{ticker}'.\n"
+            f"TradingEconomics URL not configured for '{ticker}'.\n"
             f"Disponibles : {list(TE_URLS)}"
         )
 
@@ -254,7 +254,7 @@ def scrape_tradingeconomics(ticker: str) -> pd.DataFrame:
 
     driver = webdriver.Chrome(options=options)
     try:
-        log.info("[TradingEconomics] Chargement %s...", ticker.upper())
+        log.info("[TradingEconomics] Loading %s...", ticker.upper())
         driver.get(url)
         WebDriverWait(driver, 20).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "canvas, .highcharts-root, svg"))
@@ -275,10 +275,10 @@ def scrape_tradingeconomics(ticker: str) -> pd.DataFrame:
                 continue
 
         if not rows:
-            raise ValueError("Impossible d'extraire les donnees JSON du graphique.")
+            raise ValueError("Could not extract the JSON chart data.")
 
         df = pd.DataFrame(rows).sort_values("Date").reset_index(drop=True)
-        log.info("[TE] %d lignes (%s -> %s)", len(df), df["Date"].min().date(), df["Date"].max().date())
+        log.info("[TE] %d rows (%s -> %s)", len(df), df["Date"].min().date(), df["Date"].max().date())
         return df
 
     finally:
@@ -305,19 +305,19 @@ def save(df: pd.DataFrame, ticker: str, out_dir: Path) -> Path:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Scraper d'indices financiers fret")
+    parser = argparse.ArgumentParser(description="Freight index scraper")
     parser.add_argument("--ticker",   default="bdi",
-                        help="Indice : bdi, fbx, wci, scfi (defaut: bdi)")
+                        help="Index: bdi, fbx, wci, scfi (default: bdi)")
     parser.add_argument("--start",    default="2016-01-01",
-                        help="Date debut YYYY-MM-DD (defaut: 2016-01-01)")
+                        help="Start date YYYY-MM-DD (default: 2016-01-01)")
     parser.add_argument("--end",      default=datetime.today().strftime("%Y-%m-%d"),
-                        help="Date fin YYYY-MM-DD (defaut: aujourd'hui)")
+                        help="End date YYYY-MM-DD (default: today)")
     parser.add_argument("--strategy", type=int, default=1, choices=[1, 2, 3, 4],
-                        help="1=FRED (defaut), 2=yfinance, 3=Barchart, 4=Selenium/TradingEconomics")
+                        help="1=FRED (default), 2=yfinance, 3=Barchart, 4=Selenium/TradingEconomics")
     parser.add_argument("--fred-key", default=None, metavar="KEY",
-                        help="Cle API FRED (gratuite sur fred.stlouisfed.org). Requise pour --strategy 1.")
+                        help="FRED API key (free on fred.stlouisfed.org). Required for --strategy 1.")
     parser.add_argument("--out-dir",  default=str(OUT_DIR),
-                        help=f"Repertoire de sortie (defaut: {OUT_DIR})")
+                        help=f"Output directory (default: {OUT_DIR})")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -326,11 +326,11 @@ def main() -> None:
         if args.strategy == 1:
             if not args.fred_key:
                 print(
-                    "[ERREUR] --strategy 1 (FRED) requiert --fred-key.\n"
-                    "  Cle gratuite en 30 secondes : https://fred.stlouisfed.org/docs/api/api_key.html\n"
-                    "  Puis relancez : python src/index/scrap_index.py --ticker bdi "
-                    "--start 2017-01-01 --fred-key VOTRE_CLE\n\n"
-                    "  Ou essayez sans cle : --strategy 2 (yfinance) ou --strategy 3 (Barchart)"
+                    "[ERROR] --strategy 1 (FRED) requires --fred-key.\n"
+                    "  Free key in 30 seconds: https://fred.stlouisfed.org/docs/api/api_key.html\n"
+                    "  Then re-run: python src/index/scrap_index.py --ticker bdi "
+                    "--start 2017-01-01 --fred-key YOUR_KEY\n\n"
+                    "  Or try without a key: --strategy 2 (yfinance) or --strategy 3 (Barchart)"
                 )
                 sys.exit(1)
             df = scrape_fred(args.ticker, args.start, args.end, args.fred_key)
@@ -344,12 +344,12 @@ def main() -> None:
         elif args.strategy == 4:
             df = scrape_tradingeconomics(args.ticker)
 
-        print(f"\nApercu (5 dernieres lignes) :")
+        print(f"\nPreview (last 5 rows):")
         print(df.tail(5).to_string(index=False))
         print(f"\nTotal : {len(df)} points  |  {df['Date'].min().date()} -> {df['Date'].max().date()}")
 
         out_path = save(df, args.ticker, out_dir)
-        print(f"Sauvegarde : {out_path.resolve()}")
+        print(f"Saved: {out_path.resolve()}")
 
     except Exception as e:
         print(f"\nErreur : {e}")

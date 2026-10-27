@@ -449,7 +449,7 @@ def run(target_key: str = "ALL", horizons: list[int] = None) -> pd.DataFrame:
                     xgb_metrics["n_oos"],
                 )
 
-        # ── SHAP analysis (horizon=10d uniquement pour éviter la redondance) ──
+        # ── SHAP analysis (horizon=10d only, to avoid redundancy) ──
         if 10 in horizons:
             h_shap = 10
             fwd_ret_shap = compute_forward_returns(prices, h_shap)
@@ -516,13 +516,13 @@ def compute_shap_analysis(
     horizon: int,
 ) -> None:
     """
-    Entraîne un XGBoost final sur toutes les données disponibles et calcule
-    les valeurs SHAP globales (summary bar) et locales (waterfall sur le jour
-    de congestion maximale identifié par log_gravity).
+    Train a final XGBoost on all available data and compute global SHAP
+    values (summary bar) and local ones (waterfall on the day of maximum
+    congestion, identified by log_gravity).
 
-    Sorties :
-        outputs/financial/shap_{target}_{horizon}d_summary.png   — importance globale
-        outputs/financial/shap_{target}_{horizon}d_waterfall.png — explication locale
+    Outputs:
+        outputs/financial/shap_{target}_{horizon}d_summary.png   — global importance
+        outputs/financial/shap_{target}_{horizon}d_waterfall.png — local explanation
     """
     try:
         import shap
@@ -531,14 +531,14 @@ def compute_shap_analysis(
         import matplotlib
         matplotlib.use("Agg")
     except ImportError as e:
-        log.warning("SHAP non disponible (%s) — pip install shap", e)
+        log.warning("SHAP unavailable (%s) — pip install shap", e)
         return
 
     valid = ~(np.isnan(X).any(axis=1) | np.isnan(y))
     X_clean, y_clean, dates_clean = X[valid], y[valid], dates[valid]
 
     if len(X_clean) < 50:
-        log.warning("SHAP: pas assez de données pour %s h=%dd", target_label, horizon)
+        log.warning("SHAP: not enough data for %s h=%dd", target_label, horizon)
         return
 
     model = XGBRegressor(
@@ -553,7 +553,7 @@ def compute_shap_analysis(
     slug = f"{target_label}_{horizon}d"
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # ── Summary bar (importance globale = mean |SHAP| par feature) ────────────
+    # ── Summary bar (global importance = mean |SHAP| per feature) ─────────────
     fig, ax = plt.subplots(figsize=(8, 5))
     mean_abs = np.abs(shap_values).mean(axis=0)
     order = np.argsort(mean_abs)
@@ -571,17 +571,17 @@ def compute_shap_analysis(
     plt.close(fig)
     log.info("SHAP summary -> %s", summary_path)
 
-    # ── Waterfall local : jour de congestion maximale (log_gravity max) ───────
+    # ── Local waterfall: day of maximum congestion (max log_gravity) ──────────
     log_gravity_idx = feature_names.index("log_gravity") if "log_gravity" in feature_names else 0
     peak_idx = int(np.argmax(X_clean[:, log_gravity_idx]))
     peak_date = dates_clean[peak_idx]
 
     base_value = float(explainer.expected_value)
     sv = shap_values[peak_idx]           # (n_features,)
-    fv = X_clean[peak_idx]               # valeurs des features ce jour-là
+    fv = X_clean[peak_idx]               # feature values on that day
     pred = base_value + sv.sum()
 
-    # Tri par contribution absolue décroissante
+    # Sort by decreasing absolute contribution
     order_wf = np.argsort(np.abs(sv))[::-1]
 
     fig, ax = plt.subplots(figsize=(9, 6))
@@ -589,11 +589,11 @@ def compute_shap_analysis(
     labels = [f"{feature_names[i]}\n= {fv[i]:.3f}" for i in order_wf]
     ax.barh(labels, sv[order_wf], color=colors)
     ax.axvline(0, color="black", linewidth=0.8)
-    ax.set_xlabel("Contribution SHAP au rendement prédit")
+    ax.set_xlabel("SHAP contribution to the predicted return")
     ax.set_title(
         f"SHAP — Explication locale\n{target_label} | h={horizon}j | "
-        f"{peak_date.strftime('%Y-%m-%d')} (pic congestion)\n"
-        f"Base={base_value:.4f}  Prédit={pred:.4f}"
+        f"{peak_date.strftime('%Y-%m-%d')} (congestion peak)\n"
+        f"Base={base_value:.4f}  Predicted={pred:.4f}"
     )
     ax.grid(axis="x", alpha=0.3)
     fig.tight_layout()
@@ -602,15 +602,15 @@ def compute_shap_analysis(
     plt.close(fig)
     log.info("SHAP waterfall -> %s", waterfall_path)
 
-    # ── Print résumé ──────────────────────────────────────────────────────────
+    # ── Print summary ─────────────────────────────────────────────────────────
     print(f"\n{'─'*60}")
-    print(f"SHAP | {target_label} | h={horizon}j | pic congestion {peak_date.strftime('%Y-%m-%d')}")
+    print(f"SHAP | {target_label} | h={horizon}d | congestion peak {peak_date.strftime('%Y-%m-%d')}")
     print(f"{'Feature':<22} {'SHAP':>10}  {'Valeur feature':>16}")
     print(f"{'─'*22} {'─'*10}  {'─'*16}")
     for i in order_wf:
         print(f"  {feature_names[i]:<20} {sv[i]:>+10.4f}  {fv[i]:>16.4f}")
     print(f"  {'Base value':<20} {base_value:>+10.4f}")
-    print(f"  {'Prédiction':<20} {pred:>+10.4f}")
+    print(f"  {'Prediction':<20} {pred:>+10.4f}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
