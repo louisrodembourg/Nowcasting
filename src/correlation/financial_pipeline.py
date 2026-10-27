@@ -139,7 +139,11 @@ def _compute_ttc(
 def _load_checkpoint(model_path: Path) -> tuple[LWRPINN, dict]:
     """Charge un checkpoint PINN et retourne (model, global_meta)."""
     ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
-    model = LWRPINN(hidden_layers=4, hidden_size=64)
+    model = LWRPINN(
+        hidden_layers=4, hidden_size=64,
+        n_freqs=int(ckpt.get("n_freqs", 0)),
+        fourier_sigma=float(ckpt.get("fourier_sigma", 1.0)),
+    )
     model.load_state_dict(ckpt["model_state"])
     model.eval()
     log.info(
@@ -234,8 +238,9 @@ def build_events_dataset(
                 "x_km":   ep.x_norm * ep.channel_len_km,
                 "t_days": ep.t_norm * ep.duration_days,
             })
-            # Fenêtre étendue à 3× la durée pour laisser le PINN extrapoler la résolution
-            t_max = float(episode_data["t_days"].max()) * 3.0 + 2.0
+            # Extrapolate far enough beyond the episode to observe resolution.
+            # Minimum 90 days: typical LA port congestion clears in 2-8 weeks post-episode.
+            t_max = max(float(episode_data["t_days"].max()) * 3.0 + 30.0, 90.0)
 
             try:
                 profiles = extract_physical_profiles(
