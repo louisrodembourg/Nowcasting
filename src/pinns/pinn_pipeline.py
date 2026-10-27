@@ -729,6 +729,66 @@ def extract_physical_profiles(
     })
 
 
+def extract_pinn_summaries(profiles: pd.DataFrame) -> dict:
+    """
+    Extrait des résumés scalaires du champ PINN prédit (ρ̂, v̂, flux̂).
+
+    Ces scalaires servent de features physiques pour le XGBoost Phase 4,
+    qui prédit le TTC observé (durée d'épisode) à partir des caractéristiques
+    du champ de congestion reconstruit par le PINN.
+
+    Returns
+    -------
+    dict avec les clés :
+        peak_rho        [vessels/km] : densité maximale sur l'épisode
+        t_to_peak_days  [jours]      : instant du pic de congestion
+        area_under_rho  [v/km * j]   : intégrale de max_x ρ(x,t) dans le temps
+        decay_rate      [v/km / j]   : pente de résorption post-pic (négatif = décroissance)
+        flux_entry_mean [v*kn/km]    : flux moyen au premier dixième du chenal
+        v_mean_global   [noeuds]     : vitesse moyenne sur tout l'épisode
+    """
+    t_series = (
+        profiles.groupby("t_days")["rho_hat"]
+        .max()
+        .reset_index()
+        .sort_values("t_days")
+    )
+    t_vals    = t_series["t_days"].values
+    rho_max_t = t_series["rho_hat"].values
+
+    if len(t_vals) == 0:
+        return {
+            "peak_rho": 0.0, "t_to_peak_days": 0.0,
+            "area_under_rho": 0.0, "decay_rate": 0.0,
+            "flux_entry_mean": 0.0, "v_mean_global": 0.0,
+        }
+
+    peak_idx  = int(np.argmax(rho_max_t))
+    peak_rho  = float(rho_max_t[peak_idx])
+    t_to_peak = float(t_vals[peak_idx])
+
+    area_under_rho = float(np.trapz(rho_max_t, t_vals)) if len(t_vals) > 1 else 0.0
+
+    post_t   = t_vals[peak_idx:]
+    post_rho = rho_max_t[peak_idx:]
+    decay_rate = float(np.polyfit(post_t, post_rho, 1)[0]) if len(post_t) >= 2 else 0.0
+
+    x_threshold     = profiles["x_km"].quantile(0.10)
+    entry           = profiles[profiles["x_km"] <= x_threshold]
+    flux_entry_mean = float(entry["flux_hat"].mean()) if len(entry) > 0 else 0.0
+
+    v_mean_global = float(profiles["v_hat"].mean())
+
+    return {
+        "peak_rho":        peak_rho,
+        "t_to_peak_days":  t_to_peak,
+        "area_under_rho":  area_under_rho,
+        "decay_rate":      decay_rate,
+        "flux_entry_mean": flux_entry_mean,
+        "v_mean_global":   v_mean_global,
+    }
+
+
 def plot_physical_profiles(
     profiles: pd.DataFrame,
     episode_data: Optional[pd.DataFrame] = None,

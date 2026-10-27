@@ -2,26 +2,29 @@
 ttc_xgb_shap.py — Estimateur du Time-to-Clear par XGBoost + explicabilité SHAP.
 
 Position dans la chaîne d'analyse :
-    pinn_pipeline.py  →  build_events_dataset()
-        ↓  (episode_id, start_date, gravity_score, ttc_days, …)
+    pinn_pipeline.py  →  extract_physical_profiles()  →  extract_pinn_summaries()
+        ↓  (peak_rho, t_to_peak_days, area_under_rho, decay_rate, …)
+    financial_pipeline.py  →  build_events_dataset()
+        ↓  (episode_id, start_date, gravity_score, duration_days, pinn_summaries, …)
     [ttc_xgb_shap.py]            ← CE MODULE
         ↓  XGBRegressor entraîné + PNG SHAP (summary + waterfall)
     financial_pipeline.py → generate_trading_signal()
 
 Features physiques d'entrée (une ligne = un épisode de disruption) :
-    approach_speed  (float) : Vitesse moyenne d'approche dans rayon < 50 NM,
-                              proxy du comportement de congestion amont
-                              (Kontovas & Psaraftis, 2011).
-    anchorage_queue (int)   : Navires immobiles dans zones d'attente au démarrage
-                              de l'épisode (= waiting_vessels dans gravity_daily).
-    complexity_p    (float) : Indice de complexité du trafic maritime (0–1 normalisé).
     gravity_score   (float) : Score topologique d'anomalie issu du Manifold Learning
-                              (sortie de manifold_pipeline.py).
+                              (Phase 2 — manifold_pipeline.py).
+    n_ais_points    (int)   : Nombre de points AIS observés sur l'épisode.
+    peak_rho        (float) : Densité maximale [vessels/km] issue du champ PINN ρ̂(x,t).
+    t_to_peak_days  (float) : Temps [jours] pour atteindre le pic de congestion.
+    area_under_rho  (float) : Intégrale temporelle de max_x ρ(x,t) — charge totale.
+    decay_rate      (float) : Pente de décroissance post-pic [v/km/j].
+    flux_entry_mean (float) : Flux moyen à l'entrée du chenal [vessels·kn/km].
 
 Cible supervisée :
-    time_to_clear   (float) : Durée de résorption de l'épisode en jours.
-                              Source : colonne ttc_days de build_events_dataset()
-                              (calculée par PINN ou fallback durée observée).
+    duration_days   (float) : Durée observée de l'épisode en jours, dérivée du
+                              gravity score (durée du run au-dessus du seuil).
+                              Proxy empirique du TTC — plus robuste que le seuillage
+                              arbitraire sur ρ̂(x,t).
 
 Usage CLI :
     python src/correlation/ttc_xgb_shap.py \\
@@ -56,16 +59,19 @@ log = logging.getLogger(__name__)
 # CONSTANTES
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Noms canoniques des 4 features physiques attendues dans le DataFrame d'entrée.
+# Features physiques : gravity score (Phase 2) + résumés scalaires du champ PINN (Phase 3).
 FEATURE_COLS: list[str] = [
-    "approach_speed",   # nœuds — vitesse d'approche amont
-    "anchorage_queue",  # navires — file d'attente au mouillage
-    "complexity_p",     # [0,1]  — indice de complexité trafic
-    "gravity_score",    # a.u.   — anomalie topologique Manifold
+    "gravity_score",    # anomalie topologique Manifold (Phase 2)
+    "n_ais_points",     # couverture AIS de l'épisode
+    "peak_rho",         # densité maximale [vessels/km] — champ PINN
+    "t_to_peak_days",   # temps au pic de congestion [jours] — champ PINN
+    "area_under_rho",   # charge totale de congestion [v/km·j] — champ PINN
+    "decay_rate",       # pente de résorption post-pic [v/km/j] — champ PINN
+    "flux_entry_mean",  # flux moyen à l'entrée du chenal [v·kn/km] — champ PINN
 ]
 
-# Colonne cible : durée de résorption prédite par le PINN (ou fallback durée observée).
-TARGET_COL: str = "time_to_clear"
+# Cible : durée observée de l'épisode (proxy TTC empirique, plus robuste que seuillage ρ̂).
+TARGET_COL: str = "duration_days"
 
 # Colonne de date utilisée pour le tri chronologique (plusieurs alias tolérés).
 DATE_COL_CANDIDATES: tuple[str, ...] = ("start_date", "date", "Date")
@@ -125,7 +131,6 @@ def load_episode_features(
 
     # Renommages automatiques (sortie build_events_dataset → format attendu)
     default_aliases: dict[str, str] = {
-        "ttc_days":        "time_to_clear",
         "waiting_vessels": "anchorage_queue",
     }
     if alias_map:

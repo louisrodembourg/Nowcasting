@@ -56,6 +56,7 @@ from src.pinns.pinn_pipeline import (
     Episode,
     LOCATION_DEFAULTS,
     extract_physical_profiles,
+    extract_pinn_summaries,
     structure_episodes,
 )
 
@@ -249,26 +250,39 @@ def build_events_dataset(
                     profiles, rho_threshold_frac,
                     fallback_days=float(ep.duration_days),
                 )
+                pinn_summaries = extract_pinn_summaries(profiles)
                 log.info(
-                    "    TTC = %.1f jours [%s]",
+                    "    TTC = %.1f jours [%s] | peak_rho=%.2f | decay=%.4f",
                     ttc, ttc_source,
+                    pinn_summaries["peak_rho"], pinn_summaries["decay_rate"],
                 )
             except Exception as exc:
                 log.warning("    Erreur profils PINN (%s) — fallback duration", exc)
                 ttc, ttc_source = float(ep.duration_days), "duration_fallback"
+                pinn_summaries = {
+                    "peak_rho": float("nan"), "t_to_peak_days": float("nan"),
+                    "area_under_rho": float("nan"), "decay_rate": float("nan"),
+                    "flux_entry_mean": float("nan"), "v_mean_global": float("nan"),
+                }
         else:
             log.warning("    Aucun point AIS — fallback duration")
             ttc, ttc_source = float(ep.duration_days), "duration_fallback"
+            pinn_summaries = {
+                "peak_rho": float("nan"), "t_to_peak_days": float("nan"),
+                "area_under_rho": float("nan"), "decay_rate": float("nan"),
+                "flux_entry_mean": float("nan"), "v_mean_global": float("nan"),
+            }
 
         records.append({
             "episode_id":    ep.episode_id,
             "start_date":    ep.start_date,
             "end_date":      ep.end_date,
-            "duration_days": ep.duration_days,
+            "duration_days": ep.duration_days,   # TTC observé — label XGBoost Phase 4
             "gravity_score": float(ep.trigger_score),
-            "ttc_days":      ttc,
+            "ttc_pinn":      ttc,                # TTC par seuillage PINN (référence)
             "ttc_source":    ttc_source,
             "n_ais_points":  ep.n_points,
+            **pinn_summaries,                    # peak_rho, t_to_peak_days, area_under_rho, decay_rate, flux_entry_mean, v_mean_global
         })
 
     df = pd.DataFrame(records)
