@@ -63,8 +63,15 @@ outputs/financial/*.csv, figures
 | `correlation/correlation_analysis.py` | Spearman lag-scan: features × targets × horizons × lags. |
 | `correlation/predict_returns.py` | Walk-forward Ridge / XGBoost baselines on MATX, BDRY, SBLK and container stocks. |
 | `correlation/two_regime_model.py` | Causal episode detection that switches between a normal-day model and an episode model fed with PINN ρ. |
-| `correlation/pinn_vs_baseline.py`, `five_steps_explanation.py`, `naive_gravity_test.py` | Ablations: what the PINN adds, the step-by-step IC progression (0.07 → 0.25), and the naive gravity-score test. |
+| `correlation/pinn_vs_baseline.py`, `five_steps_explanation.py`, `naive_gravity_test.py` | Ablations: what the PINN adds, the step-by-step IC progression, and the naive gravity-score test. |
 | `index/scrap_index.py`, `index/visualize_index.py`, `ingestion/download_index.py` | Download freight indices and equity prices, and plot them against the gravity score. |
+
+## Tooling
+
+| Path | Role |
+|---|---|
+| `scripts/make_readme_figures.py` | Rebuilds the README figures (`docs/img/`) from pipeline outputs. |
+| `tests/` | pytest suite: LWR residual on an analytic travelling wave, AIS kinematic filter, PINN field summaries, XGBoost + SHAP pipeline on synthetic episodes. Runs in GitHub Actions on every push. |
 
 ## Conventions
 
