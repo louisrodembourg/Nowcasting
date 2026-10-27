@@ -17,7 +17,7 @@ import torch.nn as nn
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.pinns.lwr_pinn import get_device
 from src.pinns.pinn_pipeline import structure_episodes

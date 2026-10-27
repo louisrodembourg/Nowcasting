@@ -42,5 +42,6 @@ notebooks/*.jpeg
 .env
 .env.*
 !.env.example
-CLAUDE.md
 PROGRESS.md
+
+# Local tool settings

@@ -1,22 +1,27 @@
 # Data processing
-duckdb
-polars
+duckdb>=1.0
+polars>=1.0
+pandas>=2.0
+numpy>=1.26
+pyarrow>=15.0
+scipy>=1.11
+shapely>=2.0
 
 # Machine learning
-hdbscan
-scikit-learn
-torch
-xgboost
+scikit-learn>=1.4
+hdbscan>=0.8
+torch>=2.2          # MPS backend on Apple Silicon
+xgboost>=2.0
+shap>=0.45
 
-# Explainability
-shap
-
-# Data sources
-yfinance
-pyarrow
+# Data sources (AIS download, financial indices)
+requests>=2.31
+yfinance>=0.2
+beautifulsoup4>=4.12
+selenium>=4.0       # only for src/index/scrap_index.py
 
 # Visualization
-folium
-matplotlib
-ipykernel
-plotly
+folium>=0.15
+matplotlib>=3.8
+plotly>=5.0
+kaleido>=0.2        # static PNG export for plotly figures

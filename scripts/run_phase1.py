@@ -11,21 +11,24 @@ Writes the feature matrix to data/features/<location>_daily_features.parquet
 
 Usage (run from Nowcasting/ root):
     # Houston (default) — download + process
-    python run_phase1.py --start 2017-07-25 --end 2017-09-15
+    python scripts/run_phase1.py --start 2017-07-25 --end 2017-09-15
 
     # LA/Long Beach — process only (already downloaded)
-    python run_phase1.py --location la --start 2019-01-01 --end 2019-12-31 --no-download
+    python scripts/run_phase1.py --location la --start 2019-01-01 --end 2019-12-31 --no-download
 
     # Force re-download
-    python run_phase1.py --location houston --start 2017-08-01 --end 2017-08-31 --force
+    python scripts/run_phase1.py --location houston --start 2017-08-01 --end 2017-08-31 --force
 """
 import argparse
 import logging
+import sys
 import time
 from datetime import date, timedelta
 from pathlib import Path
 
 import polars as pl
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.ingestion.download import download_day, LOCATIONS
 from src.clustering.hdbscan_daily import cluster_day

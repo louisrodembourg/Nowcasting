@@ -3,7 +3,7 @@ Entraîne un PINN (rho + v, architecture actuelle) par épisode,
 extrait les résumés physiques sur grille dense, sauvegarde en Parquet.
 
 Usage:
-    python run_train_pinn_per_episode.py [--epochs 500] [--max-duration 30]
+    python scripts/run_train_pinn_per_episode.py [--epochs 500] [--max-duration 30]
 
 Output:
     data/features/la_pinn_episode_summaries.parquet
@@ -26,7 +26,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.pinns.lwr_pinn import LWRPINN, get_device, total_loss
 from src.pinns.pinn_pipeline import structure_episodes
