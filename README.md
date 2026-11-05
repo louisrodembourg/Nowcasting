@@ -5,6 +5,8 @@
 
 **Can raw vessel positions tell us how congested a port is, how long the congestion will last, and what it means for shipping stocks?**
 
+https://github.com/user-attachments/assets/7461ec19-e6ea-482a-aeef-46c3900dfe78
+
 This academic research project (March–June 2026) builds an end-to-end pipeline from **AIS data** (the transponder signal every large ship broadcasts) to an interpretable market alert:
 
 > *"Congestion at port X should take N days to clear and move asset Z by Y%."*
