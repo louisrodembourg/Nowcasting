@@ -147,7 +147,9 @@ def _run_hdbscan(
         pl.len().alias("nb_messages"),
     ]
 
-    agg = static.group_by(["MMSI", "traj_id"]).agg(agg_exprs)
+    # group_by returns groups in an arbitrary order and HDBSCAN depends on the input order:
+    # sort the episodes so the same day always gives the same clusters.
+    agg = static.group_by(["MMSI", "traj_id"]).agg(agg_exprs).sort(["MMSI", "traj_id"])
 
     headings_list = agg["_headings"].to_list()
     h_means, h_stds = [], []

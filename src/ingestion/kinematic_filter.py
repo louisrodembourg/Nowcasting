@@ -34,8 +34,9 @@ def prepare_kinematics(df: pl.DataFrame) -> pl.DataFrame:
 
     Returns the enriched DataFrame (original columns kept).
     """
-    # Sort by vessel id and timestamp (prerequisite for gap detection)
-    df = df.sort(["MMSI", "BaseDateTime"])
+    # Sort by vessel id and timestamp (prerequisite for gap detection). Stable sort: messages
+    # sharing a timestamp keep their file order, so shifts and SOG_corr are reproducible.
+    df = df.sort(["MMSI", "BaseDateTime"], maintain_order=True)
 
     # Previous position and timestamp of the prior message for each MMSI
     df = df.with_columns([
