@@ -2,6 +2,10 @@
 Regenerate the figures shown in the README (docs/img/) from pipeline outputs.
 
 Inputs (produced by the pipeline, not versioned):
+    data/parquet/la/la_YYYY_MM_DD.parquet             Phase 1 — daily AIS (HDBSCAN re-run on two days)
+    data/zones/la_docked.geojson, data/features/la_waiting_zones.geojson   port zones
+    data/external/ne_10m_land_v5.1.2.geojson          coastline (Natural Earth, public domain;
+                                                      downloaded on first use)
     data/features/la_gravity_all_years.parquet        Phase 2 — daily gravity score
     data/features/pinn_la_episodes_profiles.parquet   Phase 3 — PINN fields ρ, v, q
     outputs/financial/two_regime_results.csv          Phase 4 — global OOS ICs
@@ -10,6 +14,9 @@ Inputs (produced by the pipeline, not versioned):
 Usage (from the repository root):
     python scripts/make_readme_figures.py
 """
+import json
+import sys
+import urllib.request
 from pathlib import Path
 
 import matplotlib
@@ -18,6 +25,11 @@ import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import polars as pl
+from matplotlib.patches import Polygon as PolygonPatch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from src.clustering.hdbscan_daily import ClusteringConfig, cluster_day, load_waiting_zones  # noqa: E402
 
 OUT_DIR = Path("docs/img")
 
@@ -46,6 +58,91 @@ plt.rcParams.update({
     "savefig.dpi": 160,
     "savefig.bbox": "tight",
 })
+
+
+LAND_URL = ("https://raw.githubusercontent.com/nvkelso/natural-earth-vector/"
+            "v5.1.2/geojson/ne_10m_land.geojson")
+LAND_FILE = Path("data/external/ne_10m_land_v5.1.2.geojson")
+PORT_EXTENT = (-118.46, -117.97, 33.49, 33.80)  # lon min, lon max, lat min, lat max
+
+
+def _ring(path: str) -> np.ndarray:
+    return np.array(json.loads(Path(path).read_text())["features"][0]["geometry"]["coordinates"][0])
+
+
+def _land(ax) -> None:
+    """Natural Earth land polygons around the port, drawn below everything else."""
+    if not LAND_FILE.exists():
+        LAND_FILE.parent.mkdir(parents=True, exist_ok=True)
+        urllib.request.urlretrieve(LAND_URL, LAND_FILE)
+    lon_min, lon_max, lat_min, lat_max = PORT_EXTENT
+    for feature in json.loads(LAND_FILE.read_text())["features"]:
+        geometry = feature["geometry"]
+        polygons = geometry["coordinates"] if geometry["type"] == "MultiPolygon" else [geometry["coordinates"]]
+        for polygon in polygons:
+            ring = np.array(polygon[0])
+            if (ring[:, 0].max() < lon_min - 1 or ring[:, 0].min() > lon_max + 1
+                    or ring[:, 1].max() < lat_min - 1 or ring[:, 1].min() > lat_max + 1):
+                continue
+            ax.add_patch(PolygonPatch(ring, closed=True, facecolor="#efeee9", edgecolor="#c9c7c0",
+                                      linewidth=0.8, zorder=0))
+
+
+def port_clusters() -> Path:
+    """The port as Phase 1 sees it: daily HDBSCAN clusters of stationary vessels, docked vs
+    waiting, on the same calendar day in a calm year and at the peak of the 2021 backlog."""
+    config = ClusteringConfig(waiting_allowed_polygons=load_waiting_zones("la"))
+    zones = [
+        (_ring("data/features/la_waiting_zones.geojson"), "Anchorage (waiting zone)", ORANGE, "--"),
+        (_ring("data/zones/la_docked.geojson"), "Terminals", BLUE, "-"),
+    ]
+    days = ["2019-10-02", "2021-10-02"]
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5.2))
+    for ax, day in zip(axes, days):
+        path = Path(f"data/parquet/la/la_{day.replace('-', '_')}.parquet")
+        clusters, _ = cluster_day(path, config)
+        fixes = pl.read_parquet(path, columns=["MMSI", "BaseDateTime", "LAT", "LON"]) \
+            .sort("BaseDateTime").group_by("MMSI").last()
+
+        _land(ax)
+        for ring, name, color, style in zones:
+            ax.add_patch(PolygonPatch(ring, closed=True, facecolor=color, alpha=0.06, zorder=1))
+            ax.add_patch(PolygonPatch(ring, closed=True, fill=False, edgecolor=color, linestyle=style,
+                                      linewidth=1.3, zorder=2, label=name))
+        ax.scatter(fixes["LON"], fixes["LAT"], s=4, color="#b5b3ad", lw=0, zorder=3, label="Other AIS fixes")
+        noise = clusters.filter(pl.col("cluster_label") < 0)
+        ax.scatter(noise["LON"], noise["LAT"], s=10, marker="x", color=INK_MUTED, lw=0.8, zorder=4,
+                   label="Stationary, unclustered")
+        # The pipeline's rule: a cluster touching the waiting zone is "waiting", any other "docked"
+        for kind, color, name in (("docked", BLUE, "Cluster outside the waiting zone (docked)"),
+                                  ("waiting", ORANGE, "Cluster in the waiting zone (waiting)")):
+            sub = clusters.filter(pl.col("cluster_type") == kind)
+            ax.scatter(sub["LON"], sub["LAT"], s=10 + 30 * sub["membership_score"].to_numpy(), color=color,
+                       edgecolor=SURFACE, lw=0.4, zorder=5, label=name)
+        waiting = clusters.filter(pl.col("cluster_type") == "waiting")
+        n_clusters = waiting["cluster_label"].n_unique()
+        ax.set_title(f"{pd.Timestamp(day):%-d %B %Y} — {waiting['MMSI'].n_unique()} vessels in "
+                     f"{n_clusters} waiting cluster{'s' * (n_clusters != 1)}", loc="left")
+        lon_min, lon_max, lat_min, lat_max = PORT_EXTENT
+        ax.set_xlim(lon_min, lon_max)
+        ax.set_ylim(lat_min, lat_max)
+        ax.set_aspect(1 / np.cos(np.radians((lat_min + lat_max) / 2)))
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.grid(False)
+        for spine in ax.spines.values():
+            spine.set_visible(True)
+            spine.set_color(GRID)
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=3, frameon=False, fontsize=9,
+               bbox_to_anchor=(0.5, -0.06), markerscale=1.6)
+    fig.suptitle("Port of Los Angeles / Long Beach — daily HDBSCAN on stationary vessels (SOG < 1 kn), "
+                 "same day two years apart", x=0.01, ha="left", fontsize=12, fontweight="bold", color=INK)
+    fig.tight_layout()
+    path = OUT_DIR / "la_port_clusters.png"
+    fig.savefig(path)
+    plt.close(fig)
+    return path
 
 
 def congestion_overview() -> Path:
@@ -159,5 +256,5 @@ def results_ic() -> Path:
 
 if __name__ == "__main__":
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    for make in (congestion_overview, pinn_fields, results_ic):
+    for make in (port_clusters, congestion_overview, pinn_fields, results_ic):
         print("saved", make())

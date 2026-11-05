@@ -11,11 +11,35 @@ This academic research project (March–June 2026) builds an end-to-end pipeline
 
 > *"Congestion at port X should take N days to clear and move asset Z by Y%."*
 
+**Key results** (Port of Los Angeles / Long Beach, strictly out-of-sample, [details](#results)):
+
+- Port congestion measured from AIS forecasts 21-day returns of shipping equities: Spearman IC 0.08–0.12, all p < 0.05.
+- Physics helps where it should: for Matson (MATX), the physics-informed model lifts the 10-day IC from 0.076 to 0.103 (+37%), and to **0.25** on congestion-episode days.
+- A negative control (the dry-bulk carrier SBLK) behaves as expected, pointing to a container-specific channel rather than a macro factor.
+
+## The port, seen from AIS
+
+![Port of Los Angeles / Long Beach: HDBSCAN clusters of stationary vessels on 2 October 2019 and 2 October 2021](docs/img/la_port_clusters.png)
+
+Every large ship broadcasts its position every few seconds to minutes. The pipeline keeps
+one day of these positions at a time and asks a simple question: **which ships are stopped,
+and where?**
+
+- **Stationary vessels** (speed under 1 knot, recomputed from consecutive positions) are
+  clustered every day with **HDBSCAN**, which copes with dense terminals and a sparse
+  open sea in the same pass.
+- A cluster that reaches the **anchorage** (orange dashed area) is labelled *waiting*;
+  any other is *docked*: berthed at the **terminals** (blue outline) or moored elsewhere.
+- Same calendar day, two years apart: **14 vessels in 3 waiting clusters in 2019, 171 in
+  11 clusters at the peak of the 2021 West Coast backlog.** The queue also spills beyond
+  the anchorage, out to sea.
+
+The main case study is the **Port of Los Angeles / Long Beach, 2017–2024** (~2,800 days of
+NOAA AIS data). Houston (Hurricane Harvey) and the Suez Canal served as secondary test cases.
+
 ## Why
 
 Supply-chain shocks show up **physically** before they show up in prices: ships pile up at anchor during the 2021 US West Coast backlog, Hurricane Harvey or the Red Sea crisis. AIS data captures that physical layer in near real time and is publicly available. The question is whether a robust, physically grounded congestion signal carries information that markets have not priced in yet.
-
-The main case study is the **Port of Los Angeles / Long Beach, 2017–2024** (~2,800 days of NOAA AIS data). Houston (Hurricane Harvey) and the Suez Canal served as secondary test cases.
 
 ![LA congestion seen from AIS](docs/img/la_congestion_overview.png)
 
